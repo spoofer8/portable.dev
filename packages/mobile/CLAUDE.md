@@ -244,6 +244,18 @@ drop is a silent reconnect, no re-scan. All I/O is seam-injected and RNTL-testab
   file-viewer raw-bytes Bearer — each importing it BY FILE (not the pc-connect barrel) so the heavy
   scanner graph stays out. **`authedFetch` honors `X-Renewed-Token`** from the relay (persists the
   renewed JWT per pcId) and skips `/refresh` on the relay path (the PC has no `/refresh` endpoint).
+- **`renewDataPathToken()`** (`src/features/api/renewDataPathToken.ts`, portable.dev#24) is the
+  PSK-proven recovery funnel for an EXPIRED JWT: seals the old token to the PC's public
+  `POST /api/e2e/renew` (opening the envelope proves PSK possession), persists the fresh JWT,
+  single-flight keyed by pcId. Contract: fresh token on success; **`null` ONLY when the PC
+  genuinely rejected the pairing** (dead PSK / rotated secret → re-pair UX); **throws** on
+  transport/storage errors (retryable — defaults use the STRICT keychain reads). Consumers:
+  `authedFetch`'s `renewOnUnauthorized` 401-retry seam (RelayApiClient only — handshakes ride a
+  dedicated NON-renewing fetch, `E2eTransportDeps.handshakeFetch`, or a renew-armed handshake
+  401 would deadlock the tunnel), `useNativeSocket`'s `connect_error` `token_expired` path
+  (terminal `'failed'` state + persistent ReconnectingBanner variant when renew is rejected),
+  and `verifyTunnelAddress`'s sealed 426 probe. A paired phone therefore reconnects after ANY
+  idle period without re-scanning the QR.
 - **`PcConnectModal`** is the in-app **re-scan** flow (camera-first — the user already tapped
   "Connect PC"). It backs the Home/Repos error cards (`home-connect-pc` / `repo-list-connect-pc` —
   a failed connection is the PC, not GitHub; in local-first GitHub lives on the PC) and the

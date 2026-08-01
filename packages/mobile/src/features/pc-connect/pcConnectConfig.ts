@@ -21,8 +21,8 @@ import { getGatewayUrl } from '../auth/gatewayConfig';
 import { getAuthToken } from '../auth/secureAuthStore';
 
 import { connectToPc } from './connectToPc';
-import { getConnectedPcId } from './connectedPcStore';
-import { getE2eKey } from './deviceTokenStore';
+import { getConnectedPcIdStrict } from './connectedPcStore';
+import { getE2eKeyStrict } from './deviceTokenStore';
 import { linkPc } from './linkPc';
 
 import type { MobileRnAppleReviewerCredentialsResponse, QrLinkPayload } from '@vgit2/shared/types';
@@ -35,17 +35,19 @@ import type { MobileRnAppleReviewerCredentialsResponse, QrLinkPayload } from '@v
 export interface PcConnectConfig {
   /**
    * Read the currently-connected PC id (null when the app is not yet pointed at a
-   * PC). Default: the SecureStore reader.
+   * PC). Default: the STRICT SecureStore reader — a storage failure rethrows;
+   * only a SUCCESSFUL null (= genuinely no pairing) may route to the QR scanner.
    */
   getConnectedPcId?: () => Promise<string | null>;
   /**
    * Read the per-PC E2E pre-shared key (base64), or null when this device never
-   * stored one for `pcId`. Default: the SecureStore reader. Used by the host to
-   * self-heal the E2E migration gap (portable.dev#13): a device paired BEFORE
-   * E2E existed holds a JWT for its pcId but no e2eKey, and since E2E is
-   * mandatory on the relay data path EVERY `/api/*` request would then throw
-   * deep in the app — so a returning device missing the key is routed back to
-   * the QR scanner instead of dead-ending.
+   * stored one for `pcId`. Default: the STRICT SecureStore reader (a storage
+   * failure rethrows). Used by the host to self-heal the E2E migration gap
+   * (portable.dev#13): a device paired BEFORE E2E existed holds a JWT for its
+   * pcId but no e2eKey, and since E2E is mandatory on the relay data path EVERY
+   * `/api/*` request would then throw deep in the app — so a returning device
+   * SUCCESSFULLY resolving no key is routed back to the QR scanner instead of
+   * dead-ending.
    */
   getE2eKey?: (pcId: string) => Promise<string | null>;
   /**
@@ -81,8 +83,9 @@ export interface PcConnectConfig {
  */
 export function buildPcConnectConfig(): PcConnectConfig {
   return {
-    getConnectedPcId,
-    getE2eKey,
+    // Strict readers: lenient-to-null here would silently re-pair on a locked keychain.
+    getConnectedPcId: getConnectedPcIdStrict,
+    getE2eKey: getE2eKeyStrict,
     onConnect: async (pcId: string) => {
       const result = await connectToPc(pcId, { gatewayBase: getGatewayUrl() });
       return result.ready;

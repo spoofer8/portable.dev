@@ -15,6 +15,12 @@
  *     routed back to the scanner — E2E is mandatory on the relay data path, so
  *     without the key every `/api/*` request would throw `NoE2eKeyError` deep in
  *     the app.
+ *   - The pairing reads are STRICT: a SecureStore failure retries on a short
+ *     backoff, then surfaces a `storage-error` screen. Only a SUCCESSFUL null
+ *     read may auto-route to the scanner — a read failure treated as "never
+ *     paired" would orphan a valid pairing. The secondary "Connect PC" action
+ *     is the user-initiated escape for a permanently-undecryptable entry: it
+ *     only routes to the scanner (the re-link overwrite is the wipe).
  *   - No PC connected → an OPTIONAL Apple-reviewer pre-step: if
  *     `config.getReviewerCredentials` resolves a `{ gatewayBase, pcId, token,
  *     e2eKey }` payload, the dedicated App-Store reviewer is linked + connected
@@ -41,16 +47,38 @@ import { LoadingSplash } from '../../components/LoadingSplash';
 import {
   PcConnectErrorScreen,
   PcConnectGate,
-  getConnectedPcId as defaultGetConnectedPcId,
-  getE2eKey as defaultGetE2eKey,
+  getConnectedPcIdStrict as defaultGetConnectedPcId,
+  getE2eKeyStrict as defaultGetE2eKey,
   usePcConnectionStore,
   type PcConnectConfig,
 } from '../pc-connect';
 
-type Phase = 'checking' | 'connect' | 'connecting' | 'error' | 'connected';
+type Phase = 'checking' | 'connect' | 'connecting' | 'error' | 'storage-error' | 'connected';
 
 const CONNECT_FAILED_MESSAGE =
   "Couldn't connect to your PC. Make sure `portable start` is running on your computer, then scan the QR again.";
+
+const STORAGE_READ_FAILED_MESSAGE =
+  "Couldn't read this device's saved PC pairing — secure storage isn't responding. Your pairing is still saved; try again in a moment.";
+
+// Keychain reads can fail transiently right after first-unlock — bounded retry
+// before the failure surfaces.
+const STORAGE_READ_ATTEMPTS = 3;
+const STORAGE_READ_BACKOFF_MS = [500, 1000];
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** Run a STRICT storage read on the bounded retry ladder; the last failure rethrows. */
+async function readWithRetry<T>(read: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await read();
+    } catch (err) {
+      if (attempt >= STORAGE_READ_ATTEMPTS) throw err;
+      await sleep(STORAGE_READ_BACKOFF_MS[attempt - 1]);
+    }
+  }
+}
 
 export interface PcConnectGateHostProps {
   config: PcConnectConfig;
@@ -61,6 +89,8 @@ export function PcConnectGateHost({ config, children }: PcConnectGateHostProps) 
   const getConnectedPcId = config.getConnectedPcId ?? defaultGetConnectedPcId;
   const getE2eKey = config.getE2eKey ?? defaultGetE2eKey;
   const [phase, setPhase] = useState<Phase>('checking');
+  // Bumped by the storage-error Retry to re-run the mount check from scratch.
+  const [recheckNonce, setRecheckNonce] = useState(0);
 
   // Resolve the connected-PC state once on mount. A persisted pcId means a
   // returning device → straight through to the app; none → try the reviewer fast
@@ -97,12 +127,14 @@ export function PcConnectGateHost({ config, children }: PcConnectGateHostProps) 
     }
 
     void (async () => {
-      let pcId: string | null = null;
+      let pcId: string | null;
       try {
-        pcId = await getConnectedPcId();
+        pcId = await readWithRetry(getConnectedPcId);
       } catch {
-        // A corrupt/undecryptable entry must not wedge startup — fall through.
-        pcId = null;
+        // Keychain still unanswered after the ladder — surface it; routing to
+        // the scanner would orphan a valid pairing.
+        if (alive) setPhase('storage-error');
+        return;
       }
       if (pcId) {
         // Self-heal the E2E migration gap (portable.dev#13): a device paired
@@ -111,13 +143,15 @@ export function PcConnectGateHost({ config, children }: PcConnectGateHostProps) 
         // throw `NoE2eKeyError` deep in the app (a dead home, no way out). Detect
         // the missing key HERE and route to the QR scanner for a fresh pairing
         // (the new QR carries the e2eKey) instead of dead-ending at request time.
-        let hasKey = false;
+        // Only a SUCCESSFUL null read means "missing" — a failure surfaces like
+        // the pcId read above.
+        let hasKey: boolean;
+        const id = pcId;
         try {
-          hasKey = (await getE2eKey(pcId)) !== null;
+          hasKey = (await readWithRetry(() => getE2eKey(id))) !== null;
         } catch {
-          // An unreadable keychain entry is treated as absent → re-scan (the same
-          // fail-open-to-scanner posture as a corrupt pcId above).
-          hasKey = false;
+          if (alive) setPhase('storage-error');
+          return;
         }
         if (hasKey) {
           if (alive) setPhase('connected');
@@ -138,7 +172,7 @@ export function PcConnectGateHost({ config, children }: PcConnectGateHostProps) 
     return () => {
       alive = false;
     };
-  }, [getConnectedPcId, getE2eKey, config]);
+  }, [getConnectedPcId, getE2eKey, config, recheckNonce]);
 
   // Return to the QR scanner on an explicit disconnect (Runtime tab → "Disconnect").
   // `disconnectPc` clears the stored pcId + per-PC JWT first, then bumps this signal;
@@ -167,6 +201,24 @@ export function PcConnectGateHost({ config, children }: PcConnectGateHostProps) 
   if (phase === 'error') {
     return (
       <PcConnectErrorScreen message={CONNECT_FAILED_MESSAGE} onRetry={() => setPhase('connect')} />
+    );
+  }
+
+  if (phase === 'storage-error') {
+    return (
+      <PcConnectErrorScreen
+        testID="pc-connect-storage-error"
+        message={STORAGE_READ_FAILED_MESSAGE}
+        onRetry={() => {
+          // Re-run the strict check; a still-locked keychain lands back here, never the scanner.
+          setPhase('checking');
+          setRecheckNonce((n) => n + 1);
+        }}
+        // Escape hatch for a permanently-undecryptable entry: only ROUTES to the
+        // scanner — never wipes (a successful re-link overwrites the credentials).
+        secondaryLabel="Connect PC"
+        onSecondary={() => setPhase('connect')}
+      />
     );
   }
 

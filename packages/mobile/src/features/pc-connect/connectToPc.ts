@@ -23,7 +23,7 @@
  */
 
 import { saveConnectedPcId } from './connectedPcStore';
-import { getDeviceToken } from './deviceTokenStore';
+import { getDeviceToken, getE2eKey } from './deviceTokenStore';
 import { verifyTunnelAddress } from './verifyTunnelAddress';
 
 export interface ConnectToPcDeps {
@@ -31,6 +31,12 @@ export interface ConnectToPcDeps {
   gatewayBase: string;
   /** Seam: read the stored device token. Defaults to {@link getDeviceToken}. */
   getToken?: (pcId: string) => Promise<string | null>;
+  /**
+   * Seam: read the candidate PC's stored E2E PSK for the default `verify`'s
+   * sealed token check. Lenient by design: an unreadable key just skips the
+   * sealed check (fail-open), it never blocks a connect. Defaults to {@link getE2eKey}.
+   */
+  getE2eKey?: (pcId: string) => Promise<string | null>;
   /**
    * Seam: body-validate the PC is reachable. Defaults to
    * {@link verifyTunnelAddress} over `<gatewayBase>/t/<pcId>/api/health`.
@@ -87,27 +93,23 @@ export interface ConnectToPcResult {
  */
 export async function connectToPc(pcId: string, deps: ConnectToPcDeps): Promise<ConnectToPcResult> {
   const getToken = deps.getToken ?? getDeviceToken;
+  const readE2eKey = deps.getE2eKey ?? getE2eKey;
   const setConnectedPc = deps.setConnectedPc ?? saveConnectedPcId;
   const verify =
     deps.verify ??
-    ((gatewayBase: string, id: string, token: string) =>
-      verifyTunnelAddress(gatewayBase, id, token, { fetchImpl: deps.fetchImpl }));
+    (async (gatewayBase: string, id: string, token: string) =>
+      verifyTunnelAddress(gatewayBase, id, token, {
+        fetchImpl: deps.fetchImpl,
+        // The stored PSK lets the probe run sealed when the PC enforces E2E.
+        e2eKey: await readE2eKey(id),
+      }));
 
   const deviceToken = await getToken(pcId);
-  console.warn(
-    '[QRDBG] connectToPc pcId=',
-    pcId,
-    'gatewayBase=',
-    deps.gatewayBase,
-    'hasToken=',
-    !!deviceToken
-  );
   if (!deviceToken) {
     return { ready: false, deviceToken: null, reason: 'no-token' };
   }
 
   const healthy = await verify(deps.gatewayBase, pcId, deviceToken);
-  console.warn('[QRDBG] connectToPc verify →', healthy ? 'HEALTHY' : 'UNHEALTHY');
   if (!healthy) {
     // Linked but not answering — re-pick / re-probe (a rotation re-points
     // automatically). Do NOT point the app at a dead PC.

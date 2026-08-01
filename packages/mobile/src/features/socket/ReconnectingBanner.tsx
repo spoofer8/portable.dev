@@ -6,6 +6,10 @@
  * It is driven purely by `useSocketStore` state — there is NO arbitrary timeout:
  * it appears the moment the socket is not connected and clears the moment a
  * `connect` event flips `connected` back to true.
+ *
+ * The `failed` phase (the PC rejected the pairing — reconnection is off and no
+ * event will ever clear it) renders a distinct terminal variant, shown even
+ * before a first connect (the cold-start expired-token lockout).
  */
 
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
@@ -19,10 +23,25 @@ export function ReconnectingBanner() {
   const connectionState = useSocketStore((s) => s.connectionState);
   const { theme, getBoldTextColor } = useAppTheme();
 
+  // Terminal dead pairing: no spinner (nothing is retrying); recovery is the
+  // Settings → Connect PC re-scan entry.
+  if (connectionState === 'failed') {
+    return (
+      <View
+        style={[styles.banner, { backgroundColor: theme.colors.danger }]}
+        testID="connection-failed-banner"
+      >
+        <Text style={[styles.text, styles.failedText]} testID="connection-failed-banner-text">
+          PC connection is no longer authorized. Reconnect from Settings → Connect PC.
+        </Text>
+      </View>
+    );
+  }
+
   // Only surface after the first successful connection: a fresh mount that has
   // never connected is "connecting" (handled by provisioning UI), not
-  // "reconnecting". `failed` has its own terminal UX.
-  if (connected || !hasConnectedOnce || connectionState === 'failed') return null;
+  // "reconnecting".
+  if (connected || !hasConnectedOnce) return null;
 
   // Use the accent for the reconnecting indicator; the text color stays
   // readable over it (bold-text luminance pick).
@@ -56,4 +75,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
   },
   text: { fontSize: 14, fontWeight: '500' },
+  // `danger` is a fixed hex in every theme — white always reads over it.
+  failedText: { color: '#FFFFFF', flexShrink: 1, textAlign: 'center' },
 });

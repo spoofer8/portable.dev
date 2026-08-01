@@ -246,3 +246,175 @@ describe('device-path X-Renewed-Token persistence', () => {
     expect(persistRenewedToken).not.toHaveBeenCalled();
   });
 });
+
+describe('device-path 401 renewal (renewOnUnauthorized — portable.dev#24)', () => {
+  let gateway: MockGateway;
+  let client: GatewayClient;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    secureStore.__store.clear();
+    gateway = createMockGateway();
+    client = new GatewayClient({ gatewayUrl: gateway.baseUrl, fetchImpl: gateway.fetchImpl });
+  });
+
+  /** The endpoint answers 401 for the expired JWT, 200 for the re-minted one. */
+  function serveUntilRenewed(freshToken: string): void {
+    gateway.on('GET', SANDBOX_API, (req) => {
+      const auth = req.headers.Authorization ?? req.headers.authorization ?? '';
+      if (auth === `Bearer ${freshToken}`) return { body: { ok: true } };
+      return { status: 401, body: { error: 'jwt expired' } };
+    });
+  }
+
+  it('renews on 401, replays once with the fresh Bearer, and returns the replay', async () => {
+    serveUntilRenewed('psk-minted-jwt');
+    const renewOnUnauthorized = jest.fn().mockResolvedValue('psk-minted-jwt');
+    const onTokenRefreshed = jest.fn();
+
+    const authedFetch = createAuthedFetch({
+      gateway: client,
+      fetchImpl: gateway.fetchImpl,
+      getToken: async () => 'expired-device-jwt',
+      persistRenewedToken: jest.fn().mockResolvedValue(undefined),
+      renewOnUnauthorized,
+      onTokenRefreshed,
+    });
+
+    const res = await authedFetch(SANDBOX_API);
+
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({ ok: true });
+    expect(renewOnUnauthorized).toHaveBeenCalledTimes(1);
+    expect(onTokenRefreshed).toHaveBeenCalledWith('psk-minted-jwt');
+    const apiReqs = gateway.requests.filter((r) => r.url === SANDBOX_API);
+    expect(apiReqs).toHaveLength(2);
+    expect(apiReqs[0].headers.Authorization).toBe('Bearer expired-device-jwt');
+    expect(apiReqs[1].headers.Authorization).toBe('Bearer psk-minted-jwt');
+    expect(gateway.requests.some((r) => r.path.endsWith('/refresh'))).toBe(false);
+  });
+
+  it('returns the ORIGINAL 401 when renew resolves null (PC rejected recovery)', async () => {
+    gateway.on('GET', SANDBOX_API, () => ({ status: 401, body: { error: 'jwt expired' } }));
+    const renewOnUnauthorized = jest.fn().mockResolvedValue(null);
+    const onTokenRefreshed = jest.fn();
+
+    const authedFetch = createAuthedFetch({
+      gateway: client,
+      fetchImpl: gateway.fetchImpl,
+      getToken: async () => 'expired-device-jwt',
+      persistRenewedToken: jest.fn().mockResolvedValue(undefined),
+      renewOnUnauthorized,
+      onTokenRefreshed,
+    });
+
+    const res = await authedFetch(SANDBOX_API);
+
+    expect(res.status).toBe(401);
+    await expect(res.json()).resolves.toEqual({ error: 'jwt expired' });
+    expect(renewOnUnauthorized).toHaveBeenCalledTimes(1);
+    expect(onTokenRefreshed).not.toHaveBeenCalled();
+    expect(gateway.requests.filter((r) => r.url === SANDBOX_API)).toHaveLength(1);
+  });
+
+  it('returns the ORIGINAL 401 when renew throws (transport failure)', async () => {
+    gateway.on('GET', SANDBOX_API, () => ({ status: 401, body: { error: 'jwt expired' } }));
+    const renewOnUnauthorized = jest.fn().mockRejectedValue(new Error('network down'));
+
+    const authedFetch = createAuthedFetch({
+      gateway: client,
+      fetchImpl: gateway.fetchImpl,
+      getToken: async () => 'expired-device-jwt',
+      persistRenewedToken: jest.fn().mockResolvedValue(undefined),
+      renewOnUnauthorized,
+    });
+
+    const res = await authedFetch(SANDBOX_API);
+
+    expect(res.status).toBe(401);
+    expect(renewOnUnauthorized).toHaveBeenCalledTimes(1);
+    expect(gateway.requests.filter((r) => r.url === SANDBOX_API)).toHaveLength(1);
+  });
+
+  it('never calls renew on a non-401 response', async () => {
+    gateway.on('GET', SANDBOX_API, () => ({ body: { ok: true } }));
+    const renewOnUnauthorized = jest.fn().mockResolvedValue('psk-minted-jwt');
+
+    const authedFetch = createAuthedFetch({
+      gateway: client,
+      fetchImpl: gateway.fetchImpl,
+      getToken: async () => 'current-device-jwt',
+      persistRenewedToken: jest.fn().mockResolvedValue(undefined),
+      renewOnUnauthorized,
+    });
+
+    const res = await authedFetch(SANDBOX_API);
+    expect(res.status).toBe(200);
+    expect(renewOnUnauthorized).not.toHaveBeenCalled();
+  });
+
+  it('ignores renewOnUnauthorized on the legacy gateway path (no persistRenewedToken)', async () => {
+    secureStore.__store.set(AUTH_TOKEN_KEY, 'stale-token');
+    gateway.on('GET', SANDBOX_API, (req) => {
+      const auth = req.headers.Authorization ?? '';
+      return auth === 'Bearer mock-refreshed-token'
+        ? { body: { ok: true } }
+        : { status: 401, body: { error: 'expired' } };
+    });
+    const renewOnUnauthorized = jest.fn().mockResolvedValue('psk-minted-jwt');
+
+    const authedFetch = createAuthedFetch({
+      gateway: client,
+      fetchImpl: gateway.fetchImpl,
+      renewOnUnauthorized,
+    });
+
+    const res = await authedFetch(SANDBOX_API);
+
+    expect(res.status).toBe(200);
+    expect(renewOnUnauthorized).not.toHaveBeenCalled();
+    expect(gateway.requests.some((r) => r.path.endsWith('/refresh'))).toBe(true);
+  });
+
+  it('two concurrent 401s replay with the same fresh token (single-flight lives in the renew module)', async () => {
+    serveUntilRenewed('psk-minted-jwt');
+
+    // Fake renew module: counts calls but single-flights the work, like the real renewDataPathToken.
+    let renewWorkCount = 0;
+    let inflight: Promise<string | null> | null = null;
+    let release!: (token: string | null) => void;
+    const gate = new Promise<string | null>((resolve) => {
+      release = resolve;
+    });
+    const renewOnUnauthorized = jest.fn(() => {
+      if (!inflight) {
+        renewWorkCount += 1;
+        inflight = gate.finally(() => {
+          inflight = null;
+        });
+      }
+      return inflight;
+    });
+
+    const authedFetch = createAuthedFetch({
+      gateway: client,
+      fetchImpl: gateway.fetchImpl,
+      getToken: async () => 'expired-device-jwt',
+      persistRenewedToken: jest.fn().mockResolvedValue(undefined),
+      renewOnUnauthorized,
+    });
+
+    const pending = Promise.all([authedFetch(SANDBOX_API), authedFetch(SANDBOX_API)]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    release('psk-minted-jwt');
+    const [a, b] = await pending;
+
+    expect([a.status, b.status]).toEqual([200, 200]);
+    expect(renewOnUnauthorized).toHaveBeenCalledTimes(2);
+    expect(renewWorkCount).toBe(1);
+    const replays = gateway.requests.filter(
+      (r) => r.url === SANDBOX_API && r.headers.Authorization === 'Bearer psk-minted-jwt'
+    );
+    expect(replays).toHaveLength(2);
+  });
+});

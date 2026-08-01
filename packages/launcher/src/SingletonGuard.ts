@@ -40,6 +40,14 @@ export interface LauncherLock {
   port: number;
   /** ISO timestamp the lock was written (diagnostics only). */
   startedAt: string;
+  /**
+   * True when this instance is supervisor-managed (`portable connect --service`,
+   * portable.dev#12). A MANUAL `portable` must NOT take such an instance over —
+   * the supervisor (systemd / Task Scheduler) would respawn it, which would then
+   * take the manual run back over: an endless fight. The manual run refuses with
+   * guidance instead (`portable service stop` first).
+   */
+  service?: boolean;
 }
 
 /** Injected effects (all defaulted to the real impls in {@link acquireSingleton}). */
@@ -74,12 +82,25 @@ export interface SingletonGuardDeps {
   log?: (line: string) => void;
   /** Max time (ms) to wait for the old runtime's port to free after the kill. */
   portFreeTimeoutMs?: number;
+  /**
+   * True when THIS process is the supervisor-managed daemon (`connect --service`).
+   * Stamped into the lock ({@link LauncherLock.service}); a service boot takes
+   * over anything (incl. a manual run), while a manual boot refuses to take over
+   * a live service instance (see {@link SingletonHandle.blocked}).
+   */
+  service?: boolean;
 }
 
 /** Handle returned by {@link acquireSingleton}; release on shutdown. */
 export interface SingletonHandle {
   /** Remove our lock file (only if it's still ours). Idempotent, never throws. */
   release: () => void;
+  /**
+   * Set when boot must NOT proceed: a live service-managed instance owns the
+   * runtime and this is a manual run (guidance already logged). The caller
+   * exits instead of booting.
+   */
+  blocked?: boolean;
 }
 
 const DEFAULT_PORT_FREE_TIMEOUT_MS = 12_000;
@@ -249,6 +270,18 @@ export async function acquireSingleton(deps: SingletonGuardDeps = {}): Promise<S
   const running = await probeHealth(port);
   const existing = readLock(lockPath);
 
+  // A live SERVICE-managed instance must not be taken over by a manual run: the
+  // supervisor (systemd / Task Scheduler) would respawn the killed daemon, which
+  // would then take the manual run back over — an endless fight loop. Refuse
+  // with guidance instead. (A service boot still takes over anything below.)
+  if (running && !deps.service && existing?.service) {
+    log(
+      `[launcher] portable is running as a background service on :${port}.\n` +
+        '           Use `portable service stop` to stop it first (or `portable service status` / `portable service uninstall`).'
+    );
+    return { blocked: true, release: () => {} };
+  }
+
   if (running) {
     // A portable runtime really IS serving the port. Find its pid to tree-kill:
     // the lock first (it's the launcher root → /T gets the api child + cloudflared),
@@ -293,8 +326,14 @@ export async function acquireSingleton(deps: SingletonGuardDeps = {}): Promise<S
     removeLock(lockPath);
   }
 
-  // Claim the lock for ourselves.
-  writeLock(lockPath, { pid: selfPid, port, startedAt: nowIso() });
+  // Claim the lock for ourselves (service boots stamp the marker the manual-run
+  // refusal above keys on).
+  writeLock(lockPath, {
+    pid: selfPid,
+    port,
+    startedAt: nowIso(),
+    ...(deps.service ? { service: true } : {}),
+  });
 
   return {
     release: () => {
@@ -304,4 +343,57 @@ export async function acquireSingleton(deps: SingletonGuardDeps = {}): Promise<S
       if (current && current.pid === selfPid) removeLock(lockPath);
     },
   };
+}
+
+/** Result of {@link stopRunningInstance}. */
+export interface StopRunningResult {
+  /** Was a runtime actually serving the port when we looked? */
+  wasRunning: boolean;
+  /** True when the port is free now (nothing ran, or the kill worked). */
+  stopped: boolean;
+}
+
+/**
+ * Stop the currently-running portable runtime, if any: probe the loopback api
+ * port, resolve the launcher pid (lock file → port owner), tree-kill it, and
+ * wait for the port to free. Shares the takeover's seams/mechanics but is a
+ * standalone "just stop it" — used by `portable service stop` on Windows, where
+ * `schtasks /End` only terminates the task's powershell wrapper and leaves the
+ * bun runtime alive. Never throws.
+ */
+export async function stopRunningInstance(
+  deps: SingletonGuardDeps = {}
+): Promise<StopRunningResult> {
+  const env = deps.env ?? process.env;
+  const lockPath = deps.lockPath ?? defaultLockPath();
+  const port = deps.port ?? resolveApiPort(env);
+  const probeHealth = deps.probeHealth ?? probeHealthReal;
+  const readLock = deps.readLock ?? readLockReal;
+  const aliveCheck = deps.isProcessAlive ?? isProcessAlive;
+  const findPortOwner = deps.findPortOwner ?? findPortOwnerReal;
+  const terminateTree = deps.terminateTree ?? terminateTreeReal;
+  const sleep = deps.sleep ?? sleepReal;
+  const log = deps.log ?? ((line: string) => console.log(line));
+  const portFreeTimeoutMs = deps.portFreeTimeoutMs ?? DEFAULT_PORT_FREE_TIMEOUT_MS;
+
+  if (!(await probeHealth(port))) return { wasRunning: false, stopped: true };
+
+  const existing = readLock(lockPath);
+  let pid = existing?.pid ?? null;
+  if (pid === null || !aliveCheck(pid)) {
+    pid = await findPortOwner(port);
+  }
+  if (pid) {
+    log(`[launcher] stopping the running portable on :${port} (pid ${pid})…`);
+    await terminateTree(pid);
+  } else {
+    log(`[launcher] :${port} is serving /api/health but its owner pid is unknown.`);
+  }
+
+  const deadline = Date.now() + portFreeTimeoutMs;
+  while (Date.now() < deadline) {
+    if (!(await probeHealth(port))) return { wasRunning: true, stopped: true };
+    await sleep(250);
+  }
+  return { wasRunning: true, stopped: false };
 }

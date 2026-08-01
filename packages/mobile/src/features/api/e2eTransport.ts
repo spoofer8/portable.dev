@@ -12,26 +12,26 @@
  * (the PC forgot the session — restart / TTL) the transport re-handshakes once
  * and replays, so a dropped session is invisible to callers.
  *
+ * The session cache is the SHARED one (`e2eSessionManager`) — the socket path
+ * seals frames with the same per-pcId session, so evictions must be visible
+ * both ways. An injected `sessionManager` keeps a private cache (tests).
+ *
  * The returned `e2eFetch(innerPath, init)` mimics `fetch`: it resolves to a
  * `Response`-like object carrying the decrypted inner status/headers/body, so
  * `RelayApiClient` consumes it exactly like a direct response.
  */
 import {
-  completeHandshake,
-  createHandshakeInit,
-  decodeBase64,
   openJson,
   sealJson,
   textToB64,
   b64ToText,
-  type E2eHandshakeResponse,
   type E2eInnerRequest,
   type E2eInnerResponse,
-  type E2eSession,
   type E2eTunnelPayload,
 } from '@vgit2/shared/e2e';
 
 import { nativeRandomBytes } from './e2eRandom';
+import { sharedE2eSessionManager, type E2eSessionManager } from './e2eSessionManager';
 
 /** A minimal Response-like the RelayApiClient already handles. */
 export interface E2eResponseLike {
@@ -46,11 +46,19 @@ export type E2eFetch = (absoluteUrl: string, init?: RequestInit) => Promise<E2eR
 
 export interface E2eTransportDeps {
   /**
-   * The outer transport for the `POST /api/e2e[/handshake]` requests — the
-   * existing `authedFetch` so the outer Bearer + `X-Renewed-Token` renewal keep
-   * working (identity is by-design visible to the relay).
+   * The outer transport for the `POST /api/e2e` tunnel requests — the existing
+   * `authedFetch` so the outer Bearer + `X-Renewed-Token` renewal keep working
+   * (identity is by-design visible to the relay). May be renew-armed.
    */
   outerFetch: (url: string, init?: RequestInit) => Promise<Response>;
+  /**
+   * The outer transport for the `POST /api/e2e/handshake` requests. MUST NOT be
+   * renew-armed: the renew flow itself awaits this handshake, so a renewing
+   * handshake would await its own in-flight promise (permanent deadlock).
+   * Required (not defaulted to `outerFetch`) so the split is a construction-time
+   * decision at every call site. Unused when `sessionManager` is injected.
+   */
+  handshakeFetch: (url: string, init?: RequestInit) => Promise<Response>;
   /** Resolve the connected pcId (session cache key). */
   getPcId: () => Promise<string | null>;
   /** Resolve the per-PC E2E pre-shared key (base64) stored from the QR. */
@@ -59,15 +67,12 @@ export interface E2eTransportDeps {
   getRelayBase: () => Promise<string>;
   /** Injectable CSPRNG (defaults to expo-crypto). */
   random?: typeof nativeRandomBytes;
+  /** Session cache (default: the SHARED per-pcId cache; inject a private one for tests). */
+  sessionManager?: E2eSessionManager;
 }
 
-/** Thrown when the connected PC has no stored E2E key (needs a QR re-scan). */
-export class NoE2eKeyError extends Error {
-  constructor() {
-    super('No E2E key for the connected PC — re-scan the pairing QR');
-    this.name = 'NoE2eKeyError';
-  }
-}
+// Session-manager error identity — a transport consumer catches ONE class.
+export { NoE2eKeyError } from './e2eSessionManager';
 
 /** Split an absolute relay URL back into the inner `/api/...` path the PC sees. */
 function innerPathFromUrl(absoluteUrl: string, relayBase: string): string {
@@ -118,38 +123,24 @@ function toResponseLike(inner: E2eInnerResponse): E2eResponseLike {
 
 export function createE2eFetch(deps: E2eTransportDeps): E2eFetch {
   const random = deps.random ?? nativeRandomBytes;
-  // In-memory session cache keyed by pcId (keys never persist — forward secrecy).
-  const sessions = new Map<string, E2eSession>();
-
-  async function handshake(pcId: string, relayBase: string): Promise<E2eSession> {
-    const keyB64 = await deps.getE2eKey(pcId);
-    if (!keyB64) throw new NoE2eKeyError();
-    const psk = decodeBase64(keyB64);
-    const init = createHandshakeInit(psk, random);
-    const res = await deps.outerFetch(`${relayBase}/api/e2e/handshake`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(init.message),
+  // Per-pcId session cache (keys never persist — forward secrecy). Handshakes
+  // ride `handshakeFetch`, never the possibly renew-armed `outerFetch`.
+  const manager =
+    deps.sessionManager ??
+    sharedE2eSessionManager({
+      outerFetch: deps.handshakeFetch,
+      getPcId: deps.getPcId,
+      getE2eKey: deps.getE2eKey,
+      getRelayBase: deps.getRelayBase,
+      random,
     });
-    if (!res.ok) {
-      throw new Error(`E2E handshake failed (${res.status})`);
-    }
-    const response = (await res.json()) as E2eHandshakeResponse;
-    const session = completeHandshake(psk, init.state, response);
-    sessions.set(pcId, session);
-    return session;
-  }
-
-  async function session(pcId: string, relayBase: string): Promise<E2eSession> {
-    return sessions.get(pcId) ?? handshake(pcId, relayBase);
-  }
 
   async function tunnelOnce(
     pcId: string,
     relayBase: string,
     inner: E2eInnerRequest
   ): Promise<{ status: number; response?: E2eInnerResponse }> {
-    const sess = await session(pcId, relayBase);
+    const sess = await manager.getOrCreate(pcId);
     const payload: E2eTunnelPayload = {
       sid: sess.sessionId,
       env: sealJson(sess.keys.c2s, inner, random),
@@ -160,8 +151,9 @@ export function createE2eFetch(deps: E2eTransportDeps): E2eFetch {
       body: JSON.stringify(payload),
     });
     if (res.status === 410) {
-      // The PC forgot this session — drop it so the caller re-handshakes.
-      sessions.delete(pcId);
+      // The PC forgot this session — evict it only while it is still the cached
+      // one (a late 410 must not tear down a session another attempt re-established).
+      if (manager.peek(pcId)?.sessionId === sess.sessionId) manager.drop(pcId);
       return { status: 410 };
     }
     if (!res.ok) {
@@ -186,10 +178,9 @@ export function createE2eFetch(deps: E2eTransportDeps): E2eFetch {
       bodyB64,
     };
 
-    // First attempt; on a session miss (410) re-handshake once and replay.
+    // First attempt; on a session miss (410) the replay re-handshakes.
     let result = await tunnelOnce(pcId, relayBase, inner);
     if (result.status === 410) {
-      await handshake(pcId, relayBase);
       result = await tunnelOnce(pcId, relayBase, inner);
     }
     if (!result.response) {

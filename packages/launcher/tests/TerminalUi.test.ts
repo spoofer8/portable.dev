@@ -98,6 +98,26 @@ describe('startLauncherUi', () => {
     expect(calls.render).toBe(1);
   });
 
+  it('threads the serviceControl factory through to the connected menu ([4] Services, PRD §3.2)', async () => {
+    let captured: { props: { serviceControl?: unknown } } | null = null;
+    const renderImpl = ((el: { props: { serviceControl?: unknown } }) => {
+      captured = el;
+      return {
+        rerender: (e: typeof el) => (captured = e),
+        unmount: () => {},
+      } as unknown as Instance;
+    }) as unknown as typeof import('ink').render;
+    const serviceControl = () => ({}) as never;
+    await startLauncherUi({
+      ...baseOpts,
+      initialPhase: 'connected',
+      qr: 'QR',
+      serviceControl,
+      renderImpl,
+    });
+    expect(captured!.props.serviceControl).toBe(serviceControl);
+  });
+
   it('swallows a rerender error (non-TTY / torn down)', async () => {
     const renderImpl = (() =>
       ({

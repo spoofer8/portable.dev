@@ -53,6 +53,15 @@ export async function getDeviceToken(pcId: string): Promise<string | null> {
   }
 }
 
+/**
+ * Strict variant of {@link getDeviceToken}: a storage read failure RETHROWS
+ * instead of degrading to null — `renewDataPathToken` treats `null` as a
+ * terminal re-pair signal, so a locked keychain must surface as retryable.
+ */
+export async function getDeviceTokenStrict(pcId: string): Promise<string | null> {
+  return SecureStore.getItemAsync(keyForPc(pcId));
+}
+
 /** True when this device already holds a data-path JWT for `pcId` (no QR needed). */
 export async function hasDeviceToken(pcId: string): Promise<boolean> {
   return (await getDeviceToken(pcId)) !== null;
@@ -92,4 +101,13 @@ export async function getE2eKey(pcId: string): Promise<string | null> {
     // Corrupt/undecryptable → treat as absent (the user re-links via QR).
     return null;
   }
+}
+
+/**
+ * Strict variant of {@link getE2eKey}: a storage read failure RETHROWS instead
+ * of degrading to null — "absent" routes to the QR scanner, so a locked
+ * keychain must not masquerade as a missing key.
+ */
+export async function getE2eKeyStrict(pcId: string): Promise<string | null> {
+  return SecureStore.getItemAsync(e2eKeyForPc(pcId));
 }

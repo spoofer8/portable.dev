@@ -25,8 +25,19 @@ export interface SocketLike {
   disconnect?(): unknown;
 }
 
+/**
+ * Handshake `auth`: a static object, or socket.io-client v4's callback form —
+ * invoked on every (re)connect attempt, so the caller can resolve a fresh
+ * credential per attempt without rebuilding the socket.
+ */
+export type SocketAuthOption =
+  | Record<string, unknown>
+  | ((cb: (data: Record<string, unknown>) => void) => void);
+
 /** Options accepted by {@link createSocket}; any Socket.IO manager/socket option is injectable. */
-export type CreateSocketOptions = Partial<ManagerOptions & SocketOptions>;
+export type CreateSocketOptions = Omit<Partial<ManagerOptions & SocketOptions>, 'auth'> & {
+  auth?: SocketAuthOption;
+};
 
 /**
  * Baseline connection options. Identical across platforms; callers override
@@ -53,7 +64,8 @@ const DEFAULT_OPTIONS: CreateSocketOptions = {
  * @param baseUrl - Origin to connect to (`'/'` for same-origin web, the sandbox
  *   URL for native).
  * @param opts - Platform overrides merged over {@link DEFAULT_OPTIONS}. A custom
- *   `auth` object, if provided, takes precedence over `authToken`.
+ *   `auth` (object or per-attempt callback, {@link SocketAuthOption}), if
+ *   provided, takes precedence over `authToken`.
  */
 export function createSocket(
   authToken: string | null | undefined,

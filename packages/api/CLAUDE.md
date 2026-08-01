@@ -480,6 +480,16 @@ JWT identity, never bodies/frames). Key pieces:
   the MAC is the auth) + `POST /api/e2e` (JWT-gated) decrypts the inner `{method,path,headers,
 body}` and **replays it over loopback** (`createLoopbackDispatch`) so every middleware
   applies, then encrypts `{status,headers,body}` back.
+- **PSK-proven token renewal (portable.dev#24)** — `POST /api/e2e/renew` (PUBLIC at the JWT
+  layer, like the handshake): the sealed c2s envelope carries the old pairing JWT
+  (`E2eRenewRequest`); opening it IS the auth (AEAD keys derivable only from the PSK
+  handshake). The route re-mints via `renewAuthTokenAllowExpired` (`@vgit2/shared/jwt` —
+  expired OK, signature must verify, non-pairing tokens refused) and answers the fresh token
+  sealed s2c (`E2eRenewResponse`). A phone holding the correct PSK is therefore NEVER locked
+  out by the 72h JWT expiry; revocation = rotating the pairing secrets (`portable unlink`),
+  which 401s both the handshake and the renew. REST 401s now carry a machine-readable
+  `code: 'token_expired' | 'token_invalid'`, and the socket handshake rejection sets
+  `err.data.code` (`token_expired` / `e2e_session_required`) for client classification.
 - **Socket.IO per-frame** — `services/socketE2e.ts` (`installServerSocketE2e`) wraps
   `socket.packet` (seals outbound EVENT/ACK with s2c — the one chokepoint for direct emits AND
   room broadcasts) + `socket.use` (opens inbound c2s). `SocketIOService.setupAuth` resolves the

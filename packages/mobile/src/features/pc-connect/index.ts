@@ -19,6 +19,7 @@ export {
   saveDeviceToken,
   clearDeviceToken,
   getE2eKey,
+  getE2eKeyStrict,
   saveE2eKey,
   DEVICE_TOKEN_KEY_PREFIX,
   E2E_KEY_PREFIX,
@@ -27,6 +28,7 @@ export {
   relayBaseForPc,
   saveConnectedPcId,
   getConnectedPcId,
+  getConnectedPcIdStrict,
   clearConnectedPcId,
   CONNECTED_PC_KEY,
 } from './connectedPcStore';

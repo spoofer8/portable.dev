@@ -26,9 +26,9 @@ jest.mock('expo-secure-store', () => {
   const store = new Map<string, string>();
   return {
     __store: store,
-    setItemAsync: async (k: string, v: string) => void store.set(k, v),
-    getItemAsync: async (k: string) => (store.has(k) ? store.get(k)! : null),
-    deleteItemAsync: async (k: string) => void store.delete(k),
+    setItemAsync: jest.fn(async (k: string, v: string) => void store.set(k, v)),
+    getItemAsync: jest.fn(async (k: string) => (store.has(k) ? store.get(k)! : null)),
+    deleteItemAsync: jest.fn(async (k: string) => void store.delete(k)),
   };
 });
 
@@ -162,7 +162,7 @@ describe('PcConnectGateHost — E2E-key self-heal (portable.dev#13)', () => {
     expect(screen.queryByTestId('app-marker')).toBeNull();
   });
 
-  it('an unreadable keychain (getE2eKey throws) fails open to the scanner, not a wedged app', async () => {
+  it('a persistently-unreadable E2E key surfaces the storage-error screen, never a silent re-scan (portable.dev#24)', async () => {
     const getE2eKey = jest.fn(async () => {
       throw new Error('keychain unavailable');
     });
@@ -173,8 +173,161 @@ describe('PcConnectGateHost — E2E-key self-heal (portable.dev#13)', () => {
       onLink: async () => {},
     });
 
-    await waitFor(() => expect(screen.getByTestId('pc-connect-landing')).toBeTruthy());
+    await waitFor(() => expect(screen.getByTestId('pc-connect-storage-error')).toBeTruthy(), {
+      timeout: 6000,
+    });
+    // The strict read was retried on the bounded ladder before surfacing.
+    expect(getE2eKey).toHaveBeenCalledTimes(3);
+    expect(screen.queryByTestId('pc-connect-landing')).toBeNull();
     expect(screen.queryByTestId('app-marker')).toBeNull();
+  }, 15000);
+});
+
+describe('PcConnectGateHost — keychain hardening (portable.dev#24)', () => {
+  it('a persistently-throwing pcId read lands on the storage-error screen, NOT the scanner', async () => {
+    const getConnectedPcId = jest.fn(async (): Promise<string | null> => {
+      throw new Error('keychain locked');
+    });
+    renderHost({
+      getConnectedPcId,
+      onConnect: async () => true,
+      onLink: async () => {},
+    });
+
+    await waitFor(() => expect(screen.getByTestId('pc-connect-storage-error')).toBeTruthy(), {
+      timeout: 6000,
+    });
+    expect(getConnectedPcId).toHaveBeenCalledTimes(3);
+    expect(screen.queryByTestId('pc-connect-landing')).toBeNull();
+    expect(screen.queryByTestId('app-marker')).toBeNull();
+  }, 15000);
+
+  it('a transient read failure self-heals within the retry ladder (no error screen, no scanner)', async () => {
+    let calls = 0;
+    const getConnectedPcId = jest.fn(async (): Promise<string | null> => {
+      calls += 1;
+      if (calls === 1) throw new Error('keychain settling');
+      return 'pc-1';
+    });
+    renderHost({
+      getConnectedPcId,
+      getE2eKey: async () => 'psk-base64',
+      onConnect: async () => true,
+      onLink: async () => {},
+    });
+
+    await waitFor(() => expect(screen.getByTestId('app-marker')).toBeTruthy(), {
+      timeout: 4000,
+    });
+    expect(getConnectedPcId).toHaveBeenCalledTimes(2);
+    expect(screen.queryByTestId('pc-connect-storage-error')).toBeNull();
+  }, 10000);
+
+  it('Retry re-runs the check — a now-readable keychain renders the app', async () => {
+    let calls = 0;
+    const getConnectedPcId = jest.fn(async (): Promise<string | null> => {
+      calls += 1;
+      if (calls <= 3) throw new Error('keychain locked');
+      return 'pc-1';
+    });
+    renderHost({
+      getConnectedPcId,
+      getE2eKey: async () => 'psk-base64',
+      onConnect: async () => true,
+      onLink: async () => {},
+    });
+
+    await waitFor(() => expect(screen.getByTestId('pc-connect-storage-error')).toBeTruthy(), {
+      timeout: 6000,
+    });
+
+    fireEvent.press(screen.getByTestId('pc-connect-error-retry'));
+
+    await waitFor(() => expect(screen.getByTestId('app-marker')).toBeTruthy());
+    expect(getConnectedPcId).toHaveBeenCalledTimes(4);
+    expect(screen.queryByTestId('pc-connect-storage-error')).toBeNull();
+  }, 15000);
+
+  it('the storage-error screen offers BOTH Retry and the "Connect PC" re-pair escape', async () => {
+    // A permanently-undecryptable pairing makes Retry loop forever — without the
+    // escape the app is bricked (Settings/Runtime live BELOW this gate).
+    const getConnectedPcId = jest.fn(async (): Promise<string | null> => {
+      throw new Error('keystore invalidated');
+    });
+    renderHost({
+      getConnectedPcId,
+      onConnect: async () => true,
+      onLink: async () => {},
+    });
+
+    await waitFor(() => expect(screen.getByTestId('pc-connect-storage-error')).toBeTruthy(), {
+      timeout: 6000,
+    });
+    expect(screen.getByTestId('pc-connect-error-retry')).toBeTruthy();
+    expect(screen.getByTestId('pc-connect-error-secondary')).toBeTruthy();
+  }, 15000);
+
+  it('the re-pair escape lands on the connect landing WITHOUT wiping the stored pairing', async () => {
+    const secureStore = jest.requireMock('expo-secure-store');
+    (secureStore.deleteItemAsync as jest.Mock).mockClear();
+    const getConnectedPcId = jest.fn(async (): Promise<string | null> => {
+      throw new Error('keystore invalidated');
+    });
+    renderHost({
+      getConnectedPcId,
+      onConnect: async () => true,
+      onLink: async () => {},
+    });
+
+    await waitFor(() => expect(screen.getByTestId('pc-connect-storage-error')).toBeTruthy(), {
+      timeout: 6000,
+    });
+
+    fireEvent.press(screen.getByTestId('pc-connect-error-secondary'));
+
+    await waitFor(() => expect(screen.getByTestId('pc-connect-landing')).toBeTruthy());
+    expect(screen.queryByTestId('pc-connect-storage-error')).toBeNull();
+    expect(secureStore.deleteItemAsync).not.toHaveBeenCalled();
+    expect(usePcConnectionStore.getState().disconnectSignal).toBe(0);
+    expect(getConnectedPcId).toHaveBeenCalledTimes(3);
+  }, 15000);
+
+  it('Retry stays primary and unchanged next to the escape — it re-runs the check', async () => {
+    let calls = 0;
+    const getConnectedPcId = jest.fn(async (): Promise<string | null> => {
+      calls += 1;
+      if (calls <= 3) throw new Error('keychain locked');
+      return 'pc-1';
+    });
+    renderHost({
+      getConnectedPcId,
+      getE2eKey: async () => 'psk-base64',
+      onConnect: async () => true,
+      onLink: async () => {},
+    });
+
+    await waitFor(() => expect(screen.getByTestId('pc-connect-storage-error')).toBeTruthy(), {
+      timeout: 6000,
+    });
+    expect(screen.getByTestId('pc-connect-error-secondary')).toBeTruthy();
+
+    fireEvent.press(screen.getByTestId('pc-connect-error-retry'));
+
+    await waitFor(() => expect(screen.getByTestId('app-marker')).toBeTruthy());
+    expect(getConnectedPcId).toHaveBeenCalledTimes(4);
+  }, 15000);
+
+  it('a SUCCESSFUL null read still routes to the connect landing (unchanged posture)', async () => {
+    const getConnectedPcId = jest.fn(async (): Promise<string | null> => null);
+    renderHost({
+      getConnectedPcId,
+      onConnect: async () => true,
+      onLink: async () => {},
+    });
+
+    await waitFor(() => expect(screen.getByTestId('pc-connect-landing')).toBeTruthy());
+    expect(getConnectedPcId).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId('pc-connect-storage-error')).toBeNull();
   });
 });
 

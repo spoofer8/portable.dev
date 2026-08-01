@@ -14,10 +14,10 @@
  *  - the Socket.IO handshake (`UserValidationHandler.validateSocketAuth`, no device
  *    token in deps — the 3-part JWT branch, `username` present per D16).
  *
- * The signing secret is `process.env.JWT_SECRET` — force-set by the test preload
- * (`tests/setup/preload.ts`) before `@vgit2/shared` loads, so it is the SAME secret
- * `verifyAuthToken` reads from `constants.JWT_SECRET`. That mirrors D17 exactly: the
- * launcher mints and the api validates with one shared local secret.
+ * The signing secret is the module-captured `JWT_SECRET` (`generateAuthToken`'s
+ * default) — force-set by the test preload before `@vgit2/shared` loads, so it
+ * is the SAME secret `verifyAuthToken` reads (D17: one shared local secret).
+ * A live `process.env.JWT_SECRET` read would diverge under full-suite runs.
  *
  * Each case asserts ONE deterministic outcome.
  */
@@ -40,11 +40,11 @@ const LAUNCHER_PAYLOAD = {
 } as const;
 
 /**
- * Mint a JWT exactly the way the launcher does (D16): `generateAuthToken` with the
- * locally-ensured `JWT_SECRET`. The api validates with the SAME secret from env.
+ * Mint a JWT exactly the way the launcher does (D16): `generateAuthToken` with
+ * the module-captured default `JWT_SECRET`.
  */
 function mintLauncherJwt(overrides?: Partial<typeof LAUNCHER_PAYLOAD>): string {
-  return generateAuthToken({ ...LAUNCHER_PAYLOAD, ...overrides }, process.env.JWT_SECRET);
+  return generateAuthToken({ ...LAUNCHER_PAYLOAD, ...overrides });
 }
 
 interface MockRes {
@@ -145,15 +145,30 @@ describe('rev6: launcher-minted JWT validates on Socket.IO (validateSocketAuth, 
 
   it('rejects a 3-part JWT missing the mandatory username field (D16 warning)', async () => {
     // Mint without `username` to prove the handshake enforces D16's hard requirement.
-    const token = generateAuthToken(
-      { userId: 'pc_local_user', email: 'local@host' } as typeof LAUNCHER_PAYLOAD,
-      process.env.JWT_SECRET
-    );
+    const token = generateAuthToken({
+      userId: 'pc_local_user',
+      email: 'local@host',
+    } as typeof LAUNCHER_PAYLOAD);
     const handler = makeHandler();
 
     const result = await handler.validateSocketAuth(token);
 
     expect(result.valid).toBe(false);
     expect(result.error).toContain('username');
+  });
+
+  it("classifies an EXPIRED JWT as code 'token_expired' with NO GitHub-token fallback", async () => {
+    // The exact error string proves the GitHub fallback never ran (that path
+    // would surface an Octokit failure, not the typed expiry).
+    const token = generateAuthToken(LAUNCHER_PAYLOAD, undefined, {
+      expiresIn: '-10s',
+    });
+    const handler = makeHandler();
+
+    const result = await handler.validateSocketAuth(token);
+
+    expect(result.valid).toBe(false);
+    expect(result.error).toBe('Token has expired');
+    expect(result.code).toBe('token_expired');
   });
 });

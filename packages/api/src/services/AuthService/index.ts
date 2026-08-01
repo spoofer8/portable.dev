@@ -35,6 +35,7 @@ import type {
   WaitlistEntry,
   GitHubPermissionStatus,
 } from './types';
+import type { JwtErrorCode } from '@vgit2/shared/jwt';
 import type { Request, Response } from 'express';
 
 // Re-export types for backward compatibility
@@ -282,6 +283,8 @@ export class AuthService {
     userEmail?: string;
     username?: string;
     error?: string;
+    /** Machine-readable failure: `token_expired` → renew via /api/e2e/renew. */
+    code?: JwtErrorCode;
   }> {
     return this.userValidationHandler.validateSocketAuth(token);
   }

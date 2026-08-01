@@ -134,4 +134,83 @@ describe('acquireSingleton', () => {
     // Ours released over theirs would be wrong — the newer lock must survive.
     expect(h.getLock()?.pid).toBe(1234);
   });
+
+  // ── background service interplay (portable.dev#12) ─────────────────────────
+
+  it('stamps the lock with service:true when booting as the background service', async () => {
+    const h = harness({ initialLock: null, healthSequence: [false] });
+    await acquireSingleton({ ...h.deps, service: true });
+    expect(h.getLock()).toEqual({
+      pid: 999,
+      port: 4200,
+      startedAt: '2026-06-28T00:00:00.000Z',
+      service: true,
+    });
+  });
+
+  it('a MANUAL run refuses to take over a LIVE service-managed instance (no kill, blocked)', async () => {
+    // Without this refusal the supervisor (systemd / Task Scheduler) would respawn
+    // the killed service, which would then take over the manual run — a fight loop.
+    const serviceLock: LauncherLock = { pid: 222, port: 4200, startedAt: 'old', service: true };
+    const h = harness({ initialLock: serviceLock, healthSequence: [true] });
+    const handle = await acquireSingleton(h.deps);
+
+    expect(handle.blocked).toBe(true);
+    expect(h.killed).toEqual([]);
+    expect(h.getLock()?.pid).toBe(222); // the service's lock is untouched
+    expect(h.log.join('\n')).toContain('portable service stop');
+    handle.release(); // must be a safe no-op
+    expect(h.getLock()?.pid).toBe(222);
+  });
+
+  it('a SERVICE run takes over a running manual instance as usual', async () => {
+    const manualLock: LauncherLock = { pid: 222, port: 4200, startedAt: 'old' };
+    const h = harness({ initialLock: manualLock, healthSequence: [true, false] });
+    const handle = await acquireSingleton({ ...h.deps, service: true });
+
+    expect(handle.blocked).toBeUndefined();
+    expect(h.killed).toEqual([222]);
+    expect(h.getLock()?.service).toBe(true);
+  });
+
+  it('a STALE service lock (runtime dead) does not block a manual run', async () => {
+    const staleService: LauncherLock = { pid: 222, port: 4200, startedAt: 'old', service: true };
+    const h = harness({ initialLock: staleService, healthSequence: [false] });
+    const handle = await acquireSingleton(h.deps);
+
+    expect(handle.blocked).toBeUndefined();
+    expect(h.killed).toEqual([]);
+    expect(h.getLock()).toEqual({
+      pid: 999,
+      port: 4200,
+      startedAt: '2026-06-28T00:00:00.000Z',
+    });
+  });
+});
+
+describe('stopRunningInstance', () => {
+  it('reports not-running without killing anything', async () => {
+    const h = harness({ initialLock: null, healthSequence: [false] });
+    const { stopRunningInstance } = await import('../src/SingletonGuard.js');
+    const result = await stopRunningInstance(h.deps);
+    expect(result).toEqual({ wasRunning: false, stopped: true });
+    expect(h.killed).toEqual([]);
+  });
+
+  it('tree-kills the running instance (pid from the lock) and waits for the port to free', async () => {
+    const running: LauncherLock = { pid: 222, port: 4200, startedAt: 'old', service: true };
+    const h = harness({ initialLock: running, healthSequence: [true, false] });
+    const { stopRunningInstance } = await import('../src/SingletonGuard.js');
+    const result = await stopRunningInstance(h.deps);
+    expect(result).toEqual({ wasRunning: true, stopped: true });
+    expect(h.killed).toEqual([222]);
+  });
+
+  it('reports stopped:false when the port never frees', async () => {
+    const running: LauncherLock = { pid: 222, port: 4200, startedAt: 'old' };
+    const h = harness({ initialLock: running, healthSequence: [true] });
+    const { stopRunningInstance } = await import('../src/SingletonGuard.js');
+    const result = await stopRunningInstance(h.deps);
+    expect(result).toEqual({ wasRunning: true, stopped: false });
+  });
 });

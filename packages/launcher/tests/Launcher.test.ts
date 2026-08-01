@@ -215,6 +215,62 @@ function makeDeps(trace: Trace) {
   };
 }
 
+describe('Launcher service-mode (portable.dev#12 follow-up)', () => {
+  it('§7 writes daemon runtime-state at boot milestones (+ stopping on shutdown)', async () => {
+    const trace: Trace = { order: [] };
+    const { deps } = makeDeps(trace);
+    const patches: Array<Record<string, unknown>> = [];
+    deps.runtimeState = {
+      patch: (p) => patches.push(p as Record<string, unknown>),
+      clear: () => {},
+    };
+    const launcher = new Launcher(deps);
+    await launcher.boot();
+    // First milestone: boot start (api not healthy yet).
+    expect(patches[0]).toEqual({ phase: 'starting', apiHealthy: false });
+    // Then: api serving.
+    expect(patches).toContainEqual({ apiHealthy: true });
+    // Then: a tunnel/relay milestone (apiHealthy + a relayRegistered decision).
+    expect(patches.some((p) => p.apiHealthy === true && 'relayRegistered' in p)).toBe(true);
+    await launcher.shutdown();
+    expect(patches).toContainEqual({ phase: 'stopping' });
+  });
+
+  it('§8.4 does NOT serve the permanent boot-token QR page when servePairingPage is false', async () => {
+    const trace: Trace = { order: [] };
+    const { deps } = makeDeps(trace);
+    deps.servePairingPage = false;
+    const result = await new Launcher(deps).boot();
+    expect(trace.order).not.toContain('pairing.start');
+    expect(result.loopbackUrl).toBeUndefined();
+  });
+
+  it('serves the pairing page by default (interactive parity)', async () => {
+    const trace: Trace = { order: [] };
+    const { deps } = makeDeps(trace);
+    await new Launcher(deps).boot();
+    expect(trace.order).toContain('pairing.start');
+  });
+
+  it('§10 releaseRuntimeForHandoff tears down api/tunnel/pairing/watchers but NOT the UI', async () => {
+    const trace: Trace = { order: [] };
+    const { deps } = makeDeps(trace);
+    const launcher = new Launcher(deps);
+    await launcher.boot();
+    await launcher.releaseRuntimeForHandoff();
+    // The manual runtime is freed so the daemon can bind the port…
+    expect(trace.order).toContain('pairing.stop');
+    expect(trace.order).toContain('tunnel.stop');
+    expect(trace.order).toContain('api.stop');
+    expect(trace.order).toContain('presence.stop');
+    // …but the Ink UI (the dashboard) stays alive.
+    expect(trace.order).not.toContain('ui.stop');
+    // Idempotent.
+    await launcher.releaseRuntimeForHandoff();
+    expect(trace.order.filter((o) => o === 'api.stop')).toHaveLength(1);
+  });
+});
+
 describe('Launcher.boot', () => {
   it('mounts the booting box, then api → health → mint → tunnel → pairing → ready — in order', async () => {
     const trace: Trace = { order: [] };

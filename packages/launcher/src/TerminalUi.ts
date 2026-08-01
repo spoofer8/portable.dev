@@ -1,9 +1,37 @@
 import { type DeviceInfo } from '@vgit2/shared/secrets';
-import { Box, render, Text, useInput, useStdout, type Instance } from 'ink';
+import { Box, render, Text, useInput, type Instance } from 'ink';
 import QRCode from 'qrcode';
-import { createElement as h, useEffect, useState } from 'react';
+import { createElement as h, useEffect, useRef, useState } from 'react';
 
 import { type ChatSummary } from './ChatsClient.js';
+import {
+  createDashboardMachine,
+  ServiceDashboardBody,
+  type DashboardDebugSource,
+  type DashboardMachine,
+  type DashboardPairingSession,
+} from './ServiceDashboardUi.js';
+import {
+  BottomBar,
+  Hr,
+  Spinner,
+  TopStatusBar,
+  truncate,
+  useTerminalSize,
+} from './terminalChrome.js';
+import { formatRelativeTime } from './timeFormat.js';
+
+import type { ServiceController } from './ServiceController.js';
+
+// Re-export so existing importers (`import { formatRelativeTime } from './TerminalUi'`) keep working.
+export { formatRelativeTime };
+
+/** Everything the connected menu's "[4] Services" interactive sub-view needs (PRD §3.2). */
+export interface ServiceControlDeps {
+  controller: ServiceController;
+  pairing?: DashboardPairingSession;
+  debug?: DashboardDebugSource;
+}
 
 /**
  * The launcher's steady-state terminal UI (Ink / React), rendered AFTER the api is
@@ -56,23 +84,6 @@ export async function renderTerminalQr(payload: string): Promise<string> {
   });
 }
 
-/** Humanize an ISO timestamp into a short relative string ("3m ago", "2d ago"). */
-export function formatRelativeTime(iso: string | undefined, now: Date = new Date()): string {
-  if (!iso) return 'unknown';
-  const then = Date.parse(iso);
-  if (!Number.isFinite(then)) return 'unknown';
-  const sec = Math.max(0, Math.round((now.getTime() - then) / 1000));
-  if (sec < 45) return 'just now';
-  const min = Math.round(sec / 60);
-  if (min < 60) return `${min}m ago`;
-  const hr = Math.round(min / 60);
-  if (hr < 24) return `${hr}h ago`;
-  const day = Math.round(hr / 24);
-  if (day === 1) return 'Yesterday';
-  if (day < 30) return `${day}d ago`;
-  return new Date(then).toLocaleDateString();
-}
-
 /**
  * The "[3] MCP Server" status sub-view data (rev12 D61). `sessions` is the
  * live terminal-session registry read over loopback (null while loading /
@@ -114,6 +125,12 @@ export interface RootScreenProps {
   onQuit: () => void;
   /** rev12 D61: the "[3] MCP Server" status view's data provider. */
   mcpStatus?: McpStatusProvider;
+  /**
+   * portable.dev#12 follow-up (PRD §3.2): lazily build the deps for the connected
+   * menu's interactive "[4] Services" sub-view (controller + fresh-pairing + debug).
+   * Called once when the user first opens Services; undefined → the entry is hidden.
+   */
+  serviceControl?: () => ServiceControlDeps;
 }
 
 /** The QR + pairing instructions (first run / "add a device"). No hooks. */
@@ -177,52 +194,6 @@ export function PairingView(props: RootScreenProps): ReturnType<typeof h> {
       ),
     })
   );
-}
-
-/**
- * Reactive terminal size — re-renders the screen on resize so the layout always
- * fills the current terminal (we treat the whole terminal as our canvas).
- */
-function useTerminalSize(): { columns: number; rows: number } {
-  const { stdout } = useStdout();
-  const [size, setSize] = useState(() => ({
-    columns: stdout?.columns ?? 100,
-    rows: stdout?.rows ?? 30,
-  }));
-  useEffect(() => {
-    if (!stdout) return;
-    const onResize = () => setSize({ columns: stdout.columns ?? 100, rows: stdout.rows ?? 30 });
-    stdout.on('resize', onResize);
-    onResize();
-    return () => {
-      stdout.off('resize', onResize);
-    };
-  }, [stdout]);
-  return size;
-}
-
-/** A horizontal rule (section divider) of the given column width. */
-function Hr(props: { width: number; color?: string }): ReturnType<typeof h> {
-  return h(Text, { color: props.color ?? 'gray' }, '─'.repeat(Math.max(0, props.width)));
-}
-
-/** A live HH:MM clock (top-bar, right side). */
-function Clock(): ReturnType<typeof h> {
-  const [now, setNow] = useState(() => new Date());
-  useEffect(() => {
-    const t = setInterval(() => setNow(new Date()), 1000);
-    if (typeof (t as { unref?: () => void }).unref === 'function')
-      (t as { unref: () => void }).unref();
-    return () => clearInterval(t);
-  }, []);
-  const hh = String(now.getHours()).padStart(2, '0');
-  const mm = String(now.getMinutes()).padStart(2, '0');
-  return h(Text, { color: 'gray' }, `${hh}:${mm}`);
-}
-
-/** Truncate a string to `n` cols with an ellipsis. */
-function truncate(s: string, n: number): string {
-  return s.length <= n ? s : `${s.slice(0, Math.max(0, n - 1))}…`;
 }
 
 /** Compact device-presence HEADER shown above the chats list (right column). */
@@ -393,53 +364,6 @@ function answerSegments(a: AnswerSegment[], baseColor: string): ReturnType<typeo
   return a.map((s, i) => h(Text, { key: i, color: s.emphasis ? BRAND_COLOR : baseColor }, s.text));
 }
 
-/** The top status bar (PORTABLE · ● label →→ <phone> · ● CONNECTED HH:MM) — shared by screens. */
-function TopStatusBar(props: {
-  phoneConnected: boolean;
-  label: string;
-  phoneName?: string;
-}): ReturnType<typeof h> {
-  const phoneColor = props.phoneConnected ? 'green' : 'red';
-  // The make/model the phone self-reports (expo-device); else a plain "phone".
-  const phoneName = props.phoneName?.trim() || 'phone';
-  return h(
-    Box,
-    { width: '100%', justifyContent: 'space-between' },
-    h(Text, { bold: true, color: 'whiteBright' }, 'PORTABLE'),
-    // center — <PC name> →→ <phone>. The first arrow is always green (the desktop is
-    // always there); the second arrow + phone name are red until a phone connects.
-    h(
-      Box,
-      {},
-      h(Text, { color: 'green' }, '● '),
-      h(Text, { bold: true, color: 'green' }, props.label),
-      h(Text, {}, ' '),
-      h(Text, { bold: true, color: 'green' }, '→'),
-      h(Text, { bold: true, color: phoneColor }, '→'),
-      h(Text, {}, ' '),
-      h(Text, { bold: true, color: phoneColor }, phoneName)
-    ),
-    // right — connection badge + clock
-    h(
-      Box,
-      {},
-      h(Text, { color: phoneColor }, `● ${props.phoneConnected ? 'CONNECTED' : 'Disconnected'}`),
-      h(Text, {}, '   '),
-      h(Clock)
-    )
-  );
-}
-
-/** The bottom context-hint bar (left hints, right quit) — shared by screens. */
-function BottomBar(props: { left: string; right: string }): ReturnType<typeof h> {
-  return h(
-    Box,
-    { width: '100%', justifyContent: 'space-between' },
-    h(Text, { color: 'gray' }, props.left),
-    h(Text, { color: 'gray' }, props.right)
-  );
-}
-
 /**
  * The scrollable Help/FAQ list (right pane of the Help screen). Each entry shows the
  * question (Q) with its answer (A) beneath. The hovered entry auto-expands to the full
@@ -504,7 +428,7 @@ function FaqList(props: {
  */
 export function ConnectedMenuView(props: RootScreenProps): ReturnType<typeof h> {
   const chats = props.chats ?? [];
-  const [mode, setMode] = useState<'menu' | 'qr' | 'action' | 'help' | 'mcp'>('menu');
+  const [mode, setMode] = useState<'menu' | 'qr' | 'action' | 'help' | 'mcp' | 'services'>('menu');
   const [focus, setFocus] = useState<'menu' | 'chats'>('menu');
   const [menuSel, setMenuSel] = useState(0);
   const [chatSel, setChatSel] = useState(0);
@@ -537,6 +461,34 @@ export function ConnectedMenuView(props: RootScreenProps): ReturnType<typeof h> 
       clearInterval(timer);
     };
   }, [mode, props.mcpStatus]);
+
+  // "[4] Services" interactive sub-view (portable.dev#12, PRD §3.2). The dashboard
+  // state machine is embedded IN this menu (same Ink instance): a ref holds it,
+  // onChange forces a re-render, and this menu's single useInput forwards keys to
+  // it while in 'services' mode (no nested input handler). Built lazily on entry.
+  const serviceMachineRef = useRef<DashboardMachine | null>(null);
+  const [, forceServiceRender] = useState(0);
+  useEffect(() => {
+    if (mode !== 'services') return;
+    const deps = props.serviceControl?.();
+    if (!deps) return;
+    const machine = createDashboardMachine({
+      controller: deps.controller,
+      pairing: deps.pairing,
+      debug: deps.debug,
+      onExit: () => {
+        serviceMachineRef.current = null;
+        setMode('menu');
+      },
+      onChange: () => forceServiceRender((n) => n + 1),
+    });
+    serviceMachineRef.current = machine;
+    machine.start();
+    return () => {
+      machine.stop();
+      serviceMachineRef.current = null;
+    };
+  }, [mode, props.serviceControl]);
 
   // Terminal size is read ONCE here (a hook) so the hook order stays stable across
   // every `mode` branch below — Ink re-renders the SAME component when `mode` changes,
@@ -584,6 +536,20 @@ export function ConnectedMenuView(props: RootScreenProps): ReturnType<typeof h> 
       return;
     }
 
+    if (mode === 'services') {
+      // Forward every key to the embedded dashboard machine (its own state machine
+      // handles ↑/↓ select, Enter, number keys, and 'b'/back → onExit → menu).
+      // Single useInput, no nesting.
+      serviceMachineRef.current?.onKey(input, {
+        escape: !!key.escape,
+        return: !!key.return,
+        ctrl: !!key.ctrl,
+        upArrow: !!key.upArrow,
+        downArrow: !!key.downArrow,
+      });
+      return;
+    }
+
     if (mode === 'help') {
       const openMenu = () => {
         setMode('menu');
@@ -613,16 +579,23 @@ export function ConnectedMenuView(props: RootScreenProps): ReturnType<typeof h> 
         setMcpView(null);
         setMode('mcp');
       };
+      const openServices = () => {
+        // Only enter the Services sub-view when its deps are wired (the effect
+        // above builds the machine on entry).
+        if (props.serviceControl) setMode('services');
+      };
       if (input === '1') setMode('qr');
       else if (input === '2') openHelp();
       else if (input === '3') openMcp();
-      else if (input === '4' || input === 'q') props.onQuit();
+      else if (input === '4') openServices();
+      else if (input === '5' || input === 'q') props.onQuit();
       else if (key.upArrow) setMenuSel((s) => Math.max(0, s - 1));
-      else if (key.downArrow) setMenuSel((s) => Math.min(3, s + 1));
+      else if (key.downArrow) setMenuSel((s) => Math.min(4, s + 1));
       else if (key.return) {
         if (menuSel === 0) setMode('qr');
         else if (menuSel === 1) openHelp();
         else if (menuSel === 2) openMcp();
+        else if (menuSel === 3) openServices();
         else props.onQuit();
       } else if (key.rightArrow && chats.length > 0) {
         setChatSel((s) => clampSel(s));
@@ -775,6 +748,26 @@ export function ConnectedMenuView(props: RootScreenProps): ReturnType<typeof h> 
     );
   }
 
+  // ── Services sub-view (portable.dev#12, PRD §3.2) — the FULL interactive service
+  //    dashboard, embedded in this menu (same Ink instance). Same view as the
+  //    standalone `portable` dashboard; keys are routed to the machine above. ─────
+  if (mode === 'services') {
+    const st = serviceMachineRef.current?.getState();
+    return h(ServiceDashboardBody, {
+      label: props.label,
+      mode: st?.mode ?? 'dashboard',
+      snapshot: st?.snapshot ?? null,
+      busy: st?.busy ?? false,
+      notice: st?.notice,
+      error: st?.error,
+      pairing: st?.pairing,
+      debugLines: st?.debugLines,
+      debugMeta: st?.debugMeta,
+      debugFollowing: st?.debugFollowing,
+      selectedIndex: st?.selectedIndex,
+    });
+  }
+
   // ── Help / FAQ sub-view — preserves the chrome; swaps the panes (left = Back,
   //    right = a scrollable FAQ with expandable answers). ────────────────────────
   if (mode === 'help') {
@@ -910,7 +903,8 @@ export function ConnectedMenuView(props: RootScreenProps): ReturnType<typeof h> 
           menuRow(0, '[1]', 'Pair Device', '(QR Code)'),
           menuRow(1, '[2]', 'Help'),
           menuRow(2, '[3]', 'MCP Server'),
-          menuRow(3, '[4]', 'Quit')
+          menuRow(3, '[4]', 'Services'),
+          menuRow(4, '[5]', 'Quit')
         )
       ),
       // Vertical rule (stretches to the body height).
@@ -955,19 +949,6 @@ export function ConnectedMenuView(props: RootScreenProps): ReturnType<typeof h> 
       right: 'Ctrl-C  quit',
     })
   );
-}
-
-/** A braille dot spinner that animates on its own timer (Ink re-renders on tick). */
-function Spinner(): ReturnType<typeof h> {
-  const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-  const [frame, setFrame] = useState(0);
-  useEffect(() => {
-    const t = setInterval(() => setFrame((f) => f + 1), 120);
-    if (typeof (t as { unref?: () => void }).unref === 'function')
-      (t as { unref: () => void }).unref();
-    return () => clearInterval(t);
-  }, []);
-  return h(Text, { color: 'cyan' }, frames[frame % frames.length]);
 }
 
 /**
@@ -1071,6 +1052,8 @@ export interface StartLauncherUiOptions {
   onResumeChat?: (chat: ChatSummary) => void;
   /** rev12 D61: the "[3] MCP Server" status view's data provider. */
   mcpStatus?: McpStatusProvider;
+  /** portable.dev#12: lazily build the interactive "[4] Services" sub-view deps (PRD §3.2). */
+  serviceControl?: () => ServiceControlDeps;
   /** Ink render seam (tests inject a fake returning an {@link Instance}). */
   renderImpl?: typeof render;
 }
@@ -1109,6 +1092,7 @@ export async function startLauncherUi(options: StartLauncherUiOptions): Promise<
       onResumeChat: options.onResumeChat,
       onQuit: options.onQuit,
       mcpStatus: options.mcpStatus,
+      serviceControl: options.serviceControl,
     });
 
   let instance: Instance | null = renderImpl(build());
@@ -1165,6 +1149,45 @@ export async function startLauncherUi(options: StartLauncherUiOptions): Promise<
  * logs each boot step, `ready` prints the QR block once, `showConnected` logs a
  * one-liner, `stop` is a no-op.
  */
+/**
+ * `portable connect --service` (portable.dev#12): the HEADLESS daemon handle —
+ * no Ink, no QR print (nobody is watching a terminal; on Linux these lines land
+ * in the journal, and the cli routes them to the api log file too). `ready`
+ * logs the relay endpoint + loopback pairing URL once; device presence is
+ * logged only on CHANGE so the poll doesn't spam the log.
+ */
+export async function startHeadlessUi(
+  options: StartLauncherUiOptions & { log?: (line: string) => void }
+): Promise<LauncherUiHandle> {
+  const log = options.log ?? ((line: string) => process.stdout.write(`${line}\n`));
+  if (options.status) log(`[launcher] ${options.status}`);
+  let lastDeviceCount = -1;
+
+  return {
+    setStatus: (next) => log(`[launcher] ${next}`),
+    ready: (opts) => {
+      log('[service] portable is running in the background.');
+      log(`[service] relay endpoint: ${options.endpoint} (${options.label} · ${options.pcId})`);
+      if (opts.loopbackUrl) log(`[service] pairing page (on this PC): ${opts.loopbackUrl}`);
+      log(
+        '[service] to pair a NEW phone, run `portable service stop`, then `portable` in a terminal for the QR.'
+      );
+    },
+    showConnected: () => log('[launcher] a device connected.'),
+    setDevices: (devices) => {
+      if (devices.length === lastDeviceCount) return;
+      lastDeviceCount = devices.length;
+      log(
+        devices.length === 0
+          ? '[launcher] no mobile device connected.'
+          : `[launcher] ${devices.length} mobile device(s) connected.`
+      );
+    },
+    setChats: () => {}, // headless: no chats UI
+    stop: () => {},
+  };
+}
+
 export async function startStaticUi(
   options: StartLauncherUiOptions & { log?: (line: string) => void }
 ): Promise<LauncherUiHandle> {

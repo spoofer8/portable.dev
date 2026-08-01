@@ -35,13 +35,16 @@ const ENVELOPE_PREFIX = 'v1';
  * Resolve the local data directory for the PC runtime.
  * Precedence: explicit override → $PORTABLE_DATA_DIR → $DATA_DIR →
  * $XDG_DATA_HOME/portable → ~/.portable
+ *
+ * `env` defaults to the live process env; the service installers pass a
+ * captured snapshot to resolve the daemon's data dir from the operator's shell.
  */
-export function resolveDataDir(override?: string): string {
+export function resolveDataDir(override?: string, env: NodeJS.ProcessEnv = process.env): string {
   const fromEnv =
     override ||
-    process.env.PORTABLE_DATA_DIR ||
-    process.env.DATA_DIR ||
-    (process.env.XDG_DATA_HOME ? path.join(process.env.XDG_DATA_HOME, 'portable') : undefined) ||
+    env.PORTABLE_DATA_DIR ||
+    env.DATA_DIR ||
+    (env.XDG_DATA_HOME ? path.join(env.XDG_DATA_HOME, 'portable') : undefined) ||
     path.join(os.homedir(), '.portable');
 
   // Expand a leading ~ for env-provided paths (mirrors shared/constants behavior).

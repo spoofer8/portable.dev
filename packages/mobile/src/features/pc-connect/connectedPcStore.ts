@@ -55,6 +55,15 @@ export async function getConnectedPcId(): Promise<string | null> {
   }
 }
 
+/**
+ * Strict variant of {@link getConnectedPcId}: a storage read failure RETHROWS
+ * instead of degrading to null, so `null` always means "no pairing stored" —
+ * a transiently-locked keychain must not route a paired device to the scanner.
+ */
+export async function getConnectedPcIdStrict(): Promise<string | null> {
+  return SecureStore.getItemAsync(CONNECTED_PC_KEY);
+}
+
 /** Forget the connected PC (sign-out / explicit re-pick). Device tokens are kept. */
 export async function clearConnectedPcId(): Promise<void> {
   await SecureStore.deleteItemAsync(CONNECTED_PC_KEY);

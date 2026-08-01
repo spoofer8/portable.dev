@@ -4,6 +4,27 @@ Patch notes for the Portable CLI, published to npm as
 [`@volter-ai/portable.dev`](https://www.npmjs.com/package/@volter-ai/portable.dev).
 Versions follow the monorepo release version.
 
+## [3.5.4] - 2026-08-01
+
+### Added
+
+- Run Portable as a background service: `portable service install` keeps your PC
+  reachable after you close the terminal and across reboots. Available on Windows,
+  macOS, and Linux; manage it with `portable service status | start | stop | restart |
+uninstall`.
+- With the service installed, running `portable` opens a live Services dashboard: check
+  the daemon's health, tunnel, and connected devices; start, stop, or restart it; and
+  show a fresh pairing QR at any time — no restart needed. The same dashboard is also
+  available from the connected menu.
+- `portable service debug` prints the service status and recent logs, then follows them
+  live (`--no-follow` for a one-shot dump).
+
+### Fixed
+
+- Your phone now stays paired even if you don't open the app for days: the pairing
+  renews itself silently in the background, so you only need to scan a QR code again
+  after running `portable unlink` on your PC.
+
 ## [3.5.3] - 2026-07-11
 
 ### Added

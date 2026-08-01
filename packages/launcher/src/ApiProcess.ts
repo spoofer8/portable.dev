@@ -98,7 +98,12 @@ export interface ApiProcessOptions {
   childEnvOverrides?: ApiChildEnvOverrides;
   /** child_process.spawn seam (injected in tests). */
   spawnImpl?: SpawnImpl;
-  /** Bun executable. Defaults to 'bun'. */
+  /**
+   * Bun executable. Defaults to `process.execPath` (the bun running the
+   * launcher) — NOT the bare name 'bun', which fails to resolve under service
+   * supervisors (launchd/systemd/Task Scheduler) whose minimal PATH lacks
+   * `~/.bun/bin`.
+   */
   bun?: string;
   /** Grace period (ms) between SIGTERM and SIGKILL on stop(). Default 8000. */
   killGraceMs?: number;
@@ -122,7 +127,7 @@ export class ApiProcess {
     this.env = options.env ?? process.env;
     this.childEnvOverrides = options.childEnvOverrides ?? {};
     this.spawnImpl = options.spawnImpl ?? spawn;
-    this.bun = options.bun ?? 'bun';
+    this.bun = options.bun ?? process.execPath;
     this.killGraceMs = options.killGraceMs ?? 8000;
     this.log = options.log ?? ((line) => console.log(line));
   }

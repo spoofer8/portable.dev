@@ -12,6 +12,8 @@
  *     (2) probes the AUTHED `GET /api/user-settings` — a `401`/`403` means the PC
  *     rejected the token (fail-fast, e.g. a JWT_SECRET mismatch) → false; any other
  *     authed outcome (non-401) never blocks a valid token (liveness already passed).
+ *     Under mandatory E2E the plaintext probe answers `426`, so with the candidate's
+ *     PSK the token check runs SEALED via the renew probe with candidate-scoped deps.
  *   - connectToPc: no stored token → `no-token`; token + healthy → ready; token +
  *     unhealthy → `unhealthy`.
  *
@@ -31,19 +33,36 @@ jest.mock('expo-secure-store', () => {
   };
 });
 
+import crypto from 'crypto';
+
+import {
+  encodeBase64,
+  openJson,
+  respondToHandshake,
+  sealJson,
+  type E2eEnvelope,
+  type E2eHandshakeInit,
+} from '@vgit2/shared/e2e';
+
 import { createMockGateway } from '../src/test/mockGateway';
 import { connectToPc } from '../src/features/pc-connect/connectToPc';
 import {
   clearDeviceToken,
   getDeviceToken,
   saveDeviceToken,
+  saveE2eKey,
 } from '../src/features/pc-connect/deviceTokenStore';
 import { linkPc } from '../src/features/pc-connect/linkPc';
+import * as verifyTunnelAddressModule from '../src/features/pc-connect/verifyTunnelAddress';
 import {
   relayAuthCheckUrl,
   relayHealthUrl,
   verifyTunnelAddress,
+  type VerifyTunnelAddressDeps,
 } from '../src/features/pc-connect/verifyTunnelAddress';
+
+type SealedRenew = NonNullable<VerifyTunnelAddressDeps['renew']>;
+type SealedRenewDeps = NonNullable<Parameters<SealedRenew>[0]>;
 
 const GATEWAY = 'https://app.portable.dev';
 
@@ -203,6 +222,225 @@ describe('verifyTunnelAddress', () => {
   });
 });
 
+describe('verifyTunnelAddress — sealed token check under mandatory E2E (portable.dev#24)', () => {
+  const random = (n: number) => new Uint8Array(crypto.randomBytes(n));
+  const PSK = new Uint8Array(32).fill(7);
+  const PSK_B64 = encodeBase64(PSK);
+
+  /** A mandatory-E2E PC: live health, but EVERY plaintext protected route → 426. */
+  function registerE2ePc(gateway: ReturnType<typeof createMockGateway>, pcId: string) {
+    gateway.on('GET', `/t/${pcId}/api/health`, () => ({ status: 200, body: { status: 'ok' } }));
+    gateway.on('GET', `/t/${pcId}/api/user-settings`, () => ({
+      status: 426,
+      body: { error: 'E2E required', code: 'e2e_required' },
+    }));
+  }
+
+  it('426 + PSK + renew resolves a fresh token → true, with CANDIDATE-scoped deps', async () => {
+    const gateway = createMockGateway({ baseUrl: GATEWAY });
+    registerE2ePc(gateway, 'pc_alpha');
+    let captured: SealedRenewDeps | undefined;
+    const renew = jest.fn(async (deps?: SealedRenewDeps) => {
+      captured = deps;
+      return 'fresh-jwt';
+    });
+
+    await expect(
+      verifyTunnelAddress(GATEWAY, 'pc_alpha', 'dt', {
+        fetchImpl: gateway.fetchImpl,
+        e2eKey: PSK_B64,
+        renew,
+        random,
+      })
+    ).resolves.toBe(true);
+
+    expect(renew).toHaveBeenCalledTimes(1);
+    // The renew probe is pinned to the CANDIDATE PC, never the globally-connected one.
+    await expect(captured!.getPcId!()).resolves.toBe('pc_alpha');
+    await expect(captured!.getRelayBase!()).resolves.toBe(`${GATEWAY}/t/pc_alpha`);
+    await expect(captured!.getStoredToken!('pc_alpha')).resolves.toBe('dt');
+    expect(captured!.fetchImpl).toBe(gateway.fetchImpl);
+    await captured!.persist!('renewed-jwt');
+    expect(await getDeviceToken('pc_alpha')).toBe('renewed-jwt');
+  });
+
+  it('426 + renew resolves null (dead PSK or dead signature) → false', async () => {
+    const gateway = createMockGateway({ baseUrl: GATEWAY });
+    registerE2ePc(gateway, 'pc_alpha');
+
+    await expect(
+      verifyTunnelAddress(GATEWAY, 'pc_alpha', 'dt', {
+        fetchImpl: gateway.fetchImpl,
+        e2eKey: PSK_B64,
+        renew: async () => null,
+        random,
+      })
+    ).resolves.toBe(false);
+  });
+
+  it('426 + renew THROWS (transport-shaped) → true (liveness passed, keep fail-open)', async () => {
+    const gateway = createMockGateway({ baseUrl: GATEWAY });
+    registerE2ePc(gateway, 'pc_alpha');
+
+    await expect(
+      verifyTunnelAddress(GATEWAY, 'pc_alpha', 'dt', {
+        fetchImpl: gateway.fetchImpl,
+        e2eKey: PSK_B64,
+        renew: async () => {
+          throw new Error('relay hiccup');
+        },
+        random,
+      })
+    ).resolves.toBe(true);
+  });
+
+  it('426 WITHOUT a PSK keeps the fail-open posture (sealed check never attempted)', async () => {
+    const gateway = createMockGateway({ baseUrl: GATEWAY });
+    registerE2ePc(gateway, 'pc_alpha');
+    const renew = jest.fn(async () => null);
+
+    await expect(
+      verifyTunnelAddress(GATEWAY, 'pc_alpha', 'dt', { fetchImpl: gateway.fetchImpl, renew })
+    ).resolves.toBe(true);
+
+    expect(renew).not.toHaveBeenCalled();
+    expect(gateway.requests.some((r) => r.path.endsWith('/api/e2e/handshake'))).toBe(false);
+  });
+
+  it('getSession runs a throwaway PSK handshake against the candidate relay; dropSession re-handshakes', async () => {
+    const gateway = createMockGateway({ baseUrl: GATEWAY });
+    registerE2ePc(gateway, 'pc_alpha');
+    const pcSessionIds: string[] = [];
+    gateway.on('POST', '/t/pc_alpha/api/e2e/handshake', (req) => {
+      const { message, sessionId } = respondToHandshake(PSK, req.body as E2eHandshakeInit, random);
+      pcSessionIds.push(sessionId);
+      return { status: 200, body: message };
+    });
+    let captured: SealedRenewDeps | undefined;
+    const renew = jest.fn(async (deps?: SealedRenewDeps) => {
+      captured = deps;
+      return 'fresh-jwt';
+    });
+
+    await verifyTunnelAddress(GATEWAY, 'pc_alpha', 'dt', {
+      fetchImpl: gateway.fetchImpl,
+      e2eKey: PSK_B64,
+      renew,
+      random,
+    });
+
+    const s1 = await captured!.getSession!('pc_alpha');
+    const s2 = await captured!.getSession!('pc_alpha');
+    expect(s2).toBe(s1);
+    expect(pcSessionIds).toEqual([s1.sessionId]);
+
+    captured!.dropSession!('pc_alpha');
+    const s3 = await captured!.getSession!('pc_alpha');
+    expect(pcSessionIds).toHaveLength(2);
+    expect(s3.sessionId).toBe(pcSessionIds[1]);
+  });
+
+  it('exposes peekSession over the SAME throwaway session (the 410 eviction guard can fire)', async () => {
+    const gateway = createMockGateway({ baseUrl: GATEWAY });
+    registerE2ePc(gateway, 'pc_alpha');
+    gateway.on('POST', '/t/pc_alpha/api/e2e/handshake', (req) => {
+      const { message } = respondToHandshake(PSK, req.body as E2eHandshakeInit, random);
+      return { status: 200, body: message };
+    });
+    let captured: SealedRenewDeps | undefined;
+    await verifyTunnelAddress(GATEWAY, 'pc_alpha', 'dt', {
+      fetchImpl: gateway.fetchImpl,
+      e2eKey: PSK_B64,
+      renew: async (deps?: SealedRenewDeps) => {
+        captured = deps;
+        return 'fresh-jwt';
+      },
+      random,
+    });
+
+    expect(captured!.peekSession!('pc_alpha')).toBeUndefined();
+    const s1 = await captured!.getSession!('pc_alpha');
+    // peekSession must reflect the throwaway session, not the shared manager's
+    // (empty) cache — renewOnce's 410 eviction guard compares against it.
+    expect(captured!.peekSession!('pc_alpha')).toBe(s1);
+    captured!.dropSession!('pc_alpha');
+    expect(captured!.peekSession!('pc_alpha')).toBeUndefined();
+    const s2 = await captured!.getSession!('pc_alpha');
+    expect(captured!.peekSession!('pc_alpha')).toBe(s2);
+    expect(s2).not.toBe(s1);
+  });
+
+  it('410-then-success renew recovers with exactly one re-handshake and persists the fresh token', async () => {
+    const gateway = createMockGateway({ baseUrl: GATEWAY });
+    registerE2ePc(gateway, 'pc_alpha');
+    // A PSK-speaking PC that restarted after the throwaway handshake: the first
+    // renew hits a forgotten session (410).
+    const pcSessions = new Map<string, { c2s: Uint8Array; s2c: Uint8Array }>();
+    const handshakeIds: string[] = [];
+    gateway.on('POST', '/t/pc_alpha/api/e2e/handshake', (req) => {
+      const { message, sessionId, keys } = respondToHandshake(
+        PSK,
+        req.body as E2eHandshakeInit,
+        random
+      );
+      pcSessions.set(sessionId, keys);
+      handshakeIds.push(sessionId);
+      return { status: 200, body: message };
+    });
+    const renewSids: string[] = [];
+    gateway.on('POST', '/t/pc_alpha/api/e2e/renew', (req) => {
+      const { sid, env } = req.body as { sid: string; env: E2eEnvelope };
+      renewSids.push(sid);
+      if (renewSids.length === 1) {
+        pcSessions.delete(sid);
+        return { status: 410, body: { error: 'unknown e2e session' } };
+      }
+      const keys = pcSessions.get(sid);
+      if (!keys) return { status: 410, body: { error: 'unknown e2e session' } };
+      const { token } = openJson<{ token: string }>(keys.c2s, env);
+      expect(token).toBe('dt');
+      return {
+        status: 200,
+        body: { sid, env: sealJson(keys.s2c, { token: 'fresh-jwt' }, random) },
+      };
+    });
+
+    // No `renew` injected: the real default renewDataPathToken runs against the candidate deps.
+    await expect(
+      verifyTunnelAddress(GATEWAY, 'pc_alpha', 'dt', {
+        fetchImpl: gateway.fetchImpl,
+        e2eKey: PSK_B64,
+        random,
+      })
+    ).resolves.toBe(true);
+
+    expect(handshakeIds).toHaveLength(2);
+    expect(renewSids).toEqual([handshakeIds[0], handshakeIds[1]]);
+    await expect(getDeviceToken('pc_alpha')).resolves.toBe('fresh-jwt');
+  });
+
+  it('a 401 handshake (dead PSK) surfaces from getSession in the e2eSessionManager failure shape', async () => {
+    const gateway = createMockGateway({ baseUrl: GATEWAY });
+    registerE2ePc(gateway, 'pc_alpha');
+    gateway.on('POST', '/t/pc_alpha/api/e2e/handshake', () => ({
+      status: 401,
+      body: { error: 'bad PSK MAC' },
+    }));
+    let captured: SealedRenewDeps | undefined;
+    await verifyTunnelAddress(GATEWAY, 'pc_alpha', 'dt', {
+      fetchImpl: gateway.fetchImpl,
+      e2eKey: PSK_B64,
+      renew: async (deps?: SealedRenewDeps) => {
+        captured = deps;
+        return null;
+      },
+      random,
+    });
+
+    await expect(captured!.getSession!('pc_alpha')).rejects.toThrow('E2E handshake failed (401)');
+  });
+});
+
 describe('connectToPc', () => {
   it('returns no-token when this device never linked the PC (no first-connection report)', async () => {
     await clearDeviceToken('pc_alpha');
@@ -246,6 +484,29 @@ describe('connectToPc', () => {
     });
     expect(result).toEqual({ ready: true, deviceToken: 'stored-dt' });
     expect(reportFirstConnection).toHaveBeenCalledTimes(1);
+  });
+
+  it('default verify carries the stored e2eKey (enables the sealed check on a mandatory-E2E PC)', async () => {
+    const verifySpy = jest
+      .spyOn(verifyTunnelAddressModule, 'verifyTunnelAddress')
+      .mockResolvedValue(true);
+    try {
+      await saveDeviceToken('pc_alpha', 'stored-dt');
+      await saveE2eKey('pc_alpha', 'psk-base64');
+      const result = await connectToPc('pc_alpha', {
+        gatewayBase: GATEWAY,
+        reportFirstConnection: jest.fn(),
+      });
+      expect(result.ready).toBe(true);
+      expect(verifySpy).toHaveBeenCalledWith(
+        GATEWAY,
+        'pc_alpha',
+        'stored-dt',
+        expect.objectContaining({ e2eKey: 'psk-base64' })
+      );
+    } finally {
+      verifySpy.mockRestore();
+    }
   });
 
   it('reports unhealthy when the stored token fails the health probe (no first-connection report)', async () => {

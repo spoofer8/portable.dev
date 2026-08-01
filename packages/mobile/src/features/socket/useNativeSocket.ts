@@ -147,6 +147,11 @@ export interface NativeSocketDeps {
    * is not configured (tests) so the socket stays plaintext as before.
    */
   getE2eSession?: () => Promise<E2eSession | null>;
+  /**
+   * Renew an expired data-path JWT over the sealed PSK route: fresh (persisted)
+   * token, `null` = pairing rejected (re-pair), throws on transport errors.
+   */
+  renewDataPathToken?: () => Promise<string | null>;
 }
 
 /**
@@ -157,6 +162,15 @@ export interface NativeSocketDeps {
 async function defaultGetE2eSession(): Promise<E2eSession | null> {
   if (!isE2eConfigured()) return null;
   return getOrCreateE2eSession();
+}
+
+/** Default renewal — lazy-required so the renew module stays out of this feature's static graph. */
+async function defaultRenewDataPathToken(): Promise<string | null> {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const mod = require('../api/renewDataPathToken') as {
+    renewDataPathToken: () => Promise<string | null>;
+  };
+  return mod.renewDataPathToken();
 }
 
 /** Read this build's own version (baked into the bundle from app.json). */
@@ -261,6 +275,50 @@ export function useNativeSocket(deps: NativeSocketDeps = {}): NativeSocket {
   // Bounded E2E recovery counter; reset on a live connect.
   const e2eRecoveryRef = useRef(0);
 
+  // Serializes every disconnect→rebuild: two concurrent rebuilds race on
+  // `socketRef` and the loser leaks as a zombie.
+  const rebuildChainRef = useRef<Promise<void>>(Promise.resolve());
+  // True between the socket effect's mount and its cleanup — a rebuild finishing
+  // after unmount must not re-assign `socketRef`.
+  const mountedRef = useRef(false);
+
+  /**
+   * Tear down the current socket and build a replacement, appended to the shared
+   * rebuild chain so at most one teardown+build runs at a time.
+   */
+  const rebuildSocket = useCallback((): Promise<void> => {
+    const run = async () => {
+      // Stop reconnection FIRST so no queued retry fires against the dead
+      // credential/sid mid-teardown.
+      setReconnection(socketRef.current, false);
+      try {
+        socketRef.current?.disconnect?.();
+      } catch {
+        // ignore
+      }
+      socketRef.current = null;
+      // Unmounted while queued: the teardown above is safe, but a build now would leak.
+      if (!mountedRef.current) return;
+      const built = await buildSocketRef.current?.();
+      if (built && !mountedRef.current) {
+        // Unmounted mid-build — undo the socket we just created. The cast
+        // un-narrows `null`: TS can't see buildSocket's re-assignment.
+        const leaked = socketRef.current as SocketLike | null;
+        setReconnection(leaked, false);
+        leaked?.disconnect?.();
+        socketRef.current = null;
+      }
+    };
+    const next = rebuildChainRef.current.then(run, run);
+    // The chain must survive a failed build so the NEXT rebuild still runs;
+    // `next` still rejects to this caller.
+    rebuildChainRef.current = next.then(
+      () => undefined,
+      () => undefined
+    );
+    return next;
+  }, []);
+
   /**
    * The socket analogue of the HTTP tunnel's `410`→re-handshake recovery: when the
    * PC rejects a socket whose `e2eSid` names a session it no longer holds (api
@@ -275,16 +333,8 @@ export function useNativeSocket(deps: NativeSocketDeps = {}): NativeSocket {
     }
     socketLog('e2e:recover', { attempt });
     await dropConnectedE2eSession();
-    // Stop reconnection FIRST so no queued retry fires against the dead sid.
-    setReconnection(socketRef.current, false);
     try {
-      socketRef.current?.disconnect?.();
-    } catch {
-      // ignore
-    }
-    socketRef.current = null;
-    try {
-      await buildSocketRef.current?.();
+      await rebuildSocket();
     } catch (err) {
       socketLog(
         'e2e:recover_build_failed',
@@ -292,7 +342,48 @@ export function useNativeSocket(deps: NativeSocketDeps = {}): NativeSocket {
         'error'
       );
     }
-  }, []);
+  }, [rebuildSocket]);
+
+  // Single-flight for renewals; also read by `handleConnectError` so retry
+  // errors mid-renewal don't launch a racing E2E recovery.
+  const tokenRenewalRef = useRef(false);
+
+  // Terminal latch: the PC rejected the pairing itself — every reconnect
+  // authority goes quiet. Cleared only on a later successful connect and on the
+  // socket effect's (re)mount (Settings → Connect PC remounts the providers).
+  const pairingRejectedRef = useRef(false);
+
+  /**
+   * Socket analogue of authedFetch's 401→renew→replay: renew the expired JWT
+   * over the sealed PSK route and rebuild the socket (without touching the E2E
+   * recovery budget). A `null` renewal → terminal `failed` state.
+   */
+  const renewExpiredToken = useCallback(async () => {
+    if (tokenRenewalRef.current || pairingRejectedRef.current) return;
+    tokenRenewalRef.current = true;
+    try {
+      const fresh = await (depsRef.current.renewDataPathToken ?? defaultRenewDataPathToken)();
+      // Unmounted mid-renewal — the next mount owns the socket.
+      if (!mountedRef.current) return;
+      if (!fresh) {
+        socketLog('token:renew_rejected', {}, 'error');
+        // Dead pairing: latch FIRST, silence the io manager + health monitor,
+        // write 'failed' LAST so nothing stomps it.
+        pairingRejectedRef.current = true;
+        setReconnection(socketRef.current, false);
+        healthRef.current?.suspend();
+        useSocketStore.getState().setConnectionState('failed');
+        return;
+      }
+      socketLog('token:renewed', {});
+      await rebuildSocket();
+    } catch (err) {
+      // Transport failure — retryable: the next `token_expired` rejection re-attempts.
+      socketLog('token:renew_failed', { error: String((err as Error)?.message ?? err) }, 'error');
+    } finally {
+      tokenRenewalRef.current = false;
+    }
+  }, [rebuildSocket]);
 
   /** Rejoin every tracked room — the resync run on (re)connect and on resume. */
   const resync = useCallback(() => {
@@ -315,6 +406,9 @@ export function useNativeSocket(deps: NativeSocketDeps = {}): NativeSocket {
   }, []);
 
   const reconnectAndSync = useCallback(() => {
+    // Terminal dead pairing: stay quiet until a re-pair or a successful connect
+    // clears the latch.
+    if (pairingRejectedRef.current) return;
     const sock = socketRef.current;
     if (!sock) return;
     if (!sock.connected) {
@@ -343,6 +437,8 @@ export function useNativeSocket(deps: NativeSocketDeps = {}): NativeSocket {
         socketLog('connect', { id: shortId(sock.id), reconnect: isReconnect });
         // A live connect proves the E2E session is valid — reset the recovery budget.
         e2eRecoveryRef.current = 0;
+        // …and that the pairing works again — clear the terminal latch.
+        pairingRejectedRef.current = false;
         store.markConnected(sock.id ?? null);
         // A live connect means the session is back: drop the re-provision
         // overlay if it is still up (belt-and-braces — the epoch remount
@@ -359,22 +455,39 @@ export function useNativeSocket(deps: NativeSocketDeps = {}): NativeSocket {
       const handleDisconnect = (...args: unknown[]) => {
         const reason = args[0];
         socketLog('disconnect', { reason: String(reason ?? '') }, 'warning');
+        // Terminal latch is sticky — never stomp 'failed' back to 'disconnected'.
+        if (pairingRejectedRef.current) return;
         useSocketStore.getState().markDisconnected();
         // Don't wait for the slow engine.io ping timeout — drive the reconnect now.
         healthRef.current?.notifyDisconnected();
       };
       const handleConnectError = (...args: unknown[]) => {
-        const err = args[0] as { message?: string } | undefined;
+        const err = args[0] as { message?: string; data?: { code?: string } } | undefined;
         const message = err?.message ?? 'unknown';
+        // Typed rejection code from the PC's handshake middleware; older PCs
+        // carry only the message string.
+        const code = err?.data?.code;
         // The PC rejects an E2E socket BEFORE its own handshake diagnostic, so this
         // is the only place that failure is observable.
-        socketLog('connect_error', { message }, 'error');
+        socketLog('connect_error', { message, ...(code ? { code } : {}) }, 'error');
+        // Sticky terminal latch: a straggling retry must not flap the banner or
+        // re-trigger recovery.
+        if (pairingRejectedRef.current) return;
         useSocketStore.getState().setConnectionState('reconnecting');
+        // An expired pairing JWT is a credential problem, not an E2E one —
+        // renew without burning the E2E recovery budget.
+        if (code === 'token_expired') {
+          void renewExpiredToken();
+          return;
+        }
         // Recover on the PC's explicit E2E rejection, and when E2E is configured but
         // we never connected (an epoch remount that reused a now-dead cached session).
         if (isE2eConfigured()) {
-          const isE2eReject = /e2e session/i.test(message);
-          const neverConnected = !useSocketStore.getState().hasConnectedOnce;
+          const isE2eReject = code === 'e2e_session_required' || /e2e session/i.test(message);
+          // While a renewal is in flight its rebuild owns the socket — an
+          // un-coded retry error must not launch a racing E2E recovery.
+          const neverConnected =
+            !tokenRenewalRef.current && !useSocketStore.getState().hasConnectedOnce;
           if (isE2eReject || neverConnected) void recoverE2eSession();
         }
       };
@@ -630,7 +743,7 @@ export function useNativeSocket(deps: NativeSocketDeps = {}): NativeSocket {
       sock.on(SERVER_EVENTS.SANDBOX_METRICS, handleSandboxMetrics);
       sock.on(SERVER_EVENTS.SESSION_REAPED, handleSessionReaped);
     },
-    [resync, recoverE2eSession]
+    [resync, recoverE2eSession, renewExpiredToken]
   );
 
   /**
@@ -646,10 +759,8 @@ export function useNativeSocket(deps: NativeSocketDeps = {}): NativeSocket {
     // SecureStore reads, so reading them in parallel shaves one keychain
     // round-trip off the post-health-gate socket bring-up (the "server up but
     // app still connecting" tail). The `!url` guard is unchanged.
-    const [token, url] = await Promise.all([
-      (d.getAuthToken ?? resolveDataPathToken)(),
-      (d.getRelayUrl ?? getRelayUrl)(),
-    ]);
+    const resolveToken = d.getAuthToken ?? resolveDataPathToken;
+    const [token, url] = await Promise.all([resolveToken(), (d.getRelayUrl ?? getRelayUrl)()]);
     if (!url) {
       // No relay URL yet — deferred, the mount effect's bounded retry re-attempts.
       socketLog('build:deferred', { reason: 'no relay url', hasToken: !!token }, 'warning');
@@ -702,11 +813,22 @@ export function useNativeSocket(deps: NativeSocketDeps = {}): NativeSocket {
       ...MOBILE_SOCKET_OPTIONS,
       path: socketPath,
       ...d.socketOptions,
-      auth: {
-        token: token ?? '',
-        ...(appVersion ? { appVersion } : {}),
-        ...(deviceName ? { deviceName } : {}),
-        ...(e2eSession ? { e2eSid: e2eSession.sessionId } : {}),
+      // Callback-form auth: invoked on EVERY (re)connect attempt, so a renewed
+      // JWT rides the next retry without a rebuild. `e2eSid` is deliberately
+      // the BUILD-TIME session id — the per-frame sealing below is keyed to
+      // that session; a dead session rebuilds the whole socket. A failed
+      // re-read falls back to the build-time token.
+      auth: (cb) => {
+        void resolveToken()
+          .catch(() => token)
+          .then((fresh) => {
+            cb({
+              token: fresh ?? '',
+              ...(appVersion ? { appVersion } : {}),
+              ...(deviceName ? { deviceName } : {}),
+              ...(e2eSession ? { e2eSid: e2eSession.sessionId } : {}),
+            });
+          });
       },
     });
     // Wrap BEFORE binding handlers so bindHandlers' `on` registrations see the
@@ -787,6 +909,8 @@ export function useNativeSocket(deps: NativeSocketDeps = {}): NativeSocket {
       // tunnel) — the deterministic recovery socket.io's own auto-reconnect failed to
       // do over the relay. The resulting `connect` calls notifyConnected().
       forceReconnect: (_cause: ReconnectCause) => {
+        // Terminal dead pairing: never resurrect the transport.
+        if (pairingRejectedRef.current) return;
         const sock = socketRef.current;
         if (!sock) return;
         setReconnection(sock, true);
@@ -814,6 +938,9 @@ export function useNativeSocket(deps: NativeSocketDeps = {}): NativeSocket {
   useEffect(() => {
     let cancelled = false;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    mountedRef.current = true;
+    // A fresh mount is a fresh pairing attempt — start with the latch clear.
+    pairingRejectedRef.current = false;
     // Build the health machine for this mount BEFORE the socket, so the connect
     // handler (which fires during buildSocket) can reach it via healthRef.
     const monitor = makeHealthMonitor();
@@ -859,6 +986,7 @@ export function useNativeSocket(deps: NativeSocketDeps = {}): NativeSocket {
 
     return () => {
       cancelled = true;
+      mountedRef.current = false;
       if (retryTimer) clearTimeout(retryTimer);
       monitor.stop();
       healthRef.current = null;
@@ -891,6 +1019,8 @@ export function useNativeSocket(deps: NativeSocketDeps = {}): NativeSocket {
         // provider is about to unmount — never resurrect the old (dead-URL)
         // transport from a foreground transition.
         if (useSandboxSessionStore.getState().reprovisioning) return;
+        // Terminal dead pairing: the re-pair UX owns recovery.
+        if (pairingRejectedRef.current) return;
         setReconnection(socketRef.current, true);
         // Clean-disconnect recovery stays here (unchanged); the health machine's
         // resume() additionally re-arms the heartbeat so a socket that is lying
@@ -912,8 +1042,14 @@ export function useNativeSocket(deps: NativeSocketDeps = {}): NativeSocket {
     let prevOnline = true;
     const unsub = netInfo.addEventListener((state) => {
       const online = state.isConnected !== false;
-      // Same re-provision guard as the AppState handler.
-      if (online && !prevOnline && !useSandboxSessionStore.getState().reprovisioning) {
+      // Same re-provision guard as the AppState handler — plus the terminal
+      // dead-pairing latch (an online edge must not resume the monitor).
+      if (
+        online &&
+        !prevOnline &&
+        !useSandboxSessionStore.getState().reprovisioning &&
+        !pairingRejectedRef.current
+      ) {
         reconnectAndSync();
         healthRef.current?.resume();
       } else if (!online && prevOnline) {
