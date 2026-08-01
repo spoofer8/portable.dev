@@ -131,3 +131,69 @@ describe('SocketIOService chat:message — kill-switch guard', () => {
     expect(callback).toHaveBeenCalledWith({ success: true });
   });
 });
+
+/**
+ * setupAuth rejections must carry machine-readable `err.data.code` (socket.io
+ * delivers `err.data` to the client's connect_error). Prototype-instance
+ * harness: `setupAuth` registers on a fake `io.use`, then we invoke it directly.
+ */
+describe('SocketIOService setupAuth — machine-readable connect_error codes', () => {
+  type AuthMiddleware = (socket: any, next: (err?: Error) => void) => Promise<void> | void;
+
+  function authHarness(opts: {
+    authResult: any;
+    e2eConfigured?: boolean;
+    e2eKeys?: unknown;
+  }): AuthMiddleware {
+    const service: any = Object.create(SocketIOService.prototype);
+    let middleware: AuthMiddleware | undefined;
+    service.io = {
+      use: (fn: AuthMiddleware) => {
+        middleware = fn;
+      },
+    };
+    service.authService = { validateSocketAuth: mock(async () => opts.authResult) };
+    service.e2eSessionService = opts.e2eConfigured
+      ? { isConfigured: () => true, getSessionKeys: () => opts.e2eKeys }
+      : undefined;
+    service.setupAuth();
+    if (!middleware) throw new Error('setupAuth did not register the io.use middleware');
+    return middleware;
+  }
+
+  async function reject(mw: AuthMiddleware, auth: Record<string, unknown>): Promise<any> {
+    let captured: Error | undefined;
+    await mw({ handshake: { auth, headers: {} }, data: {} }, (err?: Error) => {
+      captured = err;
+    });
+    return captured;
+  }
+
+  it("attaches data.code 'token_expired' to the expired-JWT rejection (message unchanged)", async () => {
+    const mw = authHarness({
+      authResult: { valid: false, error: 'Token has expired', code: 'token_expired' },
+    });
+    const err = await reject(mw, { token: 'expired.jwt.token' });
+    expect(err).toBeInstanceOf(Error);
+    expect(err.message).toBe('Token has expired');
+    expect(err.data).toEqual({ code: 'token_expired' });
+  });
+
+  it('attaches NO data to a code-less rejection (nothing to machine-read)', async () => {
+    const mw = authHarness({ authResult: { valid: false, error: 'Invalid authentication' } });
+    const err = await reject(mw, { token: 'garbage' });
+    expect(err.message).toBe('Invalid authentication');
+    expect(err.data).toBeUndefined();
+  });
+
+  it("attaches data.code 'e2e_session_required' to the missing-E2E-session rejection", async () => {
+    const mw = authHarness({
+      authResult: { valid: true, userEmail: 'alice@example.com', username: 'alice' },
+      e2eConfigured: true,
+      e2eKeys: undefined,
+    });
+    const err = await reject(mw, { token: 'valid.jwt.token' });
+    expect(err.message).toBe('E2E session required');
+    expect(err.data).toEqual({ code: 'e2e_session_required' });
+  });
+});

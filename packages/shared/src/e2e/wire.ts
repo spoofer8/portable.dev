@@ -45,6 +45,19 @@ export interface E2eTunnelPayload {
   env: E2eEnvelope;
 }
 
+/**
+ * Sealed (c2s) body of `POST /api/e2e/renew`: the old pairing JWT — expired
+ * is fine, the SIGNATURE must verify. Opening the envelope proves PSK possession.
+ */
+export interface E2eRenewRequest {
+  token: string;
+}
+
+/** Sealed (s2c) response of the renew route: a fresh identical-identity JWT. */
+export interface E2eRenewResponse {
+  token: string;
+}
+
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 

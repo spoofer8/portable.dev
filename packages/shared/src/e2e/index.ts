@@ -33,7 +33,13 @@ export type {
 } from './handshake.js';
 
 export { b64ToText, openJson, sealJson, textToB64 } from './wire.js';
-export type { E2eInnerRequest, E2eInnerResponse, E2eTunnelPayload } from './wire.js';
+export type {
+  E2eInnerRequest,
+  E2eInnerResponse,
+  E2eRenewRequest,
+  E2eRenewResponse,
+  E2eTunnelPayload,
+} from './wire.js';
 
 export {
   isFrameEnvelope,

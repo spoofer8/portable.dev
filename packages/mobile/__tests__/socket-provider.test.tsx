@@ -50,6 +50,7 @@ import {
   useChatChromeStore,
 } from '../src/features/chat/chrome/chatChromeStore';
 import {
+  ReconnectingBanner,
   SocketProvider,
   useSocket,
   useSocketStore,
@@ -57,11 +58,19 @@ import {
 } from '../src/features/socket';
 import { configureE2eSessions, __resetE2eSessions } from '../src/features/api/e2eSessionManager';
 import type { AppStateLike, NetInfoLike, AppStateStatus } from '../src/features/socket';
-import { createMockSocket, type MockSocketIoModule } from '../src/test';
+import { createMockSocket, type MockSocketController, type MockSocketIoModule } from '../src/test';
 
 /** The controller backing the single socket the mocked `io()` hands out. */
 const socketMock = jest.requireMock('socket.io-client') as MockSocketIoModule;
 const controller = socketMock.__controller;
+
+/** Resolve the payload the callback-form `auth` option produces for one attempt. */
+function resolveAuthPayload(auth: unknown): Promise<Record<string, unknown>> {
+  expect(typeof auth).toBe('function');
+  return new Promise((resolve) => {
+    (auth as (cb: (data: Record<string, unknown>) => void) => void)(resolve);
+  });
+}
 
 /** Imperatively-driven AppState mock. */
 function createAppStateController(): { appState: AppStateLike; emit: (s: AppStateStatus) => void } {
@@ -516,7 +525,10 @@ describe('RN socket provider on the shared core', () => {
         await Promise.resolve();
       });
       expect(calls).toHaveLength(1);
-      expect(calls[0].opts.auth).toEqual({ token: 'token-abc', appVersion: '1.5.0' });
+      await expect(resolveAuthPayload(calls[0].opts.auth)).resolves.toEqual({
+        token: 'token-abc',
+        appVersion: '1.5.0',
+      });
     });
 
     it('omits appVersion when the build version is unavailable (older build)', async () => {
@@ -526,7 +538,9 @@ describe('RN socket provider on the shared core', () => {
         await Promise.resolve();
       });
       expect(calls).toHaveLength(1);
-      expect(calls[0].opts.auth).toEqual({ token: 'token-abc' });
+      await expect(resolveAuthPayload(calls[0].opts.auth)).resolves.toEqual({
+        token: 'token-abc',
+      });
     });
 
     it('sends the device make/model in the handshake auth', async () => {
@@ -539,11 +553,509 @@ describe('RN socket provider on the shared core', () => {
         await Promise.resolve();
       });
       expect(calls).toHaveLength(1);
-      expect(calls[0].opts.auth).toEqual({
+      await expect(resolveAuthPayload(calls[0].opts.auth)).resolves.toEqual({
         token: 'token-abc',
         appVersion: '1.5.0',
         deviceName: 'Apple iPhone 15 Pro',
       });
+    });
+  });
+
+  // The handshake auth is the CALLBACK form — the persisted token is re-read on
+  // every (re)connect attempt; a typed `token_expired` rejection renews + rebuilds.
+  describe('renewable socket credential (portable.dev#24)', () => {
+    const fakeSession = {
+      sessionId: 'sid-build',
+      keys: { c2s: new Uint8Array(32), s2c: new Uint8Array(32) },
+    };
+    const e2eManagerConfig = {
+      outerFetch: async () => ({}) as unknown as Response,
+      getPcId: async () => 'pc-1',
+      getE2eKey: async () => 'a2V5',
+      getRelayBase: async () => 'https://sandbox.portable.test',
+    };
+
+    /** One fresh mock socket per build — mirrors `io()` minting a new socket. */
+    function freshSocketFactory() {
+      const sockets: MockSocketController[] = [];
+      const calls: CreateSocketOptions[] = [];
+      /** Build indices whose socket received `disconnect()` — teardown proof. */
+      const disconnects: number[] = [];
+      const factory = (
+        _token: string | null,
+        _url: string,
+        opts?: CreateSocketOptions
+      ): SocketLike => {
+        calls.push(opts ?? {});
+        const ctl = createMockSocket({ connected: false });
+        const index = sockets.length;
+        const baseDisconnect = ctl.socket.disconnect?.bind(ctl.socket);
+        ctl.socket.disconnect = () => {
+          disconnects.push(index);
+          return baseDisconnect?.();
+        };
+        sockets.push(ctl);
+        return ctl.socket;
+      };
+      return { sockets, calls, disconnects, factory };
+    }
+
+    function mountCredentialProvider(opts: {
+      getAuthToken: () => Promise<string | null>;
+      factory: (token: string | null, url: string, o?: CreateSocketOptions) => SocketLike;
+      renewDataPathToken?: () => Promise<string | null>;
+      getE2eSession?: () => Promise<typeof fakeSession>;
+    }) {
+      return render(
+        <SocketProvider
+          getAuthToken={opts.getAuthToken}
+          getRelayUrl={async () => 'https://sandbox.portable.test'}
+          appState={appCtl.appState}
+          netInfo={netCtl.netInfo}
+          getAppVersion={() => '1.5.0'}
+          getDeviceName={() => undefined}
+          renewDataPathToken={opts.renewDataPathToken}
+          getE2eSession={opts.getE2eSession}
+          createSocketImpl={
+            opts.factory as unknown as typeof import('@vgit2/shared/socket').createSocket
+          }
+        >
+          <StateProbe />
+        </SocketProvider>
+      );
+    }
+
+    const flushDeep = () =>
+      act(async () => {
+        for (let i = 0; i < 8; i++) await Promise.resolve();
+      });
+
+    const tokenExpiredError = () =>
+      Object.assign(new Error('Token has expired'), { data: { code: 'token_expired' } });
+
+    it('re-reads the persisted token on every connect attempt while e2eSid stays the build-time session', async () => {
+      const getAuthToken = jest.fn(async (): Promise<string | null> => 'tok-1');
+      const { calls, factory } = freshSocketFactory();
+      mountCredentialProvider({
+        getAuthToken,
+        factory,
+        getE2eSession: async () => fakeSession,
+      });
+      await flushDeep();
+      expect(calls).toHaveLength(1);
+
+      await expect(resolveAuthPayload(calls[0].auth)).resolves.toEqual({
+        token: 'tok-1',
+        appVersion: '1.5.0',
+        e2eSid: 'sid-build',
+      });
+
+      // The next attempt carries the rotated token but the SAME build-time e2eSid —
+      // per-frame sealing is keyed to it; a dead session rebuilds the socket instead.
+      getAuthToken.mockResolvedValue('tok-2');
+      await expect(resolveAuthPayload(calls[0].auth)).resolves.toEqual({
+        token: 'tok-2',
+        appVersion: '1.5.0',
+        e2eSid: 'sid-build',
+      });
+    });
+
+    it("renews + rebuilds on connect_error code 'token_expired' without burning the E2E recovery budget", async () => {
+      configureE2eSessions(e2eManagerConfig);
+      const getE2eSession = jest.fn(async () => fakeSession);
+      const renewDataPathToken = jest.fn(async (): Promise<string | null> => 'fresh-token');
+      const { sockets, factory } = freshSocketFactory();
+      mountCredentialProvider({
+        getAuthToken: async () => 'tok',
+        factory,
+        renewDataPathToken,
+        getE2eSession,
+      });
+      await flushDeep();
+      expect(sockets).toHaveLength(1);
+      // Mid-session expiry, not a cold start (suppress the never-connected fallback).
+      act(() => sockets[0].setConnected(true));
+
+      // Drain a whole recovery budget's worth (MAX_E2E_RECOVERY_ATTEMPTS = 5) of expiries.
+      for (let i = 1; i <= 5; i++) {
+        await act(async () => {
+          sockets[sockets.length - 1].emitServerEvent(
+            SERVER_EVENTS.CONNECT_ERROR,
+            tokenExpiredError()
+          );
+          for (let j = 0; j < 8; j++) await Promise.resolve();
+        });
+        expect(sockets).toHaveLength(1 + i);
+      }
+      expect(renewDataPathToken).toHaveBeenCalledTimes(5);
+      expect(getE2eSession).toHaveBeenCalledTimes(6); // 1 initial + 5 token rebuilds
+
+      // The E2E recovery budget is untouched: a stale-session rejection still recovers.
+      await act(async () => {
+        sockets[sockets.length - 1].emitServerEvent(
+          SERVER_EVENTS.CONNECT_ERROR,
+          new Error('E2E session required')
+        );
+        for (let j = 0; j < 8; j++) await Promise.resolve();
+      });
+      expect(sockets).toHaveLength(7);
+      expect(getE2eSession).toHaveBeenCalledTimes(7);
+    });
+
+    it('surfaces the terminal failed state when the renewal is rejected (pairing dead)', async () => {
+      const renewDataPathToken = jest.fn(async (): Promise<string | null> => null);
+      const { sockets, factory } = freshSocketFactory();
+      mountCredentialProvider({ getAuthToken: async () => 'tok', factory, renewDataPathToken });
+      await flushDeep();
+      // Cold start with an already-expired token: the PC rejects the very first handshake.
+
+      await act(async () => {
+        sockets[0].emitServerEvent(SERVER_EVENTS.CONNECT_ERROR, tokenExpiredError());
+        for (let j = 0; j < 8; j++) await Promise.resolve();
+      });
+
+      expect(renewDataPathToken).toHaveBeenCalledTimes(1);
+      expect(sockets).toHaveLength(1);
+      expect(useSocketStore.getState().connectionState).toBe('failed');
+      expect(screen.getByTestId('conn').props.children).toBe('failed');
+      expect(screen.getByTestId('connection-failed-banner')).toBeTruthy();
+      expect(screen.queryByTestId('reconnecting-banner')).toBeNull();
+    });
+
+    // The terminal dead-pairing verdict must SILENCE the ConnectionHealthMonitor's
+    // reconnect loop — its ticks would otherwise re-enable reconnection and re-trigger
+    // the rejected renewal forever (banner flaps, phone hammers the PC).
+    describe('terminal dead pairing silences the reconnect machinery', () => {
+      it('a monitor-driven reconnect tick after the verdict never re-enables reconnection or re-renews', async () => {
+        jest.useFakeTimers();
+        try {
+          const renewDataPathToken = jest.fn(async (): Promise<string | null> => null);
+          const { sockets, factory } = freshSocketFactory();
+          // Record the io manager's reconnection toggles: the verdict turns it
+          // OFF; a leaked monitor tick would turn it back ON.
+          const reconnectionCalls: boolean[] = [];
+          const factoryWithIo = (
+            token: string | null,
+            url: string,
+            o?: CreateSocketOptions
+          ): SocketLike => {
+            const sock = factory(token, url, o) as SocketLike & {
+              io?: { reconnection: (v: boolean) => void };
+            };
+            sock.io = { reconnection: (v: boolean) => reconnectionCalls.push(v) };
+            return sock;
+          };
+          mountCredentialProvider({
+            getAuthToken: async () => 'tok',
+            factory: factoryWithIo,
+            renewDataPathToken,
+          });
+          await flushDeep();
+          expect(sockets).toHaveLength(1);
+
+          // Live connect then a tunnel drop → the monitor enters its silent reconnect loop.
+          act(() => sockets[0].setConnected(true));
+          act(() => sockets[0].setConnected(false));
+
+          await act(async () => {
+            sockets[0].emitServerEvent(SERVER_EVENTS.CONNECT_ERROR, tokenExpiredError());
+            for (let j = 0; j < 8; j++) await Promise.resolve();
+          });
+          expect(renewDataPathToken).toHaveBeenCalledTimes(1);
+          expect(screen.getByTestId('conn').props.children).toBe('failed');
+          expect(reconnectionCalls).toEqual([false]);
+
+          // Run out every pending monitor timer: no tick may revive the machinery.
+          await act(async () => {
+            jest.advanceTimersByTime(60_000);
+            for (let j = 0; j < 8; j++) await Promise.resolve();
+          });
+          expect(reconnectionCalls).toEqual([false]);
+          expect(sockets).toHaveLength(1);
+          expect(renewDataPathToken).toHaveBeenCalledTimes(1);
+          expect(screen.getByTestId('conn').props.children).toBe('failed');
+          expect(screen.getByTestId('connection-failed-banner')).toBeTruthy();
+          expect(screen.queryByTestId('reconnecting-banner')).toBeNull();
+        } finally {
+          jest.useRealTimers();
+        }
+      });
+
+      it('a straggling token_expired retry after the verdict never re-triggers the renewal (sticky failed)', async () => {
+        const renewDataPathToken = jest.fn(async (): Promise<string | null> => null);
+        const { sockets, factory } = freshSocketFactory();
+        mountCredentialProvider({ getAuthToken: async () => 'tok', factory, renewDataPathToken });
+        await flushDeep();
+
+        await act(async () => {
+          sockets[0].emitServerEvent(SERVER_EVENTS.CONNECT_ERROR, tokenExpiredError());
+          for (let j = 0; j < 8; j++) await Promise.resolve();
+        });
+        expect(renewDataPathToken).toHaveBeenCalledTimes(1);
+        expect(screen.getByTestId('conn').props.children).toBe('failed');
+
+        await act(async () => {
+          sockets[0].emitServerEvent(SERVER_EVENTS.CONNECT_ERROR, tokenExpiredError());
+          for (let j = 0; j < 8; j++) await Promise.resolve();
+        });
+        expect(renewDataPathToken).toHaveBeenCalledTimes(1);
+        expect(sockets).toHaveLength(1);
+        expect(screen.getByTestId('conn').props.children).toBe('failed');
+      });
+
+      it('foreground/online edges cannot resurrect a dead pairing; a remount starts clean', async () => {
+        const renewDataPathToken = jest.fn(async (): Promise<string | null> => null);
+        const { sockets, factory } = freshSocketFactory();
+        const utils = mountCredentialProvider({
+          getAuthToken: async () => 'tok',
+          factory,
+          renewDataPathToken,
+        });
+        await flushDeep();
+
+        await act(async () => {
+          sockets[0].emitServerEvent(SERVER_EVENTS.CONNECT_ERROR, tokenExpiredError());
+          for (let j = 0; j < 8; j++) await Promise.resolve();
+        });
+        expect(screen.getByTestId('conn').props.children).toBe('failed');
+
+        await act(async () => {
+          appCtl.emit('active');
+          netCtl.emit(false);
+          netCtl.emit(true);
+          for (let j = 0; j < 8; j++) await Promise.resolve();
+        });
+        expect(screen.getByTestId('conn').props.children).toBe('failed');
+        expect(renewDataPathToken).toHaveBeenCalledTimes(1);
+
+        utils.unmount();
+        renewDataPathToken.mockResolvedValue('fresh-token');
+        const remount = freshSocketFactory();
+        mountCredentialProvider({
+          getAuthToken: async () => 'tok',
+          factory: remount.factory,
+          renewDataPathToken,
+        });
+        await flushDeep();
+        expect(remount.sockets).toHaveLength(1);
+        expect(screen.getByTestId('conn').props.children).not.toBe('failed');
+
+        await act(async () => {
+          remount.sockets[0].emitServerEvent(SERVER_EVENTS.CONNECT_ERROR, tokenExpiredError());
+          for (let j = 0; j < 8; j++) await Promise.resolve();
+        });
+        expect(renewDataPathToken).toHaveBeenCalledTimes(2);
+        expect(remount.sockets).toHaveLength(2); // renew + rebuild — machinery alive again
+      });
+    });
+
+    it('suppresses the never-connected E2E recovery while a token renewal is in flight (one rebuild, no zombie)', async () => {
+      configureE2eSessions(e2eManagerConfig);
+      const getE2eSession = jest.fn(async () => fakeSession);
+      // Multi-RTT renewal: held pending so a retry error can land mid-renewal.
+      let resolveRenew!: (v: string | null) => void;
+      const renewDataPathToken = jest.fn(
+        () =>
+          new Promise<string | null>((r) => {
+            resolveRenew = r;
+          })
+      );
+      const { sockets, disconnects, factory } = freshSocketFactory();
+      mountCredentialProvider({
+        getAuthToken: async () => 'tok',
+        factory,
+        renewDataPathToken,
+        getE2eSession,
+      });
+      await flushDeep();
+      expect(sockets).toHaveLength(1);
+
+      await act(async () => {
+        sockets[0].emitServerEvent(SERVER_EVENTS.CONNECT_ERROR, tokenExpiredError());
+        for (let j = 0; j < 8; j++) await Promise.resolve();
+      });
+      expect(renewDataPathToken).toHaveBeenCalledTimes(1);
+
+      // A plain connect_error lands mid-renewal: the renewal owns the rebuild —
+      // the never-connected E2E recovery must not double-build.
+      await act(async () => {
+        sockets[0].emitServerEvent(SERVER_EVENTS.CONNECT_ERROR, new Error('websocket error'));
+        for (let j = 0; j < 8; j++) await Promise.resolve();
+      });
+      expect(sockets).toHaveLength(1);
+
+      await act(async () => {
+        resolveRenew('fresh-token');
+        for (let j = 0; j < 8; j++) await Promise.resolve();
+      });
+
+      // Exactly ONE new socket; the replaced one was torn down (no zombie).
+      expect(sockets).toHaveLength(2);
+      expect(disconnects).toEqual([0]);
+      // The E2E recovery never launched: 1 initial handshake + 1 renewal rebuild.
+      expect(getE2eSession).toHaveBeenCalledTimes(2);
+    });
+
+    it('serializes an E2E recovery with a queued token renewal — the intermediate socket is torn down, never leaked', async () => {
+      configureE2eSessions(e2eManagerConfig);
+      // Initial build handshakes immediately; every REBUILD handshake is held so
+      // both rebuild paths are genuinely in flight together.
+      const heldHandshakes: Array<(s: typeof fakeSession) => void> = [];
+      const getE2eSession = jest.fn((): Promise<typeof fakeSession> => {
+        if (getE2eSession.mock.calls.length === 1) return Promise.resolve(fakeSession);
+        return new Promise((r) => {
+          heldHandshakes.push(r);
+        });
+      });
+      const renewDataPathToken = jest.fn(async (): Promise<string | null> => 'fresh-token');
+      const { sockets, disconnects, factory } = freshSocketFactory();
+      mountCredentialProvider({
+        getAuthToken: async () => 'tok',
+        factory,
+        renewDataPathToken,
+        getE2eSession,
+      });
+      await flushDeep();
+      expect(sockets).toHaveLength(1);
+
+      // A typed E2E rejection starts the recovery; its rebuild handshake hangs.
+      await act(async () => {
+        sockets[0].emitServerEvent(
+          SERVER_EVENTS.CONNECT_ERROR,
+          Object.assign(new Error('rejected'), { data: { code: 'e2e_session_required' } })
+        );
+        for (let j = 0; j < 8; j++) await Promise.resolve();
+      });
+      // A token expiry mid-rebuild: the renewal must QUEUE behind it, not race it.
+      await act(async () => {
+        sockets[0].emitServerEvent(SERVER_EVENTS.CONNECT_ERROR, tokenExpiredError());
+        for (let j = 0; j < 8; j++) await Promise.resolve();
+      });
+
+      // Release the recovery's handshake, then the renewal's queued one.
+      await act(async () => {
+        heldHandshakes[0](fakeSession);
+        for (let j = 0; j < 8; j++) await Promise.resolve();
+      });
+      await act(async () => {
+        heldHandshakes[1]?.(fakeSession);
+        for (let j = 0; j < 8; j++) await Promise.resolve();
+      });
+
+      // Serialized: every replaced socket got disconnected, in order — no zombie.
+      expect(sockets).toHaveLength(3);
+      expect(disconnects).toEqual([0, 1]);
+      expect(renewDataPathToken).toHaveBeenCalledTimes(1);
+      expect(getE2eSession).toHaveBeenCalledTimes(3);
+    });
+
+    it('a renewal resolving after unmount never rebuilds — the queued rebuild is cancelled', async () => {
+      // Renewal held pending so the provider can unmount mid-flight.
+      let resolveRenew!: (v: string | null) => void;
+      const renewDataPathToken = jest.fn(
+        () =>
+          new Promise<string | null>((r) => {
+            resolveRenew = r;
+          })
+      );
+      const { sockets, factory } = freshSocketFactory();
+      const utils = mountCredentialProvider({
+        getAuthToken: async () => 'tok',
+        factory,
+        renewDataPathToken,
+      });
+      await flushDeep();
+      expect(sockets).toHaveLength(1);
+
+      await act(async () => {
+        sockets[0].emitServerEvent(SERVER_EVENTS.CONNECT_ERROR, tokenExpiredError());
+        for (let j = 0; j < 8; j++) await Promise.resolve();
+      });
+      expect(renewDataPathToken).toHaveBeenCalledTimes(1);
+
+      utils.unmount();
+
+      await act(async () => {
+        resolveRenew('fresh-token');
+        for (let j = 0; j < 8; j++) await Promise.resolve();
+      });
+
+      expect(sockets).toHaveLength(1);
+    });
+
+    it("recovers the E2E session on the typed 'e2e_session_required' code (no message match needed)", async () => {
+      configureE2eSessions(e2eManagerConfig);
+      const getE2eSession = jest.fn(async () => fakeSession);
+      const { sockets, factory } = freshSocketFactory();
+      mountCredentialProvider({ getAuthToken: async () => 'tok', factory, getE2eSession });
+      await flushDeep();
+      // Connected once → the never-connected fallback cannot mask the typed path.
+      act(() => sockets[0].setConnected(true));
+
+      await act(async () => {
+        sockets[0].emitServerEvent(
+          SERVER_EVENTS.CONNECT_ERROR,
+          Object.assign(new Error('rejected'), { data: { code: 'e2e_session_required' } })
+        );
+        for (let j = 0; j < 8; j++) await Promise.resolve();
+      });
+      expect(getE2eSession).toHaveBeenCalledTimes(2);
+      expect(sockets).toHaveLength(2);
+
+      // Any OTHER post-connect failure: no recovery, no budget burn.
+      await act(async () => {
+        sockets[1].emitServerEvent(SERVER_EVENTS.CONNECT_ERROR, new Error('transport closed'));
+        for (let j = 0; j < 8; j++) await Promise.resolve();
+      });
+      expect(getE2eSession).toHaveBeenCalledTimes(2);
+      expect(sockets).toHaveLength(2);
+    });
+  });
+
+  // The terminal dead-pairing state must be VISIBLE — hiding on 'failed' leaves
+  // a normal-looking app that never receives events.
+  describe('ReconnectingBanner terminal state', () => {
+    it('hides while connected', () => {
+      act(() => {
+        useSocketStore.getState().markConnected('sock-1');
+      });
+      render(<ReconnectingBanner />);
+      expect(screen.queryByTestId('reconnecting-banner')).toBeNull();
+      expect(screen.queryByTestId('connection-failed-banner')).toBeNull();
+    });
+
+    it('shows the reconnecting variant when the socket drops after a first connect', () => {
+      act(() => {
+        useSocketStore.getState().markConnected('sock-1');
+        useSocketStore.getState().markDisconnected();
+      });
+      render(<ReconnectingBanner />);
+      expect(screen.getByTestId('reconnecting-banner-text').props.children).toBe('Reconnecting…');
+      expect(screen.queryByTestId('connection-failed-banner')).toBeNull();
+    });
+
+    it('renders the persistent terminal variant on the failed state — even before a first connect', () => {
+      // Cold-start lockout: the first handshake fails, so hasConnectedOnce is still false.
+      act(() => {
+        useSocketStore.getState().setConnectionState('failed');
+      });
+      render(<ReconnectingBanner />);
+      expect(useSocketStore.getState().hasConnectedOnce).toBe(false);
+      const text = screen.getByTestId('connection-failed-banner-text').props.children;
+      expect(String(text)).toMatch(/no longer authorized/i);
+      expect(String(text)).toMatch(/Connect PC/);
+      expect(screen.queryByTestId('reconnecting-banner')).toBeNull();
+    });
+
+    it('renders the terminal variant on failed after a connected session too', () => {
+      act(() => {
+        useSocketStore.getState().markConnected('sock-1');
+        useSocketStore.getState().markDisconnected();
+        useSocketStore.getState().setConnectionState('failed');
+      });
+      render(<ReconnectingBanner />);
+      expect(screen.getByTestId('connection-failed-banner')).toBeTruthy();
+      expect(screen.queryByTestId('reconnecting-banner')).toBeNull();
     });
   });
 });

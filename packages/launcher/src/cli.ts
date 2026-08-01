@@ -45,6 +45,17 @@ Usage:
                      shows up in the app (a git repo is required). Refuses system
                      dirs; warns + confirms before linking your home directory.
   portable unlink    Remove the current directory from your Portable projects.
+  portable service [install|uninstall|start|stop|restart|status|debug]
+                     Run portable as a persistent BACKGROUND DAEMON: auto-start
+                     at boot/logon, auto-restart on crash, survives logout
+                     (Linux, via systemd lingering). Pair your phone with an
+                     interactive \`portable\` run FIRST — the daemon reuses that
+                     pairing, so the phone reconnects on its own. Linux: systemd
+                     user unit. Windows: Scheduled Task. macOS: launchd agent.
+                     \`debug\` shows the state + recent logs and follows them live.
+                     Run \`portable service\` with NO action (or just \`portable\`
+                     once a service is installed) to open the interactive
+                     Services dashboard.
   portable help      Show this help.
   portable --version Print the installed CLI version and exit (also -v / \`portable version\`).
 
@@ -55,7 +66,9 @@ project elsewhere, or \`portable unlink\` to drop one.
 
 Single instance: running \`portable\` (connect/start) while one is already running
 TAKES OVER — it stops the existing instance and boots fresh, no matter which
-directory you launch from. So a second window is just a full restart.
+directory you launch from. So a second window is just a full restart. EXCEPTION:
+if a BACKGROUND SERVICE is installed, \`portable\` opens the Services dashboard
+instead (it never kills the daemon or boots a second runtime).
 
 Flags:
   --debug, -d        Stream the api logs to this terminal (they're always saved
@@ -70,6 +83,10 @@ Flags:
                      (\`ngrok config add-authtoken <token>\` or NGROK_AUTHTOKEN);
                      if either is missing the launcher fails fast (no fallback).
                      Same as PORTABLE_TUNNEL_PROVIDER=ngrok.
+  --service          (internal) Run headless as the background daemon — used by
+                     the service definition \`portable service install\` creates.
+                     No terminal UI, no interactive logins; logs go to the api
+                     log file (and the journal on Linux).
 
 Credentials (auto-discovered, else login):
   On start the launcher LOOKS for credentials already on your OS and uses them:
@@ -179,6 +196,8 @@ async function main(): Promise<void> {
   const debug = args.includes('--debug') || args.includes('-d');
   const wantsDev = args.includes('--dev');
   const wantsNgrok = args.includes('--ngrok');
+  // The supervisor-spawned headless daemon (`connect --service`, portable.dev#12).
+  const serviceMode = args.includes('--service');
 
   if (wantsHelp) {
     process.stdout.write(HELP);
@@ -209,6 +228,25 @@ async function main(): Promise<void> {
     return;
   }
 
+  // `portable service <install|uninstall|start|stop|status|debug>` — the persistent
+  // background daemon (portable.dev#12). Runs AFTER loadOperatorEnv so VGIT_PORT /
+  // PORTABLE_RELAY_URL from the operator's .env shape the health probe + the
+  // installed service invocation.
+  if (command === 'service') {
+    const positionals = args.filter((a) => !a.startsWith('-'));
+    const action = positionals[positionals.indexOf('service') + 1];
+    if (!action) {
+      // `portable service` with no action opens the interactive Services dashboard
+      // instead of printing usage (portable.dev#12 follow-up, PRD §3.1).
+      const { runServiceDashboard } = await import('./ServiceDashboardRunner.js');
+      process.exitCode = await runServiceDashboard(args);
+      return;
+    }
+    const { runServiceCommand } = await import('./ServiceCommands.js');
+    process.exitCode = await runServiceCommand(args);
+    return;
+  }
+
   // `connect` (default) + the `start` back-compat alias both start the runtime.
   if (command !== 'connect' && command !== 'start') {
     process.stderr.write(`portable: unknown command '${command}'\n\n${HELP}`);
@@ -216,12 +254,35 @@ async function main(): Promise<void> {
     return;
   }
 
+  // portable.dev#12 follow-up (PRD §11): a manual `portable` in front of an
+  // INSTALLED background service (running, stopped, or broken) opens the read-and-
+  // act Service Dashboard instead of the singleton-takeover path — the daemon is
+  // never killed and no second api/tunnel is booted. The daemon itself
+  // (`--service`) is exempt; it always boots the runtime. Detection keys on the
+  // supervisor-owned installed/active signals (a plain manual runtime also answers
+  // /api/health), and fails open (never installed → normal boot below).
+  if (!serviceMode) {
+    const { runServiceDashboardIfInstalled } = await import('./ServiceDashboardRunner.js');
+    const routed = await runServiceDashboardIfInstalled(args);
+    if (routed.handled) {
+      process.exitCode = routed.code;
+      return;
+    }
+  }
+
   // Single-instance takeover: if another `portable` is already running on the api
   // port, stop it (its launcher + api child + cloudflared) and take over — so
   // typing `portable` in a second window is a full restart, regardless of cwd.
   // Best-effort: never blocks boot (a failure degrades to the api's own
   // EADDRINUSE). Released on shutdown so the lock doesn't outlive us.
-  const singleton = await acquireSingleton();
+  // EXCEPTION (portable.dev#12): a manual run does NOT take over a live
+  // service-managed daemon (the supervisor would respawn it into a fight loop) —
+  // acquireSingleton logs the `portable service stop` guidance and blocks boot.
+  const singleton = await acquireSingleton({ service: serviceMode });
+  if (singleton.blocked) {
+    process.exitCode = 1;
+    return;
+  }
   const releaseSingleton = () => singleton.release();
   process.once('exit', releaseSingleton);
 
@@ -229,12 +290,21 @@ async function main(): Promise<void> {
   // itself). Runs BEFORE the api spawns so it's discovered on this very boot.
   autoLinkIfEligible();
 
+  // Service mode tees to stdout too: on Linux stdout is the journal
+  // (`journalctl --user -u portable.service`); the file keeps Windows covered
+  // (the Scheduled Task's hidden powershell has no visible stdout).
+  const logSink = openApiLogSink({ debug: debug || serviceMode });
+
   let launcher;
   try {
     launcher = await createLauncher({
-      apiLog: openApiLogSink({ debug }),
+      apiLog: logSink,
       debug,
       ngrok: wantsNgrok,
+      service: serviceMode,
+      // Headless daemon: route the launcher's OWN lines through the same sink
+      // (file + stdout) so nothing is lost without a terminal.
+      ...(serviceMode ? { log: logSink } : {}),
     });
   } catch (err) {
     // createLauncher can hard-fail before anything starts — e.g. Chromium could

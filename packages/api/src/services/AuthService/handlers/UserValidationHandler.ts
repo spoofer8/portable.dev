@@ -1,6 +1,12 @@
 import { Octokit } from '@octokit/rest';
 import { ALLOWED_EMAILS } from '@vgit2/shared/constants';
-import { isJwtConfigured, verifyAuthToken, decodeAuthToken } from '@vgit2/shared/jwt';
+import {
+  isJwtConfigured,
+  verifyAuthToken,
+  decodeAuthToken,
+  TokenExpiredAuthError,
+  type JwtErrorCode,
+} from '@vgit2/shared/jwt';
 import { Response } from 'express';
 
 import type { OAuthRequest, HandlerDependencies, WaitlistEntry } from '../types';
@@ -116,8 +122,16 @@ export class UserValidationHandler {
             // console.log(`[UserValidation] JWT auth successful for: ${email}`);
             return email;
           }
-        } catch (_jwtError) {
-          // JWT verification failed, fall back to GitHub token
+        } catch (jwtError) {
+          // An EXPIRED JWT must NOT fall through to the GitHub-token path —
+          // the caller needs the typed expiry to point the phone at renew.
+          if (
+            jwtError instanceof TokenExpiredAuthError ||
+            (jwtError instanceof Error && jwtError.message === 'Token has expired')
+          ) {
+            throw jwtError;
+          }
+          // Any other JWT verification failure → fall back to GitHub token
           console.log(`[UserValidation] JWT verification failed, trying GitHub token...`);
         }
       }
@@ -157,6 +171,8 @@ export class UserValidationHandler {
     userEmail?: string;
     username?: string;
     error?: string;
+    /** Machine-readable failure: `token_expired` → renew via /api/e2e/renew. */
+    code?: JwtErrorCode;
   }> {
     try {
       // Local-first device-token gate: when a DeviceTokenService is
@@ -250,6 +266,10 @@ export class UserValidationHandler {
       }
     } catch (error: any) {
       console.error(`[UserValidationHandler] Socket auth validation failed:`, error);
+      // Expiry is the one recoverable failure — the phone renews instead of re-pairing.
+      if (error instanceof TokenExpiredAuthError || error?.message === 'Token has expired') {
+        return { valid: false, error: 'Token has expired', code: 'token_expired' };
+      }
       return {
         valid: false,
         error: error.message || 'Authentication failed',

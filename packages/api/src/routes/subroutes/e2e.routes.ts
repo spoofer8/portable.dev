@@ -15,9 +15,21 @@
  *                             injected seam, and answers with an envelope (s2c
  *                             key) carrying {status, headers, bodyB64}.
  *
+ *   POST /api/e2e/renew      (PUBLIC — listed in jwtAuth PUBLIC_ROUTES;
+ *                             portable.dev#24) — the c2s envelope carries
+ *                             E2eRenewRequest {token}; the s2c answer carries a
+ *                             fresh 72h JWT re-minted from the (possibly
+ *                             EXPIRED) old one.
+ *
+ * Trust model (deliberate): opening the envelope IS the auth — AEAD keys derive
+ * only from the PSK handshake, the same trust as the QR pairing. The 72h exp is
+ * a liveness window, NOT revocation; revocation = rotating the pairing secrets
+ * (`portable unlink`), which 401s both the handshake and the renew.
+ *
  * Error contract (all OUTER, deliberately coarse — no oracle detail):
  *   503 e2e_unconfigured   — no PSK on this PC (bare `bun run dev` w/o launcher)
  *   401 e2e_auth_failed    — handshake init MAC rejected
+ *   401 e2e_renew_rejected — renew token failed signature/shape → genuine re-pair
  *   410 e2e_session_unknown — sid expired/unknown → client re-handshakes
  *   400 e2e_bad_request    — malformed payload / decrypt failure / blocked path
  *
@@ -36,8 +48,11 @@ import {
   type E2eHandshakeInit,
   type E2eInnerRequest,
   type E2eInnerResponse,
+  type E2eRenewRequest,
+  type E2eRenewResponse,
   type E2eTunnelPayload,
 } from '@vgit2/shared/e2e';
+import { renewAuthTokenAllowExpired } from '@vgit2/shared/jwt';
 import { Router, type Request, type Response } from 'express';
 
 import type { E2eSessionService } from '../../services/E2eSessionService.js';
@@ -108,6 +123,59 @@ export function createE2eRoutes(e2eService: E2eSessionService, dispatch: E2eDisp
     }
   });
 
+  // ── Token renew (public; opening the c2s envelope IS the auth) ────────────
+  router.post('/e2e/renew', (req: Request, res: Response) => {
+    if (!e2eService.isConfigured()) {
+      sendCode(res, 503, 'e2e_unconfigured', 'E2E is not configured on this PC');
+      return;
+    }
+    const payload = req.body as E2eTunnelPayload;
+    if (!payload || typeof payload.sid !== 'string' || !payload.env) {
+      sendCode(res, 400, 'e2e_bad_request', 'malformed renew payload');
+      return;
+    }
+    // Peek (no TTL slide) — the route is public and the relay observes the sid,
+    // so an unauthenticated poke must not keep the session alive.
+    const keys = e2eService.peekSessionKeys(payload.sid);
+    if (!keys) {
+      sendCode(res, 410, 'e2e_session_unknown', 'unknown or expired E2E session');
+      return;
+    }
+
+    let inner: E2eRenewRequest;
+    try {
+      inner = openJson<E2eRenewRequest>(keys.c2s, payload.env);
+    } catch (err) {
+      // Decrypt failure and malformed plaintext collapse into one coarse error.
+      if (err instanceof E2eDecryptError || err instanceof SyntaxError) {
+        sendCode(res, 400, 'e2e_bad_request', 'envelope failed to open');
+        return;
+      }
+      throw err;
+    }
+    // The envelope opened — only a PSK-authenticated peer slides the TTL.
+    e2eService.touchSession(payload.sid);
+    if (!inner || typeof inner.token !== 'string' || inner.token.length === 0) {
+      sendCode(res, 400, 'e2e_bad_request', 'inner request rejected');
+      return;
+    }
+
+    let fresh: string;
+    try {
+      // Expired is fine; a bad signature / non-user token is NOT — that 401
+      // is the phone's only signal to genuinely re-pair.
+      fresh = renewAuthTokenAllowExpired(inner.token);
+    } catch {
+      sendCode(res, 401, 'e2e_renew_rejected', 'token renewal rejected');
+      return;
+    }
+
+    res.status(200).json({
+      sid: payload.sid,
+      env: sealJson(keys.s2c, { token: fresh } satisfies E2eRenewResponse, rand),
+    });
+  });
+
   // ── The full tunnel ────────────────────────────────────────────────────────
   router.post('/e2e', async (req: Request, res: Response) => {
     if (!e2eService.isConfigured()) {
@@ -119,7 +187,9 @@ export function createE2eRoutes(e2eService: E2eSessionService, dispatch: E2eDisp
       sendCode(res, 400, 'e2e_bad_request', 'malformed tunnel payload');
       return;
     }
-    const keys = e2eService.getSessionKeys(payload.sid);
+    // Peek (no TTL slide) — the relay holds the outer Bearer AND observes the
+    // sid, so a garbage-envelope poke must not keep the session alive.
+    const keys = e2eService.peekSessionKeys(payload.sid);
     if (!keys) {
       sendCode(res, 410, 'e2e_session_unknown', 'unknown or expired E2E session');
       return;
@@ -136,6 +206,9 @@ export function createE2eRoutes(e2eService: E2eSessionService, dispatch: E2eDisp
       }
       throw err;
     }
+    // Envelope opened (decrypt = auth) — slide the TTL even if the sanitizer
+    // rejects the inner request.
+    e2eService.touchSession(payload.sid);
     if (!inner) {
       sendCode(res, 400, 'e2e_bad_request', 'inner request rejected');
       return;

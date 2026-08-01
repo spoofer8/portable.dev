@@ -14,15 +14,29 @@ import { Icon, useAppTheme } from '../../theme';
 export interface PcConnectErrorScreenProps {
   message: string;
   onRetry: () => void;
+  /** Container testID (default `pc-connect-error`); the retry button id is stable on every variant. */
+  testID?: string;
+  /**
+   * Optional secondary action (bordered, below Retry). Rendered only when both
+   * props are supplied; testID `pc-connect-error-secondary`.
+   */
+  secondaryLabel?: string;
+  onSecondary?: () => void;
 }
 
-export function PcConnectErrorScreen({ message, onRetry }: PcConnectErrorScreenProps) {
+export function PcConnectErrorScreen({
+  message,
+  onRetry,
+  testID,
+  secondaryLabel,
+  onSecondary,
+}: PcConnectErrorScreenProps) {
   const { theme } = useAppTheme();
 
   return (
     <View
       style={[styles.container, { backgroundColor: theme.colors.background }]}
-      testID="pc-connect-error"
+      testID={testID ?? 'pc-connect-error'}
     >
       <Icon name="warning" size={44} color={theme.colors.warning} />
       <Text style={[styles.title, { color: theme.colors.text }]} testID="pc-connect-error-title">
@@ -42,6 +56,18 @@ export function PcConnectErrorScreen({ message, onRetry }: PcConnectErrorScreenP
       >
         <Text style={[styles.buttonText, { color: theme.colors.textInverse }]}>Try again</Text>
       </Pressable>
+      {secondaryLabel && onSecondary && (
+        <Pressable
+          testID="pc-connect-error-secondary"
+          accessibilityRole="button"
+          style={[styles.secondaryButton, { borderColor: theme.colors.primary }]}
+          onPress={onSecondary}
+        >
+          <Text style={[styles.secondaryText, { color: theme.colors.primary }]}>
+            {secondaryLabel}
+          </Text>
+        </Pressable>
+      )}
     </View>
   );
 }
@@ -52,4 +78,12 @@ const styles = StyleSheet.create({
   body: { fontSize: 15, textAlign: 'center', marginBottom: 8 },
   button: { paddingVertical: 14, paddingHorizontal: 32, borderRadius: 10, alignItems: 'center' },
   buttonText: { fontSize: 16, fontWeight: '600' },
+  secondaryButton: {
+    paddingVertical: 12,
+    paddingHorizontal: 32,
+    borderRadius: 10,
+    borderWidth: 1,
+    alignItems: 'center',
+  },
+  secondaryText: { fontSize: 15, fontWeight: '600' },
 });

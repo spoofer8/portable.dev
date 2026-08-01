@@ -6,7 +6,7 @@
  * Features:
  * - Extracts JWT from Authorization: Bearer <token> header
  * - Validates signature and expiration (locally or via remote service)
- * - Implements sliding expiration with 24-hour renewal threshold
+ * - Implements sliding expiration (renew once the token is >1h old)
  * - Returns renewed token via X-Renewed-Token header (only when needed)
  *
  * Validation Method (local-first):
@@ -14,10 +14,9 @@
  *   remote TokenValidationService was retired — the PC validates locally.
  *
  * Renewal Strategy:
- * - Token is only renewed if it expires in < 24 hours
- * - Prevents excessive token generation (99% reduction vs renew-every-request)
- * - Maintains sliding expiration: active users never logged out
- * - Example: 72h token renewed when 24h remaining → extends to 72h again
+ * - Any request made >1h after mint renews (~1 renewal/hour max)
+ * - The PSK-proven POST /api/e2e/renew recovers a token that DID expire
+ * - 401s carry a machine-readable `code` (`token_expired` | `token_invalid`)
  *
  * Security Flow:
  * 1. Extract token from Authorization header
@@ -32,6 +31,8 @@ import {
   verifyAuthToken,
   renewAuthToken,
   isJwtConfigured,
+  classifyJwtError,
+  JWT_EXPIRATION_SECONDS,
   type AuthTokenPayload,
 } from '@vgit2/shared/jwt';
 
@@ -62,9 +63,8 @@ declare global {
 // Header name for renewed token
 export const RENEWED_TOKEN_HEADER = 'X-Renewed-Token';
 
-// Renewal threshold: Only renew token if it expires in less than 24 hours
-// This prevents excessive token generation while maintaining sliding expiration
-const RENEWAL_THRESHOLD_SECONDS = 24 * 60 * 60; // 24 hours
+// Renew any request made >1h after mint (~1 renewal/hour max).
+const RENEWAL_THRESHOLD_SECONDS = JWT_EXPIRATION_SECONDS - 3600;
 
 // Public routes that don't require JWT authentication
 const PUBLIC_ROUTES = [
@@ -73,8 +73,11 @@ const PUBLIC_ROUTES = [
   '/api/healthcheck',
   '/api/min-version', // Version gate check — must be reachable before auth
   // E2E handshake (portable.dev#13): self-authenticating (PSK-keyed MAC) — the
-  // relay cannot complete it. NOTE: startsWith keeps `/api/e2e` itself gated.
+  // relay cannot complete it. `/api/e2e` (the tunnel) itself stays gated.
   '/api/e2e/handshake',
+  // Token renew: the sealed envelope is the auth — an expired-JWT phone has
+  // no valid Bearer to offer, so the route must not demand one.
+  '/api/e2e/renew',
   '/auth/github',
   '/auth/github/callback',
 ];
@@ -123,8 +126,11 @@ export function createJwtAuthMiddleware(deviceTokenService?: DeviceTokenService)
     res: Response,
     next: NextFunction
   ): Promise<void> {
-    // Skip JWT validation for public routes
-    if (PUBLIC_ROUTES.some((route) => req.path.startsWith(route))) {
+    // Public-route skip. Mounted middleware sees a mount-stripped `req.path`,
+    // so match on baseUrl + path; segment-boundary only (`/auth/github` must
+    // not bleed into `/auth/github-app/*`).
+    const fullPath = `${req.baseUrl || ''}${req.path}`;
+    if (PUBLIC_ROUTES.some((route) => fullPath === route || fullPath.startsWith(route + '/'))) {
       return next();
     }
 
@@ -158,7 +164,8 @@ export function createJwtAuthMiddleware(deviceTokenService?: DeviceTokenService)
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Invalid device token';
           console.error(`[JwtAuth] Device token validation failed: ${message}`);
-          res.status(401).json({ error: 'Unauthorized', message });
+          // Device tokens never expire — any failure means invalid, not renewable.
+          res.status(401).json({ error: 'Unauthorized', message, code: 'token_invalid' });
           return;
         }
       }
@@ -206,9 +213,11 @@ export function createJwtAuthMiddleware(deviceTokenService?: DeviceTokenService)
       } catch (error) {
         const message = error instanceof Error ? error.message : 'Invalid token';
         console.error(`[JwtAuth] Token verification failed: ${message}`);
+        // token_expired → client renews via POST /api/e2e/renew; token_invalid → re-pair.
         res.status(401).json({
           error: 'Unauthorized',
           message,
+          code: classifyJwtError(error),
           redirectUrl: GATEWAY_URL,
         });
         return;

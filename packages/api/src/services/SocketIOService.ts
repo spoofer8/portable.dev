@@ -149,7 +149,13 @@ export class SocketIOService {
         const authResult = await this.authService.validateSocketAuth(token);
 
         if (!authResult.valid) {
-          return next(new Error(authResult.error || 'Invalid authentication'));
+          const authError = new Error(authResult.error || 'Invalid authentication');
+          // socket.io delivers `err.data` to the client's connect_error — the
+          // code lets an expired-JWT phone renew instead of re-pairing.
+          if (authResult.code) {
+            (authError as Error & { data?: { code: string } }).data = { code: authResult.code };
+          }
+          return next(authError);
         }
 
         // Store validated auth data in socket
@@ -169,7 +175,12 @@ export class SocketIOService {
               : undefined;
           const keys = sid ? this.e2eSessionService.getSessionKeys(sid) : undefined;
           if (!keys) {
-            return next(new Error('E2E session required'));
+            const e2eError = new Error('E2E session required');
+            // connect_error code: client re-handshakes (distinct from token_expired).
+            (e2eError as Error & { data?: { code: string } }).data = {
+              code: 'e2e_session_required',
+            };
+            return next(e2eError);
           }
           socket.data.e2eKeys = keys;
         }

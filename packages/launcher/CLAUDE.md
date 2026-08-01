@@ -263,6 +263,102 @@ label, ttlMs}` to the hosted relay. **`verifyUrl` gate (cached-wrong fix):** whe
   tunnel, drop the device, and the fresh cold tunnel would fail the probe again → a phone
   reconnection loop. `Launcher.boot()` starts it; `shutdown()` stops it.
 
+- **Background daemon (`portable service …`, portable.dev#12)** — the persistent
+  daemon (Windows + Linux + macOS): auto-start at boot/logon, auto-restart on crash,
+  logout survival (Linux). Seam-injected modules (no real systemctl/schtasks/launchctl/fs
+  in tests):
+  - **`ServiceManager.ts`** — the shared surface: `ServiceExecSpec`/`ServiceStatus`/the
+    `ServiceManager` contract, and `resolveServiceExec()` — the daemon invocation is THIS
+    bun + THIS cli entry + `connect --service` (+ forwarded `--dev`/`--ngrok`), with the
+    install-time cwd as the working directory so `.env` discovery keeps working.
+  - **`SystemdService.ts`** — Linux: a systemd **USER** unit (`~/.config/systemd/user/
+portable.service`, `Restart=always`) + `loginctl enable-linger` for boot start/logout
+    survival (best-effort — polkit may require an admin; warned, not fatal). A user unit is
+    deliberate: creds/`~/.claude`/repos are per-user, a root system unit would run as the
+    wrong user. `status` parses the locale-stable `is-enabled`/`is-active` tokens.
+  - **`WindowsTaskService.ts`** — Windows: a Scheduled Task registered from generated
+    XML (`schtasks /Create /XML` — the CLI flags cannot express `RestartOnFailure`),
+    logon-triggered, wrapped in `powershell -WindowStyle Hidden` (bun is a console app —
+    an unwrapped action pops a console into the session). ⚠️ `stop()` = `/Change /DISABLE`
+    (or `RestartOnFailure` revives it) → `/End` → `stopRunningInstance()` (`/End` only
+    kills the powershell wrapper, not the bun runtime). `status` uses `/Query /XML` +
+    the loopback health probe (the LIST output is localized — never parse it).
+  - **`LaunchdService.ts`** — macOS: a launchd **LaunchAgent**
+    (`~/Library/LaunchAgents/dev.portable.daemon.plist`, `RunAtLoad` + `KeepAlive`),
+    managed with the modern `launchctl bootstrap/bootout gui/$UID` API (not the
+    deprecated `load`/`unload`). ⚠️ `stop()` = `bootout` — the ONLY stop `KeepAlive`
+    cannot undo (`launchctl kill` gets respawned); `install()` runs `enable` first
+    because a `disable` PERSISTS across bootouts. Per-user agent, not a root
+    LaunchDaemon (same HOME/per-user rationale as Linux). Daemon stdout/stderr →
+    `<DATA_DIR>/logs/portable-daemon.log` (`StandardOutPath`).
+  - **`ServiceCommands.ts`** — the `portable service <action>` dispatch: platform pick
+    (linux → systemd, win32 → Scheduled Task, darwin → launchd; others → guidance,
+    exit 1), action routing, human status print (exit 0 = healthy). Actions:
+    `install|uninstall|start|stop|restart|status|debug` — `restart` = `stop` then
+    `start`; `install` also freezes the `ServiceInstallManifest` (§5) and `uninstall`
+    clears it + the runtime-state file. NO action (or bare `portable` with a service
+    installed) opens the interactive dashboard instead.
+  - **`connect --service`** (cli.ts → `createLauncher({service})`) — the headless daemon
+    mode: `startHeadlessUi` (log-only — no Ink, no QR; presence logged on CHANGE),
+    `prepareCredentials({skipInteractive})` (no TTY for logins — the interactive first
+    run is where pairing/logins happen), and the launcher's own log routed to the api
+    log-file sink teed to stdout (journald on Linux). In service mode it ALSO publishes
+    the `DaemonRuntimeStateStore` (§7) at boot milestones and DISABLES the permanent
+    boot-token QR page (§8.4 — the token expires on a long-running daemon; the dashboard
+    mints a fresh one on demand). Docs:
+    [`docs/portable-daemon.md`](../../docs/portable-daemon.md).
+
+- **Interactive CLI control plane (portable.dev#12 follow-up)** — the daemon stays
+  headless; the CLI is its control plane. A manual `portable` in front of an installed
+  service opens a live dashboard instead of taking the runtime over; it reads the daemon
+  over loopback and drives the platform managers (never a second api/tunnel). Seam-injected
+  like the rest:
+  - **`ServiceInstallManifest.ts`** (§5) — a cwd-independent, per-user record of the install
+    context (dataDir/pcId/relay/apiPort/tunnelProvider/cwd/forwardedFlags) so a dashboard
+    from ANY dir rebuilds the daemon's real config. Atomic + `0600`; NEVER holds a secret
+    (whitelisted keys); a version mismatch throws reinstall guidance.
+  - **`DaemonRuntimeStateStore.ts`** (§7) — the daemon's structured runtime state
+    (`<DATA_DIR>/daemon-runtime-state.json`: phase/pid/tunnel/relay/publicUrl). Written by
+    the launcher in service mode; a STALE file never alone declares "healthy" (readers
+    cross-check live `/api/health` + the pid). No secret ever goes in it.
+  - **`ServiceController.ts`** (§4/§6) — aggregates `manager.status()` + `/api/health` +
+    the device/pairing/runtime stores + the manifest into a `ServiceSnapshot`, and drives
+    `install/uninstall/start/stop/restart` returning a structured `ServiceActionResult`
+    (actions AWAIT the real transition). The two consumers are `ServiceCommands` and the
+    dashboard — the dashboard never shells out or parses stdout.
+  - **Manager `installDefinition()`** (§10) — an ADDITIVE per-manager method that
+    registers + enables auto-start WITHOUT starting (systemd `enable` sans `--now`; launchd
+    write+enable, no bootstrap; schtasks `/Create` sans `/Run`). `install()` stays the fused
+    register+enable+start for the scriptable command (existing tests unchanged).
+  - **Runtime→daemon handoff** (§10) — installing/starting the service from the connected
+    menu (a LIVE manual runtime) can't just `manager.install()`: the daemon would fight the
+    manual runtime for the loopback port. `ServiceController` takes an optional `handoff` (wired
+    by `createLauncher` to `Launcher.releaseRuntimeForHandoff`); when present, `install({start})`
+    does `installDefinition()` → freeze manifest → `handoff()` → `manager.start()`.
+    `releaseRuntimeForHandoff` tears down THIS runtime's api/tunnel/pairing/watchers + frees the
+    port but NOT the Ink UI (the dashboard stays up), and a `handingOff` flag stops the
+    "api exited → tear down" watcher from firing. The daemon's own `acquireSingleton` reclaims
+    the lock (port is free). The standalone dashboard has NO handoff (no manual runtime) →
+    `install()` binds the port directly.
+  - **`PairingSessionFactory.ts`** (§8) — mints a FRESH pairing QR on demand from the
+    manifest's dataDir/pcId (fixes the 72h boot-token staleness): re-reads the JWT secret +
+    E2E PSK from the right `LocalSecretStore`, mints a new token (fresh iat/exp/jti — the api
+    accepts any token signed by the shared secret), and serves an EPHEMERAL 127.0.0.1-only
+    page torn down on exit. Token is never persisted/logged.
+  - **`ServiceLogSource.ts`** (§9) — the shared log layer (`readRecent`/`follow`) behind BOTH
+    `service debug` and the dashboard Debug screen, reusing `tailFile`/`latestApiLogPath`/
+    `followLogs`. One source per platform (Linux → newest api log; else → daemon log).
+  - **`ServiceDashboardUi.ts`** (§3.3) — the Ink dashboard (single instance; all state in the
+    `startServiceDashboard` closure, the view is controlled + forwards keys). Contextual
+    actions (Start disabled when running, Uninstall confirms, in-flight blocks input), fresh
+    QR (§8), interactive Debug (§9); errors surface inline without unmounting.
+  - **`ServiceDashboardRunner.ts`** (§3.1/§11) — assembles controller + pairing + debug and
+    mounts the dashboard; `runServiceDashboardIfInstalled()` is the `cli.ts` routing that
+    opens it (keyed on the supervisor-owned `installed`/`active`, NOT the health probe, since
+    a plain manual runtime also answers `/api/health`). `cli.ts` runs it BEFORE the singleton.
+  - The connected menu gains a **`[4] Services`** status view (§3.2, `TerminalUi.ts`); Quit
+    shifted to `[5]`.
+
 - **`SingletonGuard.ts`** (`acquireSingleton`) — **single-instance takeover** so typing
   `portable` in a second window is a full restart (the first instance is stopped, the
   second boots fresh), regardless of directory. The launcher pins the api to
@@ -275,6 +371,16 @@ label, ttlMs}` to the hosted relay. **`verifyUrl` gate (cached-wrong fix):** whe
   `taskkill /T /F`**, **POSIX SIGTERM→SIGKILL**. After the kill it WAITS for the port to
   free (~12s cap) before booting ours. **Never throws into boot.** `release()` (wired to
   `process.once('exit')`) removes the lock only if it's still ours.
+  **Service interplay (portable.dev#12):** a `connect --service` boot stamps
+  `service:true` into the lock. As of the CLI-control-plane follow-up, a manual
+  `portable` in front of an INSTALLED service is intercepted in `cli.ts` BEFORE
+  `acquireSingleton` (`runServiceDashboardIfInstalled`) and opens the dashboard — so the
+  guard's `handle.blocked`/refuse path is now a defense-in-depth fallback (a live daemon
+  with no manifest), not the primary UX. The invariant is unchanged: a manual run must
+  NEVER tree-kill a supervisor-managed daemon (systemd/Task Scheduler would respawn it →
+  a fight loop). A service boot still takes over anything. `stopRunningInstance()` is the
+  standalone probe→tree-kill→wait-port-free (used by the Windows `service stop`, where
+  `schtasks /End` leaves the bun runtime alive).
 
 ## Gotchas
 

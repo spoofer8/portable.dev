@@ -247,6 +247,23 @@ describe('ApiProcess', () => {
     expect(proc.pid).toBe(4242);
   });
 
+  it('defaults the bun executable to process.execPath (bare `bun` breaks under service PATH)', () => {
+    // Under launchd/systemd the daemon env has a minimal PATH without ~/.bun/bin,
+    // so a bare 'bun' spawn ENOENTs — the running binary is always resolvable.
+    const child = new FakeChild();
+    let spawnedCmd = '';
+    const proc = new ApiProcess({
+      env: {},
+      log: () => {},
+      spawnImpl: ((cmd: string) => {
+        spawnedCmd = cmd;
+        return child as any;
+      }) as any,
+    });
+    proc.start();
+    expect(spawnedCmd).toBe(process.execPath);
+  });
+
   it('stop() sends SIGTERM and resolves once the child exits', async () => {
     const child = new FakeChild();
     const proc = new ApiProcess({

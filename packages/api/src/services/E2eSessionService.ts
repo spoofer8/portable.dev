@@ -84,14 +84,30 @@ export class E2eSessionService {
 
   /** Resolve a live session's keys (sliding TTL touch), or undefined. */
   getSessionKeys(sessionId: string): E2eSessionKeys | undefined {
+    const keys = this.peekSessionKeys(sessionId);
+    if (keys) this.touchSession(sessionId);
+    return keys;
+  }
+
+  /**
+   * Resolve a live session's keys WITHOUT sliding the TTL — for pre-auth
+   * lookups: a party that merely observed a sid must not keep the session
+   * alive; call {@link touchSession} only AFTER the envelope actually opened.
+   */
+  peekSessionKeys(sessionId: string): E2eSessionKeys | undefined {
     const record = this.sessions.get(sessionId);
     if (!record) return undefined;
     if (this.now() - record.lastUsedAt > SESSION_TTL_MS) {
       this.sessions.delete(sessionId);
       return undefined;
     }
-    record.lastUsedAt = this.now();
     return record.keys;
+  }
+
+  /** Slide a live session's TTL — call only once the caller authenticated. */
+  touchSession(sessionId: string): void {
+    const record = this.sessions.get(sessionId);
+    if (record) record.lastUsedAt = this.now();
   }
 
   private evictExpired(): void {

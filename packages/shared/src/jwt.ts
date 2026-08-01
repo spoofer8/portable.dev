@@ -153,13 +153,47 @@ export function verifyAuthToken(token: string): AuthTokenPayload {
     return decoded;
   } catch (err) {
     if (err instanceof jwt.TokenExpiredError) {
-      throw new Error('Token has expired');
+      throw new TokenExpiredAuthError();
     }
     if (err instanceof jwt.JsonWebTokenError) {
-      throw new Error(`Invalid token: ${err.message}`);
+      throw new TokenInvalidAuthError(`Invalid token: ${err.message}`);
     }
     throw err;
   }
+}
+
+/** Machine-readable JWT failure codes (401 body `code` field + typed errors). */
+export type JwtErrorCode = 'token_expired' | 'token_invalid';
+
+/**
+ * Signature verified but `exp` passed — recoverable via `POST /api/e2e/renew`,
+ * never a re-pair. Message stays `'Token has expired'` (string contracts).
+ */
+export class TokenExpiredAuthError extends Error {
+  readonly code: JwtErrorCode = 'token_expired';
+  constructor() {
+    super('Token has expired');
+    this.name = 'TokenExpiredAuthError';
+  }
+}
+
+/**
+ * Signature/shape verification failed (rotated JWT_SECRET or foreign token) —
+ * renewal is impossible; clients must genuinely re-pair.
+ */
+export class TokenInvalidAuthError extends Error {
+  readonly code: JwtErrorCode = 'token_invalid';
+  constructor(message: string) {
+    super(message);
+    this.name = 'TokenInvalidAuthError';
+  }
+}
+
+/** Map any verify failure to its wire code (message-match fallback for safety). */
+export function classifyJwtError(err: unknown): JwtErrorCode {
+  if (err instanceof TokenExpiredAuthError) return 'token_expired';
+  if (err instanceof Error && err.message === 'Token has expired') return 'token_expired';
+  return 'token_invalid';
 }
 
 /**
@@ -219,6 +253,54 @@ export function renewAuthToken(token: string): string {
     googleDriveToken: payload.googleDriveToken,
     googleRefreshToken: payload.googleRefreshToken,
   });
+}
+
+/**
+ * Verify a JWT's signature/audience/shape while ACCEPTING an expired `exp`.
+ * A bad signature still throws {@link TokenInvalidAuthError} — the genuine
+ * re-pair case.
+ */
+export function verifyAuthTokenAllowExpired(token: string, jwtSecret?: string): AuthTokenPayload {
+  try {
+    return jwt.verify(token, jwtSecret || JWT_SECRET, {
+      audience: 'authenticated',
+      algorithms: ['HS256'],
+      ignoreExpiration: true,
+    }) as AuthTokenPayload;
+  } catch (err) {
+    if (err instanceof jwt.JsonWebTokenError) {
+      throw new TokenInvalidAuthError(`Invalid token: ${err.message}`);
+    }
+    throw err;
+  }
+}
+
+/**
+ * Re-mint a fresh 72h token from an expired-but-signature-valid one (same
+ * identity). Deliberately NO staleness cap — PSK possession is the auth and a
+ * cap would recreate the lockout. Non-pairing (service-account-shaped) tokens refused.
+ */
+export function renewAuthTokenAllowExpired(token: string, jwtSecret?: string): string {
+  const payload = verifyAuthTokenAllowExpired(token, jwtSecret);
+  if (
+    payload.type ||
+    payload.serviceAccount ||
+    payload.serviceAccountId ||
+    payload.allowedUserIds
+  ) {
+    throw new TokenInvalidAuthError('Invalid token: not a user pairing token');
+  }
+  return generateAuthToken(
+    {
+      userId: payload.userId,
+      username: payload.username,
+      email: payload.email,
+      avatarUrl: payload.avatarUrl,
+      googleDriveToken: payload.googleDriveToken,
+      googleRefreshToken: payload.googleRefreshToken,
+    },
+    jwtSecret
+  );
 }
 
 /**

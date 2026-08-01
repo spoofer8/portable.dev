@@ -114,7 +114,12 @@ describe('useNativeSocket — relay handshake addressing', () => {
     // Origin only → namespace stays '/'; the relay prefix lives in `path`.
     expect(built[0].url).toBe('https://app.portable.dev');
     expect(built[0].opts?.path).toBe('/t/pc-123/socket.io');
-    expect(built[0].opts?.auth).toEqual({ token: 'jwt', appVersion: '1.5.0' });
+    // Callback-form auth: resolve one attempt's payload.
+    const auth = built[0].opts?.auth as (cb: (data: Record<string, unknown>) => void) => void;
+    expect(typeof auth).toBe('function');
+    await expect(new Promise<Record<string, unknown>>((resolve) => auth(resolve))).resolves.toEqual(
+      { token: 'jwt', appVersion: '1.5.0' }
+    );
     unmount();
   });
 });

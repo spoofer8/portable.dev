@@ -93,6 +93,15 @@ describe('resolveDataDir', () => {
     delete process.env.XDG_DATA_HOME;
     expect(resolveDataDir()).toBe(path.join(os.homedir(), '.portable'));
   });
+
+  it('reads from an explicit env instead of process.env when given', () => {
+    process.env.PORTABLE_DATA_DIR = '/from-process-env';
+    expect(resolveDataDir(undefined, { XDG_DATA_HOME: '/xdg' })).toBe(
+      path.join('/xdg', 'portable')
+    );
+    expect(resolveDataDir(undefined, { PORTABLE_DATA_DIR: '/custom' })).toBe('/custom');
+    expect(resolveDataDir(undefined, {})).toBe(path.join(os.homedir(), '.portable'));
+  });
 });
 
 describe('LocalSecretStore', () => {

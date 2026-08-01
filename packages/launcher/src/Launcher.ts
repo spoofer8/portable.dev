@@ -25,6 +25,10 @@ import {
   resolveUseNgrok,
 } from './config.js';
 import { startConnectionWatch, type ConnectionWatcherHandle } from './ConnectionWatcher.js';
+import {
+  DaemonRuntimeStateStore,
+  type DaemonRuntimeStateWriter,
+} from './DaemonRuntimeStateStore.js';
 import { internalBridgePath, mintInternalSecret, writeInternalBridge } from './InternalBridge.js';
 import { ensureSidecarRegistration } from './McpSidecarRegistrar.js';
 import { ensureNgrok } from './NgrokProvisioner.js';
@@ -36,16 +40,22 @@ import {
   resolvePairingIdentity,
 } from './PairingIdentity.js';
 import { PairingServer } from './PairingServer.js';
+import { PairingSessionFactory } from './PairingSessionFactory.js';
 import { prepareCredentials } from './prepareCredentials.js';
 import { startPresenceWatch, type PresenceWatcherHandle } from './PresenceWatcher.js';
 import { verifyPublicUrl } from './PublicUrlVerifier.js';
+import { makeManagerReal } from './ServiceCommands.js';
+import { createServiceController } from './ServiceController.js';
+import { ServiceLogSource } from './ServiceLogSource.js';
 import {
   renderTerminalQr,
+  startHeadlessUi,
   startLauncherUi,
   startStaticUi,
   type LauncherUiHandle,
   type McpStatusProvider,
   type McpStatusView,
+  type ServiceControlDeps,
   type StartLauncherUiOptions,
 } from './TerminalUi.js';
 import {
@@ -181,6 +191,12 @@ export interface LauncherDeps {
    */
   mcpStatus?: McpStatusProvider;
   /**
+   * portable.dev#12 follow-up: lazily build the deps for the connected menu's
+   * interactive "[4] Services" sub-view (controller + fresh-pairing + debug, PRD
+   * §3.2). Wired by {@link createLauncher}; undefined → the entry is inert.
+   */
+  serviceControl?: () => ServiceControlDeps;
+  /**
    * Tunnel self-heal seam (tests). Defaults to {@link startTunnelHealthMonitor}.
    * Probes the PUBLIC relay path and cycles cloudflared when it's unreachable while
    * the local api is healthy (recovers a dead/stale gateway mapping).
@@ -209,6 +225,22 @@ export interface LauncherDeps {
    * so boot warnings never corrupt the live status box. Defaults to {@link log}.
    */
   apiLog?: (line: string) => void;
+  /**
+   * Structured daemon runtime-state writer (portable.dev#12 follow-up, PRD §7).
+   * Wired by {@link createLauncher} ONLY in `--service` mode (the supervised
+   * daemon) so a separate dashboard can read the tunnel/relay/phase it can't see
+   * over `/api/health`. Undefined for an interactive run — `boot()`/`shutdown()`
+   * simply skip the writes (no behavior change). Best-effort — never blocks boot.
+   */
+  runtimeState?: DaemonRuntimeStateWriter;
+  /**
+   * Whether to serve the loopback pairing fallback page carrying the BOOT-time
+   * token (default true). {@link createLauncher} sets it FALSE in `--service` mode:
+   * a long-running daemon's boot token eventually expires, so the permanent page
+   * is removed and the dashboard's on-demand {@link PairingSessionFactory} mints a
+   * fresh QR instead (PRD §8.4). Interactive runs keep the page.
+   */
+  servePairingPage?: boolean;
 }
 
 export interface RunResult {
@@ -241,10 +273,59 @@ export class Launcher {
    */
   private connectedDevices: DeviceInfo[] = [];
   private shuttingDown = false;
+  /**
+   * True once {@link releaseRuntimeForHandoff} has torn the manual runtime down for
+   * the interactive service handoff (PRD §10). It stops the api ON PURPOSE, so the
+   * "api exited → tear the launcher down" watcher must NOT fire — this CLI keeps
+   * running (now showing the daemon dashboard).
+   */
+  private handingOff = false;
 
   constructor(deps: LauncherDeps) {
     this.deps = deps;
     this.log = deps.log ?? ((line) => console.log(line));
+  }
+
+  /**
+   * The interactive runtime→daemon HANDOFF (PRD §10). Tear down THIS manual
+   * runtime's api + tunnel + pairing page + watchers and free the loopback port —
+   * WITHOUT stopping the Ink UI (the dashboard stays alive) — so the supervised
+   * daemon can bind the port. The singleton lock is left for the daemon's own
+   * `acquireSingleton` to reclaim (it probes the now-free port and takes over the
+   * lock). Idempotent.
+   */
+  async releaseRuntimeForHandoff(): Promise<void> {
+    if (this.handingOff) return;
+    this.handingOff = true;
+    this.log(
+      '[launcher] handing off to the background service — tearing down the manual runtime (keeping this CLI up)…'
+    );
+    this.connectionWatch?.stop();
+    this.connectionWatch = null;
+    this.presenceWatch?.stop();
+    this.presenceWatch = null;
+    this.chatsWatch?.stop();
+    this.chatsWatch = null;
+    this.tunnelHealthMonitor?.stop();
+    this.tunnelHealthMonitor = null;
+    try {
+      await this.pairingServer?.stop();
+    } catch (err) {
+      this.log(
+        `[launcher] pairing server stop error (handoff): ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    this.pairingServer = null;
+    try {
+      await this.tunnel?.stop();
+    } catch (err) {
+      this.log(
+        `[launcher] tunnel stop error (handoff): ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+    this.tunnel = null;
+    await this.deps.apiProcess.stop();
+    this.log('[launcher] manual runtime released — the service can now bind the port.');
   }
 
   /** The QR payload string `{ gatewayBase, pcId, token, e2eKey }`. */
@@ -327,6 +408,7 @@ export class Launcher {
         onArchiveChat,
         onResumeChat,
         mcpStatus: this.deps.mcpStatus,
+        serviceControl: this.deps.serviceControl,
       });
     } catch (err) {
       // Terminal can't render Ink — boot continues; status falls back to plain logs.
@@ -340,6 +422,8 @@ export class Launcher {
     // 2. Spawn the api on loopback (JWT secret / pcId / relay wired via createLauncher).
     const apiBaseUrl = resolveApiBaseUrl(env);
     setStatus(`Starting the api on ${apiBaseUrl}…`);
+    // §7: record the daemon boot start (service mode only; no-op otherwise).
+    this.deps.runtimeState?.patch({ phase: 'starting', apiHealthy: false });
     this.deps.apiProcess.start();
 
     // 3. Wait for /api/health.
@@ -348,6 +432,8 @@ export class Launcher {
     const health = await waitFn(apiBaseUrl, {
       isAlive: () => this.deps.apiProcess.isAlive(),
     });
+    // §7: api is serving — the tunnel/relay come next.
+    this.deps.runtimeState?.patch({ apiHealthy: true });
 
     // 4. Mint the data-path JWT — the launcher owns the credential.
     //    Resolve the GitHub login NOW (after prepareCredentials persisted it)
@@ -394,21 +480,38 @@ export class Launcher {
         '[launcher] tunnel registration did not confirm within the timeout — showing the QR anyway (self-heal will recover it)'
       );
     }
+    // §7: record the tunnel + relay milestone (service mode only).
+    this.deps.runtimeState?.patch({
+      phase: registered ? 'healthy' : 'degraded',
+      apiHealthy: true,
+      relayRegistered: registered,
+      tunnelHealthy: registered ? true : null,
+      ...(registered ? { lastRegisteredAt: new Date().toISOString() } : {}),
+    });
 
     // 6. Serve the loopback-only pairing fallback page (NEVER tunneled).
-    setStatus('Starting the pairing page…');
-    const makeServer =
-      this.deps.makePairingServer ??
-      ((p, e) => new PairingServer({ payload: p, endpoint: e, log: detailLog }));
-    this.pairingServer = makeServer(payload, this.deps.endpoint);
+    //    §8.4: in `--service` mode this permanent page carries the BOOT token,
+    //    which expires on a long-running daemon — it is disabled, and the
+    //    dashboard's on-demand PairingSessionFactory mints a fresh QR instead.
     let loopbackUrl: string | undefined;
-    try {
-      loopbackUrl = await this.pairingServer.start();
-    } catch (err) {
+    if (this.deps.servePairingPage !== false) {
+      setStatus('Starting the pairing page…');
+      const makeServer =
+        this.deps.makePairingServer ??
+        ((p, e) => new PairingServer({ payload: p, endpoint: e, log: detailLog }));
+      this.pairingServer = makeServer(payload, this.deps.endpoint);
+      try {
+        loopbackUrl = await this.pairingServer.start();
+      } catch (err) {
+        detailLog(
+          `[pairing] loopback page failed to start: ${err instanceof Error ? err.message : String(err)}`
+        );
+        this.pairingServer = null;
+      }
+    } else {
       detailLog(
-        `[pairing] loopback page failed to start: ${err instanceof Error ? err.message : String(err)}`
+        '[pairing] service mode: the permanent boot-token QR page is disabled — open `portable` for a fresh QR (PRD §8.4).'
       );
-      this.pairingServer = null;
     }
 
     // 7. Render the QR and switch the SAME Ink instance from the booting box to the
@@ -494,6 +597,8 @@ export class Launcher {
   async shutdown(): Promise<void> {
     if (this.shuttingDown) return;
     this.shuttingDown = true;
+    // §7: record the shutdown start (service mode only).
+    this.deps.runtimeState?.patch({ phase: 'stopping' });
     this.connectionWatch?.stop();
     this.connectionWatch = null;
     this.presenceWatch?.stop();
@@ -555,8 +660,13 @@ export class Launcher {
       },
     });
 
-    // If the api dies on its own, stop waiting and tear down.
+    // If the api dies on its own, stop waiting and tear down — UNLESS we stopped it
+    // ourselves for the service handoff (§10), in which case this CLI stays up.
     this.deps.apiProcess.waitUntilExit().then(() => {
+      if (this.handingOff) {
+        this.log('[launcher] manual api released for the service handoff — staying up');
+        return;
+      }
       this.log('[launcher] api exited — tearing down');
       finish();
     });
@@ -592,6 +702,16 @@ export interface CreateLauncherOptions {
    * installed or not authenticated — there is no fallback to cloudflared.
    */
   ngrok?: boolean;
+  /**
+   * `portable connect --service` (portable.dev#12) — the supervisor-spawned
+   * HEADLESS daemon (systemd user unit / Windows Scheduled Task). No terminal:
+   * the Ink UI is replaced by the log-only {@link startHeadlessUi} handle, and
+   * credential prep runs with `skipInteractive` (no TTY for `claude setup-token`
+   * or the GitHub device flow — the daemon reuses whatever the interactive first
+   * run persisted in the store). Everything else (pcId, JWT secret, E2E PSK,
+   * tunnel, registration) is identical, so a paired phone reconnects on its own.
+   */
+  service?: boolean;
 }
 
 /**
@@ -644,6 +764,7 @@ export async function createLauncher(options: CreateLauncherOptions = {}): Promi
   const endpoint = `${gatewayBase}/t/${pcId}`;
 
   const debug = options.debug ?? false;
+  const service = options.service ?? false;
 
   // Ensure a local Chromium for the REQUIRED Playwright MCP and forward its path
   // to the api child (the api reads PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH at module
@@ -760,6 +881,32 @@ export async function createLauncher(options: CreateLauncherOptions = {}): Promi
     makeTunnel = (opts) => new CloudflaredTunnel(opts);
   }
 
+  // §7 (service mode only): a structured runtime-state writer the dashboard reads
+  // for tunnel/relay/phase it can't see over /api/health. Seeded with the
+  // immutable pid/startedAt/endpoint/provider; boot()/shutdown() patch status.
+  // Best-effort — never blocks the daemon. No secret ever goes in this file.
+  const runtimeState: DaemonRuntimeStateWriter | undefined = service
+    ? (() => {
+        const store = new DaemonRuntimeStateStore();
+        const seed = {
+          pid: process.pid,
+          startedAt: new Date().toISOString(),
+          endpoint,
+          tunnelProvider: (useNgrok ? 'ngrok' : 'cloudflare') as 'ngrok' | 'cloudflare',
+        };
+        return {
+          patch: (partial) => {
+            try {
+              store.patch(partial, seed);
+            } catch {
+              // Observability is best-effort — never block the daemon.
+            }
+          },
+          clear: () => store.clear(),
+        };
+      })()
+    : undefined;
+
   const apiProcess = new ApiProcess({
     env,
     log: apiLog,
@@ -775,13 +922,17 @@ export async function createLauncher(options: CreateLauncherOptions = {}): Promi
     },
   });
 
+  // --service: the daemon has no terminal at all — the log-only headless handle
+  // (status lines + pairing info into the log/journal, presence on change).
   // --debug: drop the live Ink screen (it would clobber the streamed api logs) for a
   // plain-text handle that logs each boot status line + prints the QR once, leaving
   // the terminal free for the logs to scroll. Its showConnected() is a no-op log, so
   // the live transition is naturally disabled.
-  const startUi: LauncherDeps['startUi'] = debug
-    ? (opts) => startStaticUi({ ...opts, log })
-    : undefined;
+  const startUi: LauncherDeps['startUi'] = service
+    ? (opts) => startHeadlessUi({ ...opts, log })
+    : debug
+      ? (opts) => startStaticUi({ ...opts, log })
+      : undefined;
 
   // Prefer the connected GitHub login as the minted JWT's username so git
   // commits are authored as the GitHub user (boot() feeds this into
@@ -793,7 +944,13 @@ export async function createLauncher(options: CreateLauncherOptions = {}): Promi
   // has a login, resolvePairingIdentity falls back to the sanitized hostname.
   const githubLogin = readStoredGitHubLogin(store);
 
-  return new Launcher({
+  // §10 handoff hook: the controller built for the connected menu's "[4] Services"
+  // needs to tear down THIS manual runtime (to free the port) before starting the
+  // supervised daemon — but the Launcher instance doesn't exist yet. Set the ref
+  // right after construction; the serviceControl factory reads it lazily at open.
+  const handoffRef: { current?: () => Promise<void> } = {};
+
+  const launcher = new Launcher({
     apiProcess,
     jwtSecret,
     e2ePsk,
@@ -803,6 +960,25 @@ export async function createLauncher(options: CreateLauncherOptions = {}): Promi
     gatewayBase,
     githubLogin,
     mcpStatus,
+    // portable.dev#12 (PRD §3.2): lazily build the interactive "[4] Services"
+    // sub-view deps (controller + fresh-pairing + debug). Built only when the user
+    // opens Services (a plain interactive run never pays the construction cost), and
+    // torn down by the machine on exit. Same controller/pairing/debug the standalone
+    // dashboard uses — so the two look and behave identically (one CLI, no 2nd face).
+    // The controller carries the §10 handoff so Install/Start frees this manual
+    // runtime's port before the daemon starts, without killing this CLI.
+    serviceControl: () => {
+      const manager = makeManagerReal(process.platform, process.argv.slice(2));
+      return {
+        controller: createServiceController(manager, {
+          env,
+          log: apiLog,
+          handoff: () => handoffRef.current?.() ?? Promise.resolve(),
+        }),
+        pairing: new PairingSessionFactory({ env }),
+        debug: new ServiceLogSource(),
+      };
+    },
     // Read the GitHub login at MINT TIME over the SAME store (after
     // prepareCredentials persisted it) — the first-ever-boot fix.
     resolveGithubLogin: () => readStoredGitHubLogin(store),
@@ -810,6 +986,10 @@ export async function createLauncher(options: CreateLauncherOptions = {}): Promi
     // Route boot detail/warnings to the api LOG FILE so they never corrupt the
     // Ink-owned terminal (the live status box).
     apiLog,
+    // §7: publish structured runtime state in service mode (undefined otherwise).
+    runtimeState,
+    // §8.4: no permanent boot-token QR page for the long-running daemon.
+    servePairingPage: !service,
     // Mount on the connected menu only when a device has paired before AND we're
     // not streaming logs in --debug (which owns the terminal with a static QR print).
     initialConnected: everConnected && !debug,
@@ -820,8 +1000,11 @@ export async function createLauncher(options: CreateLauncherOptions = {}): Promi
     // Discover Anthropic + GitHub creds on the OS (and run the
     // interactive login fallback if missing) into the SAME store/env the api
     // child reads, before the api spawns + before the Ink screen takes over.
+    // The headless daemon (--service) has no TTY for `claude setup-token` / the
+    // GitHub device flow, so it discovers-and-persists only (skipInteractive) —
+    // the interactive first run is where logins happen.
     prepareCredentials: async () => {
-      await prepareCredentials({ store, env, log });
+      await prepareCredentials({ store, env, log, skipInteractive: service });
     },
     makeTunnelRouter: (apiBaseUrl, reviewerToken, reviewerE2eKey) => {
       // The registration agent keeps the hosted relay pointed at this PC's
@@ -867,7 +1050,11 @@ export async function createLauncher(options: CreateLauncherOptions = {}): Promi
       apiLog(`[register] PC ${pcId} → ${agent.getEndpoint()} (this endpoint is in the pairing QR)`);
       return new TunnelRouter({
         apiBaseUrl,
-        onTunnelUrl: (url) => agent.onTunnelUrl(url),
+        onTunnelUrl: (url) => {
+          agent.onTunnelUrl(url);
+          // §7: record the current public tunnel URL (first capture + rotations).
+          runtimeState?.patch({ publicTunnelUrl: url });
+        },
         onStop: () => agent.stop(),
         // The resolved tunnel provider (cloudflared by default, ngrok when --ngrok):
         // the binary path + the concrete tunnel factory were both resolved above so
@@ -880,4 +1067,10 @@ export async function createLauncher(options: CreateLauncherOptions = {}): Promi
     env,
     log,
   });
+
+  // Now that the Launcher exists, wire the §10 handoff the connected-menu
+  // controller invokes on Install/Start (tear down this manual runtime + free the
+  // port, keeping this CLI alive).
+  handoffRef.current = () => launcher.releaseRuntimeForHandoff();
+  return launcher;
 }

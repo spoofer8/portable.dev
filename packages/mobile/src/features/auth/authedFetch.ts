@@ -55,6 +55,13 @@ export interface CreateAuthedFetchOptions {
    * on the PC). When omitted, the legacy gateway `/refresh` behavior applies.
    */
   persistRenewedToken?: (token: string) => Promise<void>;
+  /**
+   * DEVICE-PATH only (ignored on the legacy gateway path): PSK-proven re-mint of
+   * an EXPIRED data-path JWT, called on a 401. Resolves the fresh, ALREADY-PERSISTED
+   * JWT (the request is replayed once with it), or `null` when the PC rejected
+   * recovery — the original 401 surfaces so the re-pair path runs.
+   */
+  renewOnUnauthorized?: () => Promise<string | null>;
 }
 
 /** The relay header carrying a PC-renewed data-path JWT. */
@@ -115,13 +122,29 @@ export function createAuthedFetch(opts: CreateAuthedFetchOptions): AuthedFetch {
 
     // DEVICE PATH: the relay slides the JWT and returns a fresh one in
     // `X-Renewed-Token`. Persist it (keyed by the connected pcId via the seam) +
-    // notify, and SKIP `/refresh` entirely (there is none on the PC — a 401 is
-    // returned for the death/re-pair path).
+    // notify, and SKIP `/refresh` entirely (there is none on the PC).
     if (persistRenewed) {
       const renewed = res.headers.get(RENEWED_TOKEN_HEADER);
       if (renewed) {
         await persistRenewed(renewed);
         opts.onTokenRefreshed?.(renewed);
+        return res;
+      }
+      // 401 = expired JWT: re-mint against the PSK and replay once; a rejected
+      // or failed renew surfaces the original 401 (death/re-pair path).
+      if (res.status === 401 && opts.renewOnUnauthorized) {
+        let fresh: string | null;
+        try {
+          fresh = await opts.renewOnUnauthorized();
+        } catch {
+          // Transport failure mid-renew — the next attempt renews again.
+          return res;
+        }
+        if (!fresh) return res;
+        // Already persisted by the renew module — just re-point the socket.
+        opts.onTokenRefreshed?.(fresh);
+        // Replay the original init with only the Bearer swapped (RN re-serializes FormData).
+        return doFetch(input, withBearer(init, fresh));
       }
       return res;
     }

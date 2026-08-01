@@ -21,6 +21,7 @@ import { getGatewayUrl } from '../auth/gatewayConfig';
 // out of the api module — only the SecureStore-backed token resolver is pulled in.
 import { persistRenewedDataPathToken, resolveDataPathToken } from '../pc-connect/dataPathToken';
 import { createAuthedFetch } from '../auth/authedFetch';
+import { renewDataPathToken } from './renewDataPathToken';
 import { RelayApiClient } from './relayClient';
 import { configureE2eSessions } from './e2eSessionManager';
 import { configureQueryOnlineManager, createQueryClient, type NetInfoLike } from './queryClient';
@@ -42,10 +43,9 @@ function buildDefaultClient(): RelayApiClient {
   const gateway = new GatewayClient({ gatewayUrl: getGatewayUrl() });
   // Wire the shared E2E session manager (portable.dev#13) so the Socket.IO layer can
   // establish/reuse the connected PC's session for per-frame encryption. The
-  // handshake MUST ride the SAME authed transport as the HTTP tunnel: though
-  // `/api/e2e/handshake` is public on the PC, the gateway relay still requires a
-  // valid Bearer to forward any `/t/<pcId>/*` request (only /api/health is exempt),
-  // so a plain, Bearer-less fetch is rejected 401 at the relay.
+  // handshake rides the same authed transport as the HTTP tunnel but deliberately
+  // has NO `renewOnUnauthorized` — the renew flow performs its own handshake, so a
+  // renew-armed handshake would recurse.
   const handshakeFetch = createAuthedFetch({
     gateway,
     getToken: resolveDataPathToken,
@@ -61,6 +61,8 @@ function buildDefaultClient(): RelayApiClient {
     gateway,
     getToken: resolveDataPathToken,
     persistRenewedToken: persistRenewedDataPathToken,
+    // Expired-JWT recovery: 401 → PSK-proven re-mint + single replay.
+    renewOnUnauthorized: () => renewDataPathToken(),
     // End-to-end encryption (portable.dev#13): tunnel every JSON `/api/*` request
     // through the PC's `POST /api/e2e` so the relay + Cloudflare see only opaque
     // ciphertext. Uses the connected pcId's QR-provisioned E2E key + relay base.

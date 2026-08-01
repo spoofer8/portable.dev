@@ -67,6 +67,8 @@ export interface RelayApiClientOptions {
    * data-path JWT (keyed by the connected pcId) and skip the legacy `/refresh`.
    */
   persistRenewedToken?: (token: string) => Promise<void>;
+  /** DEVICE-PATH only: see `CreateAuthedFetchOptions.renewOnUnauthorized`. */
+  renewOnUnauthorized?: () => Promise<string | null>;
   /**
    * E2E full tunnel (portable.dev#13). Enable it (the production `ApiProvider`
    * passes `e2e: {}`) to seal every JSON `/api/*` request inside an AEAD
@@ -114,14 +116,28 @@ export class RelayApiClient {
       saveToken: opts.saveToken,
       onTokenRefreshed: opts.onTokenRefreshed,
       persistRenewedToken: opts.persistRenewedToken,
+      renewOnUnauthorized: opts.renewOnUnauthorized,
     });
 
     if (opts.e2e) {
       // E2E tunnel (portable.dev#13): the AEAD envelope rides `authedFetch`, so
       // the outer Bearer + X-Renewed-Token renewal keep working while the relay
       // sees only opaque ciphertext for the inner method/path/body.
+      //
+      // The handshake gets its own fetch WITHOUT `renewOnUnauthorized` — the
+      // renew flow awaits the handshake, so a renew-armed handshake would await
+      // its own in-flight promise (permanent deadlock).
+      const handshakeFetch = createAuthedFetch({
+        gateway: opts.gateway,
+        fetchImpl: opts.fetchImpl,
+        getToken: opts.getToken,
+        saveToken: opts.saveToken,
+        onTokenRefreshed: opts.onTokenRefreshed,
+        persistRenewedToken: opts.persistRenewedToken,
+      });
       this.jsonFetch = createE2eFetch({
         outerFetch: this.authedFetch,
+        handshakeFetch,
         getPcId: opts.e2e.getPcId ?? getConnectedPcId,
         getE2eKey: opts.e2e.getE2eKey ?? getE2eKey,
         getRelayBase: opts.e2e.getRelayBase ?? (async () => (await getRelayUrl()) ?? ''),
