@@ -17,6 +17,11 @@ import { installClaudeHooks, type InstallClaudeHooksResult } from './ClaudeHooks
 import { ensureCloudflared } from './CloudflaredProvisioner.js';
 import { CloudflaredTunnel } from './CloudflaredTunnel.js';
 import {
+  discoverCodexCapability,
+  formatCodexCapabilityGuidance,
+  resolveCodexPresetsJson,
+} from './CodexCapability.js';
+import {
   resolveApiBaseUrl,
   resolveApiPort,
   resolveOperatorWorkspaceDir,
@@ -783,6 +788,14 @@ export async function createLauncher(options: CreateLauncherOptions = {}): Promi
     log(`[launcher] workspace → ${workspaceDir} (operator WORKSPACE_DIR forwarded to the api)`);
   }
 
+  // Codex is optional. Probe the native executable directly, never the operator's
+  // interactive shell aliases, and pass an app-server-safe preset map to the api.
+  // Discovery is asynchronous, bounded, and fail-open so Claude-only boot remains
+  // available when Codex is missing or broken.
+  const codexCapability = await discoverCodexCapability({ env });
+  const codexPresetsJson = resolveCodexPresetsJson(env);
+  for (const line of formatCodexCapabilityGuidance(codexCapability)) log(line);
+
   // rev12 (D53): the internal bridge + global Claude Code lifecycle hooks.
   // Mint a per-boot secret, write `<DATA_DIR>/internal-bridge.json` (how the
   // claude-spawned `portable hook-relay` / `portable mcp-sidecar` processes
@@ -919,6 +932,8 @@ export async function createLauncher(options: CreateLauncherOptions = {}): Promi
       chromiumExecutablePath,
       workspaceDir,
       hookSecret,
+      codexBin: codexCapability.available ? codexCapability.command : undefined,
+      codexPresetsJson,
     },
   });
 

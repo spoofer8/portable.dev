@@ -142,4 +142,84 @@ describe('RuntimeStateService', () => {
       expect(await svc.hasActiveRuntimeState('user@example.com')).toBe(true);
     });
   });
+
+  it('folds Codex sessions into the compatible session array with a provider tag', async () => {
+    const svc = new RuntimeStateService(
+      { getUserTunnels: () => [] } as any,
+      { getAllProcesses: () => [], getCachedOutput: () => undefined } as any,
+      undefined,
+      { getClaudeSessionInfos: () => [] } as any,
+      undefined,
+      {
+        getSessionInfos: () => [
+          {
+            chatId: 'codex-chat',
+            threadId: 'thread-1',
+            cwd: '/repo',
+            state: 'waiting',
+            activeTurnId: 'turn-1',
+            updatedAt: Date.now(),
+          },
+        ],
+      }
+    );
+
+    const snapshot = await svc.getRuntimeStateForBroadcast('user@example.com');
+    expect(snapshot.claudeSessions).toEqual([
+      expect.objectContaining({
+        chatId: 'codex-chat',
+        provider: 'codex',
+        repoPath: '/repo',
+        status: 'waiting',
+        isProcessing: true,
+        resumable: true,
+      }),
+    ]);
+  });
+
+  it('includes externally running Codex sessions and excludes Portable-owned threads', async () => {
+    const externalProvider = {
+      getExternalAgentSessionInfos: async (_userId: string, excluded: readonly string[]) => {
+        expect(excluded).toEqual(['thread-owned']);
+        return [
+          {
+            chatId: 'codex:thread-external',
+            provider: 'codex' as const,
+            repoPath: '/repo/external',
+            status: 'running' as const,
+            isProcessing: true,
+            lastActivityAt: 10,
+            idleMs: 0,
+            resumable: true,
+            origin: 'terminal' as const,
+          },
+        ];
+      },
+    };
+    const svc = new RuntimeStateService(
+      { getUserTunnels: () => [] } as any,
+      { getAllProcesses: () => [], getCachedOutput: () => undefined } as any,
+      undefined,
+      { getClaudeSessionInfos: () => [] } as any,
+      undefined,
+      {
+        getSessionInfos: () => [
+          {
+            chatId: 'portable-codex',
+            threadId: 'thread-owned',
+            cwd: '/repo/owned',
+            state: 'running',
+            updatedAt: 20,
+          },
+        ],
+      },
+      externalProvider
+    );
+
+    const snapshot = await svc.getRuntimeStateForBroadcast('user@example.com');
+    expect(snapshot.claudeSessions.map((session: any) => session.chatId)).toEqual([
+      'portable-codex',
+      'codex:thread-external',
+    ]);
+  });
 });

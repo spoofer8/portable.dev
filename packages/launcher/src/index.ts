@@ -3,6 +3,19 @@ export type { LauncherDeps, RunResult, CreateLauncherOptions } from './Launcher.
 export { ApiProcess, waitForHealth } from './ApiProcess.js';
 export type { ApiHealthBody, WaitForHealthOptions, ApiProcessOptions } from './ApiProcess.js';
 export {
+  DEFAULT_CODEX_PRESETS,
+  discoverCodexCapability,
+  formatCodexCapabilityGuidance,
+  resolveCodexCandidates,
+  resolveCodexPresetsJson,
+} from './CodexCapability.js';
+export type {
+  CodexCapability,
+  CodexPresetConfig,
+  CodexPresetId,
+  DiscoverCodexCapabilityOptions,
+} from './CodexCapability.js';
+export {
   ensureJwtSecret,
   mintPairingToken,
   resolvePairingIdentity,

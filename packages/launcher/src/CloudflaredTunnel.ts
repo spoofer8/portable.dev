@@ -81,17 +81,18 @@ export function resolveCloudflaredBin(
 
   if (platform !== 'win32') return 'cloudflared';
 
+  // Resolve Windows candidates with Windows semantics even in cross-platform tests.
   const candidates = [
-    path.join(env.ProgramFiles ?? 'C:\\Program Files', 'cloudflared', 'cloudflared.exe'),
-    path.join(
+    path.win32.join(env.ProgramFiles ?? 'C:\\Program Files', 'cloudflared', 'cloudflared.exe'),
+    path.win32.join(
       env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)',
       'cloudflared',
       'cloudflared.exe'
     ),
     env.LOCALAPPDATA
-      ? path.join(env.LOCALAPPDATA, 'Microsoft', 'WinGet', 'Links', 'cloudflared.exe')
+      ? path.win32.join(env.LOCALAPPDATA, 'Microsoft', 'WinGet', 'Links', 'cloudflared.exe')
       : '',
-    env.USERPROFILE ? path.join(env.USERPROFILE, 'scoop', 'shims', 'cloudflared.exe') : '',
+    env.USERPROFILE ? path.win32.join(env.USERPROFILE, 'scoop', 'shims', 'cloudflared.exe') : '',
   ].filter((c): c is string => c.length > 0);
 
   for (const candidate of candidates) {

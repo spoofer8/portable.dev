@@ -29,6 +29,7 @@ import session from 'express-session';
 
 import { FEATURE_FLAGS } from './config/featureFlags.js';
 import { resolveConfigDir } from './db/ClaudeProjects/projectsPaths.js';
+import { resolveProjectsRoot } from './db/CodexProjects/codexPaths.js';
 import { LocalSecretsAdapter } from './db/LocalSecretsAdapter.js';
 import { LocalSecretsVaultAdapter } from './db/LocalSecretsVaultAdapter.js';
 import { SecretsVaultAdapter } from './db/SecretsVaultAdapter.js';
@@ -51,6 +52,7 @@ import { ChatExecutionService } from './services/ChatExecutionService.js';
 import { ChatService } from './services/ChatService.js';
 import { ClaudeOAuthService } from './services/ClaudeOAuthService.js';
 import { ClaudeService } from './services/ClaudeService.js';
+import { CodexService } from './services/CodexService/index.js';
 import { ConnectionsService } from './services/ConnectionsService.js';
 import { DeviceTokenService } from './services/DeviceTokenService.js';
 import { E2eSessionService } from './services/E2eSessionService.js';
@@ -145,6 +147,7 @@ class Server {
   private leaderboardService!: LeaderboardService;
   private processTrackerService!: any; // ProcessTrackerService
   private claudeService!: ClaudeService;
+  private codexService!: CodexService;
   private socketIOService!: SocketIOService;
   private chatExecutionService!: ChatExecutionService;
   private handshakeVerificationGate!: HandshakeVerificationGate; // block kill switch (gateway VERIFY_HANDSHAKE)
@@ -187,6 +190,7 @@ class Server {
   private stopOnPcService?: import('./services/StopOnPcService.js').StopOnPcService;
   // rev12 D62: mid-turn live-follow of terminal transcripts (push rows to the room).
   private externalTranscriptFollower?: import('./services/ExternalTranscriptFollowerService.js').ExternalTranscriptFollowerService;
+  private directoryRevision = Date.now();
 
   constructor() {
     debugLog('Initializing Express...');
@@ -318,7 +322,19 @@ class Server {
         ? undefined
         : {
             configDir: resolveConfigDir(),
+            projectsRoot: resolveProjectsRoot(),
             reposProvider: () => this.gitLocalService.getLocalRepositories('local'),
+            onSessionCatalogChange: (catalog: { claude: unknown[]; codex: unknown[] }) => {
+              this.directoryRevision = Math.max(Date.now(), this.directoryRevision + 1);
+              const providers = [
+                ...(catalog.claude.length > 0 ? (['claude'] as const) : []),
+                ...(catalog.codex.length > 0 ? (['codex'] as const) : []),
+              ];
+              this.socketIOService?.broadcastToAll('chat:directory_changed', {
+                revision: this.directoryRevision,
+                providers,
+              });
+            },
           };
     const dbAdapter: DbAdapter = new SqliteDbAdapter(undefined, undefined, chatMessageSource);
     const dbInitialized = await dbAdapter.initialize();
@@ -593,6 +609,37 @@ class Server {
       this.claudeService.setLocalAiCredentialsService(this.localAiCredentialsService);
     }
 
+    this.codexService = new CodexService({
+      command: process.env.CODEX_BIN || 'codex',
+      args: ['app-server', '--stdio'],
+      onStream: (event) => {
+        void this.chatExecutionService?.handleCodexStream(event).catch((error) => {
+          console.error('[Server] Failed to handle Codex stream event:', error);
+        });
+      },
+      onStatus: (event) => {
+        void this.chatExecutionService?.handleCodexStatus(event).catch((error) => {
+          console.error('[Server] Failed to handle Codex status event:', error);
+        });
+      },
+      onApproval: (request) => {
+        void this.chatExecutionService?.handleCodexApproval(request).catch((error) => {
+          console.error('[Server] Failed to handle Codex approval request:', error);
+        });
+      },
+      onStderr: (line) => debugLog(`[Codex] ${line}`),
+      onProtocolError: (error) => console.error('[Server] Codex app-server protocol error:', error),
+      onExit: (error) => console.error('[Server] Codex app-server exited:', error),
+    });
+    this.chatService.setProviderArchiveHandler(async ({ provider, sessionId, archived }) => {
+      if (provider !== 'codex') return;
+      if (archived) {
+        await this.codexService.archiveThread(sessionId);
+      } else {
+        await this.codexService.unarchiveThread(sessionId);
+      }
+    });
+
     // Initialize MessageDeduplicationService
     const { MessageDeduplicationService } =
       await import('./services/MessageDeduplicationService.js');
@@ -632,7 +679,9 @@ class Server {
       this.processTrackerService,
       undefined, // runtimeStateFormatter
       this.claudeService, // live Claude sessions in the runtime panel
-      this.externalClaudeSessionService // rev12: terminal-session presence
+      this.externalClaudeSessionService, // rev12: terminal-session presence
+      this.codexService,
+      dbAdapter
     );
 
     // outdated-build block kill switch: fetches the gateway's
@@ -657,7 +706,8 @@ class Server {
       this.handshakeVerificationGate, // outdated-build block kill switch
       this.externalClaudeSessionService, // rev12: adopt-vs-fork gate
       this.stopOnPcService, // rev12 D63: stop-on-send (interactive send ends the terminal session)
-      this.sourceControlService // portable.dev#17: chat:create worktree validation
+      this.sourceControlService, // portable.dev#17: chat:create worktree validation
+      this.codexService
     );
 
     // Wire up circular dependency: ClaudeService needs ChatExecutionService for create_chat tool
@@ -929,7 +979,8 @@ class Server {
         this.sopService, // Pass SOPService for SOP progress in chat summarization
         this.storageService, // Pass StorageService for workspace file management
         this.localAiHelper, // Local-first one-shot AI helper (intent/suggestions/summary/project-name/voice)
-        this.claudeOAuthService // Claude-account OAuth (login-from-phone, portable.dev#18)
+        this.claudeOAuthService, // Claude-account OAuth (login-from-phone, portable.dev#18)
+        this.codexService
       )
     );
 
@@ -1286,6 +1337,12 @@ class Server {
         } catch (error) {
           console.error('[Server] Error shutting down Socket.IO:', error);
         }
+      }
+
+      try {
+        await this.codexService?.shutdown();
+      } catch (error) {
+        console.error('[Server] Error shutting down Codex app-server:', error);
       }
 
       // Close HTTP server (stop accepting new connections)

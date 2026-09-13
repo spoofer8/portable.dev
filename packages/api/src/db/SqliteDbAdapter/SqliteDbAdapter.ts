@@ -24,7 +24,7 @@ import { promises as fs } from 'fs';
 import * as path from 'path';
 
 import { WORKSPACE_DIR } from '@vgit2/shared/constants';
-import { DEFAULT_MODEL_MODE } from '@vgit2/shared/models';
+import { DEFAULT_MODEL_MODE, getCodexPresetForModel } from '@vgit2/shared/models';
 
 import { migrateJsonToSqlite } from './JsonToSqliteMigrator.js';
 import { SqliteChatStore } from './SqliteChatStore.js';
@@ -40,8 +40,19 @@ import {
 import { ClaudeProjectsMessageStore } from '../ClaudeProjects/ClaudeProjectsMessageStore.js';
 import { OverlayMessageStore } from '../ClaudeProjects/OverlayMessageStore.js';
 import { transcriptPath } from '../ClaudeProjects/projectsPaths.js';
+import { projectsDir } from '../ClaudeProjects/projectsPaths.js';
+import {
+  CodexProjectsChatIndex,
+  type DiscoveredCodexChat,
+} from '../CodexProjects/CodexProjectsChatIndex.js';
+import { CodexProjectsMessageStore } from '../CodexProjects/CodexProjectsMessageStore.js';
+import { resolveCodexHome, resolveProjectsRoot } from '../CodexProjects/codexPaths.js';
 import { pickPreviewRows } from '../previewRows.js';
 import { DataTransformer } from '../utils/DataTransformer.js';
+import {
+  SessionDiscoveryCoordinator,
+  type SessionCatalog,
+} from '../../services/session-discovery/SessionDiscoveryCoordinator.js';
 
 import type { IMessageStore } from '../ClaudeProjects/IMessageStore.js';
 import type { ChatOrigin, DbAdapter, SaveChatOptions } from '../DbAdapter.js';
@@ -56,8 +67,16 @@ export interface ChatMessageSourceConfig {
   configDir: string;
   /** F1 `getLocalRepositories` over the workspace root — the D29b discovery scope. */
   reposProvider: () => Promise<WorkspaceRepo[]>;
+  /** Codex state/rollout root. Defaults to the host user's ~/.codex. */
+  codexHome?: string;
+  /** Sessions are visible when their cwd is under this root. Defaults to ~/projects. */
+  projectsRoot?: string;
+  /** Called after startup/watch/periodic reconciliation changes the visible catalog. */
+  onSessionCatalogChange?: (catalog: SessionCatalog) => void | Promise<void>;
+  reconcileIntervalMs?: number;
 }
 import type {
+  RuntimeClaudeSessionPayload,
   StoredChat,
   ChatCategory,
   ChatStatus,
@@ -91,6 +110,13 @@ function pinnedThenRecent(a: ChatRow, b: ChatRow): number {
   return (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.last_updated - a.last_updated;
 }
 
+function providerSessionKeys(row: ChatRow): string[] {
+  const provider = row.provider ?? 'claude';
+  return [row.session_id, row.fork_source_session_id]
+    .filter((sessionId): sessionId is string => !!sessionId)
+    .map((sessionId) => `${provider}:${sessionId}`);
+}
+
 /**
  * Discovered (terminal) transcripts are always active (never saved/archived), so they
  * union into the active/legacy-non-archived views only — never the saved/archived lists.
@@ -117,7 +143,10 @@ export class SqliteDbAdapter implements DbAdapter {
   // is unioned with terminal-originated transcripts scoped to the workspace's repos.
   // Undefined → unchanged default (SQLite messages table + SQLite-only list).
   private readonly messageStore?: IMessageStore;
+  private readonly codexMessageStore?: IMessageStore;
   private readonly chatIndex?: ClaudeProjectsChatIndex;
+  private readonly codexChatIndex?: CodexProjectsChatIndex;
+  private readonly discoveryCoordinator?: SessionDiscoveryCoordinator;
   private readonly reposProvider?: () => Promise<WorkspaceRepo[]>;
   /** The `~/.claude` config dir (when JSONL mode is on) — used to locate transcripts. */
   private readonly configDir?: string;
@@ -147,12 +176,30 @@ export class SqliteDbAdapter implements DbAdapter {
       // still opens and renders.
       this.configDir = chatSource.configDir;
       this.chatIndex = new ClaudeProjectsChatIndex(chatSource.configDir);
+      const codexHome = chatSource.codexHome ?? resolveCodexHome();
+      this.codexChatIndex = new CodexProjectsChatIndex(
+        codexHome,
+        chatSource.projectsRoot ?? resolveProjectsRoot()
+      );
       this.reposProvider = chatSource.reposProvider;
       this.messageStore = new ClaudeProjectsMessageStore(
         chatSource.configDir,
         new OverlayMessageStore(this.dataDir),
         (chatId) => this.resolveTranscriptKeys(chatId)
       );
+      this.codexMessageStore = new CodexProjectsMessageStore(
+        codexHome,
+        new OverlayMessageStore(this.dataDir),
+        (chatId) => this.resolveCodexRollout(chatId)
+      );
+      this.discoveryCoordinator = new SessionDiscoveryCoordinator({
+        reposProvider: chatSource.reposProvider,
+        scanClaude: (repos) => this.chatIndex!.discoverChats(repos),
+        scanCodex: (repos) => this.codexChatIndex!.discoverChats(repos),
+        watchPaths: [projectsDir(chatSource.configDir), codexHome],
+        onCatalogChange: chatSource.onSessionCatalogChange,
+        reconcileIntervalMs: chatSource.reconcileIntervalMs,
+      });
     }
   }
 
@@ -179,7 +226,7 @@ export class SqliteDbAdapter implements DbAdapter {
     // a SUBDIR of the matched repo). Covers BOTH a terminal-originated chat with NO row AND
     // a row whose repo_path-based transcript is missing (subdir session). Keyed by the
     // SESSION id (the `.jsonl` filename); for a terminal chat that equals chatId.
-    const sessionId = row?.session_id ?? chatId;
+    const sessionId = row?.session_id ?? row?.fork_source_session_id ?? chatId;
     if (this.chatIndex && this.reposProvider) {
       try {
         const discovered = await this.chatIndex.discoverChats(await this.reposProvider());
@@ -207,6 +254,26 @@ export class SqliteDbAdapter implements DbAdapter {
     }
   }
 
+  private async resolveCodexRollout(chatId: string): Promise<string | null> {
+    if (!this.codexChatIndex || !this.reposProvider) return null;
+    const row = await this.store.getChat(chatId);
+    const threadId =
+      row?.session_id ??
+      row?.fork_source_session_id ??
+      (chatId.startsWith('codex:') ? chatId.slice(6) : chatId);
+    const match = await this.codexChatIndex.findChat(threadId, await this.reposProvider());
+    return match?.rolloutPath ?? null;
+  }
+
+  private async messageStoreForChat(
+    chatId: string,
+    knownRow?: ChatRow
+  ): Promise<IMessageStore | undefined> {
+    if (chatId.startsWith('codex:')) return this.codexMessageStore;
+    const row = knownRow ?? (await this.store.getChat(chatId));
+    return row?.provider === 'codex' ? this.codexMessageStore : this.messageStore;
+  }
+
   // ==========================================================================
   // LIFECYCLE
   // ==========================================================================
@@ -216,6 +283,9 @@ export class SqliteDbAdapter implements DbAdapter {
     // Open the JSONL message store's overlay side stream (opt-in).
     if (this.messageStore?.initialize) {
       await this.messageStore.initialize();
+    }
+    if (this.codexMessageStore?.initialize) {
+      await this.codexMessageStore.initialize();
     }
     // Connections persist to local SQLite under DATA_DIR.
     await this.connectionStore.initialize();
@@ -234,6 +304,8 @@ export class SqliteDbAdapter implements DbAdapter {
     } catch (error) {
       console.error('[SqliteDbAdapter] JSON → SQLite migration failed (will retry):', error);
     }
+
+    await this.discoveryCoordinator?.start();
 
     // All domains persist to local SQLite.
     console.log(
@@ -255,7 +327,9 @@ export class SqliteDbAdapter implements DbAdapter {
   /** Close the underlying SQLite handles (tests / graceful shutdown). */
   close(): void {
     this.store.close();
+    this.discoveryCoordinator?.stop();
     this.messageStore?.close?.();
+    this.codexMessageStore?.close?.();
     this.connectionStore.close();
     this.themeStore.close();
     this.pushStore.close();
@@ -270,6 +344,7 @@ export class SqliteDbAdapter implements DbAdapter {
     const {
       userId,
       chatId,
+      provider,
       type,
       title,
       status,
@@ -294,6 +369,7 @@ export class SqliteDbAdapter implements DbAdapter {
       const row: ChatRow = {
         id: chatId,
         user_id: userId,
+        provider: provider ?? existing?.provider ?? 'claude',
         type,
         title,
         summary: summary !== undefined ? summary : (existing?.summary ?? null),
@@ -328,15 +404,40 @@ export class SqliteDbAdapter implements DbAdapter {
     return true;
   }
 
-  /** Discover in-scope terminal-originated transcripts. [] when off. */
-  private async discoverChatsInScope(): Promise<DiscoveredChat[]> {
-    if (!this.chatIndex || !this.reposProvider) return [];
+  /** Discover terminal-originated Claude and Codex sessions. */
+  private async discoverSessionCatalog(): Promise<SessionCatalog> {
+    if (this.discoveryCoordinator) return this.discoveryCoordinator.getCatalog();
+    if (!this.chatIndex || !this.reposProvider) return { claude: [], codex: [] };
     try {
-      return await this.chatIndex.discoverChats(await this.reposProvider());
+      return {
+        claude: await this.chatIndex.discoverChats(await this.reposProvider()),
+        codex: [],
+      };
     } catch (err) {
       console.warn('[SqliteDbAdapter] chat discovery failed (continuing with SQLite rows):', err);
-      return [];
+      return { claude: [], codex: [] };
     }
+  }
+
+  async getExternalAgentSessionInfos(
+    _userId: string,
+    excludedNativeIds: readonly string[] = []
+  ): Promise<RuntimeClaudeSessionPayload[]> {
+    const excluded = new Set(excludedNativeIds);
+    const catalog = await this.discoverSessionCatalog();
+    return catalog.codex
+      .filter((chat) => chat.status === 'running' && !excluded.has(chat.threadId))
+      .map((chat) => ({
+        chatId: chat.id,
+        provider: 'codex' as const,
+        repoPath: chat.cwd,
+        status: 'running' as const,
+        isProcessing: true,
+        lastActivityAt: chat.lastUpdated,
+        idleMs: 0,
+        resumable: true,
+        origin: 'terminal' as const,
+      }));
   }
 
   /** Synthesize a chat ROW for a discovered terminal transcript (no SQLite row). */
@@ -344,6 +445,7 @@ export class SqliteDbAdapter implements DbAdapter {
     return {
       id: d.sessionId,
       user_id: userId,
+      provider: 'claude',
       type: 'claude_code',
       title: d.title,
       summary: null,
@@ -373,6 +475,38 @@ export class SqliteDbAdapter implements DbAdapter {
     };
   }
 
+  /** Synthesize a chat row for a Codex thread without claiming ownership of its rollout. */
+  private codexDiscoveredToRow(d: DiscoveredCodexChat, userId: string): ChatRow {
+    return {
+      id: d.id,
+      user_id: userId,
+      provider: 'codex',
+      type: 'claude_code',
+      title: d.title,
+      summary: null,
+      status: d.status,
+      hidden: false,
+      archived: d.archived,
+      saved: false,
+      pinned: d.pinned,
+      last_updated: d.lastUpdated,
+      repo_path: d.repoPath,
+      repo_full_name: d.repoFullName,
+      session_id: d.threadId,
+      system_prompt: null,
+      playwright_device: null,
+      model: getCodexPresetForModel(d.model),
+      permissions: 'default',
+      agent_setup_id: null,
+      parent_chat_id: null,
+      workflow_run_id: null,
+      routine_id: null,
+      last_read_message_id: null,
+      linked_issue: null,
+      created_at: d.createdAt,
+    };
+  }
+
   /**
    * Union the SQLite chat rows with terminal-originated transcripts,
    * reconciled by session_id: a SQLite row whose session_id matches a transcript is the
@@ -380,21 +514,48 @@ export class SqliteDbAdapter implements DbAdapter {
    * terminal chat. SQLite rows with session_id=null list until their transcript appears.
    * Discovered chats are never archived, so they only appear in the non-archived view.
    */
-  private async unionChatRows(
+  private unionChatRows(
     sqliteRows: ChatRow[],
-    knownSessionIds: Set<string>,
+    knownSessions: Set<string>,
+    catalog: SessionCatalog,
     userId: string,
     archived?: boolean,
     category?: ChatCategory
-  ): Promise<ChatRow[]> {
-    if (!this.chatIndex) return sqliteRows;
-    // Discovered transcripts are always active — only union them into the active view.
-    if (!includeDiscoveredFor(category, archived)) return sqliteRows;
-    const discovered = await this.discoverChatsInScope();
-    const terminal = discovered
-      .filter((d) => !knownSessionIds.has(d.sessionId))
-      .map((d) => this.discoveredToRow(d, userId));
+  ): ChatRow[] {
+    if (!this.chatIndex && !this.codexChatIndex) return sqliteRows;
+    const terminal = [
+      ...catalog.claude
+        .filter(() => includeDiscoveredFor(category, archived))
+        .filter((d) => !knownSessions.has(`claude:${d.sessionId}`))
+        .map((d) => this.discoveredToRow(d, userId)),
+      ...catalog.codex
+        .filter((d) => !knownSessions.has(`codex:${d.threadId}`))
+        .map((d) => this.codexDiscoveredToRow(d, userId))
+        .filter((row) => chatMatchesCategory(row, category, archived)),
+    ];
     return [...sqliteRows, ...terminal];
+  }
+
+  /** Codex owns external archive/pin/recency state; overlay it without mutating SQLite. */
+  private mergeCodexCatalogMetadata(rows: ChatRow[], catalog: SessionCatalog): ChatRow[] {
+    const byThreadId = new Map(catalog.codex.map((chat) => [chat.threadId, chat]));
+    return rows.map((row) => {
+      if (row.provider !== 'codex' || !row.session_id) return row;
+      const discovered = byThreadId.get(row.session_id);
+      if (!discovered) return row;
+      return {
+        ...row,
+        archived: discovered.archived,
+        // Pinning is a Portable presentation preference. Codex's own pin state
+        // must not undo a user's local pin on every catalog refresh.
+        pinned: row.pinned,
+        // A provider-side archive wins over the local Saved bucket so one chat
+        // cannot appear in two mutually-exclusive categories.
+        saved: discovered.archived ? false : row.saved,
+        last_updated: discovered.lastUpdated,
+        status: discovered.status,
+      };
+    });
   }
 
   async getChats(
@@ -405,9 +566,12 @@ export class SqliteDbAdapter implements DbAdapter {
     category?: ChatCategory
   ): Promise<StoredChat[]> {
     const chats = await this.store.readAllChats();
-    const sqliteRows = Array.from(chats.values())
-      .filter((c) => c.user_id === userId)
-      .filter((c) => chatMatchesCategory(c, category, archived));
+    const catalog = await this.discoverSessionCatalog();
+    const userRows = this.mergeCodexCatalogMetadata(
+      Array.from(chats.values()).filter((c) => c.user_id === userId),
+      catalog
+    );
+    const sqliteRows = userRows.filter((c) => chatMatchesCategory(c, category, archived));
     // Terminal-only: just the portable-native chats (real rows that were messaged →
     // session_id set), with NO discovered-transcript union.
     if (portableOnly) {
@@ -416,8 +580,8 @@ export class SqliteDbAdapter implements DbAdapter {
         .sort(pinnedThenRecent)
         .map((c) => this.transformer.transformChatFromDb(c));
     }
-    const known = new Set(sqliteRows.map((c) => c.session_id).filter((s): s is string => !!s));
-    const all = await this.unionChatRows(sqliteRows, known, userId, archived, category);
+    const known = new Set(userRows.flatMap(providerSessionKeys));
+    const all = this.unionChatRows(sqliteRows, known, catalog, userId, archived, category);
     return all.sort(pinnedThenRecent).map((c) => this.transformer.transformChatFromDb(c));
   }
 
@@ -431,19 +595,38 @@ export class SqliteDbAdapter implements DbAdapter {
     category?: ChatCategory
   ): Promise<any[]> {
     const chats = await this.store.readAllChats();
-    const sqliteRows = Array.from(chats.values())
-      .filter((c) => c.user_id === userId)
+    const catalog = await this.discoverSessionCatalog();
+    const userRows = this.mergeCodexCatalogMetadata(
+      Array.from(chats.values()).filter((c) => c.user_id === userId),
+      catalog
+    );
+    const sqliteRows = userRows
       .filter((c) => chatMatchesCategory(c, category, archived))
       // Terminal-only: keep only portable-native chats that were actually messaged
       // (session_id set). The discovered union below is also skipped when portableOnly.
       .filter((c) => (portableOnly ? c.session_id != null : true));
-    const known = new Set(sqliteRows.map((c) => c.session_id).filter((s): s is string => !!s));
-    const discovered =
-      portableOnly === true || !includeDiscoveredFor(category, archived)
+    const known = new Set(userRows.flatMap(providerSessionKeys));
+    const discoveredClaude =
+      portableOnly !== true && includeDiscoveredFor(category, archived)
+        ? catalog.claude.filter((d) => !known.has(`claude:${d.sessionId}`))
+        : [];
+    const discoveredCodex =
+      portableOnly === true
         ? []
-        : await this.discoverChatsInScope().then((ds) => ds.filter((d) => !known.has(d.sessionId)));
-    const discMap = new Map(discovered.map((d) => [d.sessionId, d]));
-    const all = [...sqliteRows, ...discovered.map((d) => this.discoveredToRow(d, userId))]
+        : catalog.codex
+            .filter((d) => !known.has(`codex:${d.threadId}`))
+            .filter((d) =>
+              chatMatchesCategory(this.codexDiscoveredToRow(d, userId), category, archived)
+            );
+    const discMap = new Map<string, DiscoveredChat | DiscoveredCodexChat>([
+      ...discoveredClaude.map((d) => [d.sessionId, d] as const),
+      ...discoveredCodex.map((d) => [d.id, d] as const),
+    ]);
+    const all = [
+      ...sqliteRows,
+      ...discoveredClaude.map((d) => this.discoveredToRow(d, userId)),
+      ...discoveredCodex.map((d) => this.codexDiscoveredToRow(d, userId)),
+    ]
       .sort(pinnedThenRecent)
       .slice(offset, offset + limit);
 
@@ -460,8 +643,9 @@ export class SqliteDbAdapter implements DbAdapter {
             last_message_data: d?.lastMessageData,
           };
         }
-        const messages = this.messageStore
-          ? await this.messageStore.readMessages(chat.id)
+        const providerStore = await this.messageStoreForChat(chat.id, chat);
+        const messages = providerStore
+          ? await providerStore.readMessages(chat.id)
           : await this.store.readMessages(chat.id);
         // Skip injected task-notification rows as preview candidates (public issue #11).
         const { firstUserMessage, lastMessage } = pickPreviewRows(messages);
@@ -482,13 +666,23 @@ export class SqliteDbAdapter implements DbAdapter {
   ): Promise<StoredChat | undefined> {
     const chat = await this.store.getChat(chatId);
     if (chat && chat.user_id === userId) {
-      return this.transformer.transformChatFromDb(chat);
+      if (chat.provider !== 'codex') return this.transformer.transformChatFromDb(chat);
+      const catalog = await this.discoverSessionCatalog();
+      const [merged] = this.mergeCodexCatalogMetadata([chat], catalog);
+      return this.transformer.transformChatFromDb(merged);
     }
     // A terminal-originated chat has a transcript but no SQLite row — open it
     // by synthesizing a row from discovery (chatId is the session id).
-    if (this.chatIndex) {
-      const d = (await this.discoverChatsInScope()).find((x) => x.sessionId === chatId);
-      if (d) return this.transformer.transformChatFromDb(this.discoveredToRow(d, userId));
+    if (this.chatIndex || this.codexChatIndex) {
+      const catalog = await this.discoverSessionCatalog();
+      const claude = catalog.claude.find((item) => item.sessionId === chatId);
+      if (claude) {
+        return this.transformer.transformChatFromDb(this.discoveredToRow(claude, userId));
+      }
+      const codex = catalog.codex.find((item) => item.id === chatId);
+      if (codex) {
+        return this.transformer.transformChatFromDb(this.codexDiscoveredToRow(codex, userId));
+      }
     }
     return undefined;
   }
@@ -501,21 +695,36 @@ export class SqliteDbAdapter implements DbAdapter {
   async getChatOrigin(chatId: string, userId: string, _authToken?: string): Promise<ChatOrigin> {
     const row = await this.store.getChat(chatId);
     if (row && row.user_id === userId) {
-      return { origin: 'sqlite' };
+      return { origin: 'sqlite', provider: row.provider ?? 'claude' };
     }
     // Discovery only exists in JSONL mode (chatIndex wired). In SQLite mode there are no
     // terminal transcripts to fork, so this can only be 'none' for a missing row.
-    if (this.chatIndex) {
-      const d = (await this.discoverChatsInScope()).find((x) => x.sessionId === chatId);
+    if (this.chatIndex || this.codexChatIndex) {
+      const catalog = await this.discoverSessionCatalog();
+      const d = catalog.claude.find((item) => item.sessionId === chatId);
       if (d) {
         return {
           origin: 'discovered',
+          provider: 'claude',
           sourceSessionId: d.sessionId,
           cwd: d.cwd,
           repoPath: d.repoPath,
           repoFullName: d.repoFullName,
           title: d.title,
           lastUpdated: d.lastUpdated,
+        };
+      }
+      const codex = catalog.codex.find((item) => item.id === chatId);
+      if (codex) {
+        return {
+          origin: 'discovered',
+          provider: 'codex',
+          sourceSessionId: codex.threadId,
+          cwd: codex.cwd,
+          repoPath: codex.repoPath,
+          repoFullName: codex.repoFullName,
+          title: codex.title,
+          lastUpdated: codex.lastUpdated,
         };
       }
     }
@@ -554,11 +763,12 @@ export class SqliteDbAdapter implements DbAdapter {
   }
 
   async deleteChat(chatId: string, userId: string, _authToken?: string): Promise<boolean> {
+    const messageStore = await this.messageStoreForChat(chatId);
     const deleted = await this.store.deleteChat(chatId, userId);
     // Also drop this chat's overlay side-stream rows (we never touch the
     // SDK-owned JSONL transcript). Best-effort; the chat row delete is authoritative.
-    if (deleted && this.messageStore?.deleteMessages) {
-      await this.messageStore.deleteMessages(chatId).catch(() => {});
+    if (deleted && messageStore?.deleteMessages) {
+      await messageStore.deleteMessages(chatId).catch(() => {});
     }
     return deleted;
   }
@@ -716,8 +926,9 @@ export class SqliteDbAdapter implements DbAdapter {
     // In JSONL mode the message store persists ONLY portable overlay events
     // (the SDK already wrote the conversation to the transcript); the SQLite default
     // persists every row as before.
-    if (this.messageStore) {
-      await this.messageStore.appendMessage(chatId, type, data, timestamp);
+    const messageStore = await this.messageStoreForChat(chatId);
+    if (messageStore) {
+      await messageStore.appendMessage(chatId, type, data, timestamp);
       return true;
     }
     await this.store.appendMessage(chatId, type, data, timestamp);
@@ -725,15 +936,13 @@ export class SqliteDbAdapter implements DbAdapter {
   }
 
   async getMessages(chatId: string, _authToken?: string): Promise<BufferedMessage[]> {
-    return this.messageStore
-      ? this.messageStore.readMessages(chatId)
-      : this.store.readMessages(chatId);
+    const messageStore = await this.messageStoreForChat(chatId);
+    return messageStore ? messageStore.readMessages(chatId) : this.store.readMessages(chatId);
   }
 
   async getMessageCount(chatId: string, _authToken?: string): Promise<number> {
-    return this.messageStore
-      ? this.messageStore.getMessageCount(chatId)
-      : this.store.getMessageCount(chatId);
+    const messageStore = await this.messageStoreForChat(chatId);
+    return messageStore ? messageStore.getMessageCount(chatId) : this.store.getMessageCount(chatId);
   }
 
   // ==========================================================================

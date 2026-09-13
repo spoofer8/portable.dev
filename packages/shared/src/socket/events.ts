@@ -9,7 +9,7 @@
  * Authoritative server handlers: `packages/api/src/services/SocketIOService.ts`.
  */
 
-import type { AskUserQuestion, CustomDisplay } from '../types/chat.js';
+import type { AgentProvider, AskUserQuestion, CustomDisplay } from '../types/chat.js';
 import type { BufferedMessage, PageContext } from '../types/common.js';
 import type { ProcessData, RuntimeClaudeSessionPayload, TunnelData } from '../types/runtime.js';
 
@@ -45,6 +45,7 @@ export const SERVER_EVENTS = {
   SYSTEM_IDLE_WARNING_CLEARED: 'system:idle_warning_cleared',
   SYSTEM_IDLE_SHUTDOWN: 'system:idle_shutdown',
   CHAT_CREATED: 'chat:created',
+  CHAT_DIRECTORY_CHANGED: 'chat:directory_changed',
   /** Fork-on-first-write: a CC chat was forked into a new Portable chat; client navigates. */
   CHAT_FORKED: 'chat:forked',
   CHAT_NEW_MESSAGE: 'chat:new_message',
@@ -97,6 +98,7 @@ export type ServerEventName = (typeof SERVER_EVENTS)[keyof typeof SERVER_EVENTS]
 export interface ChatCreatePayload {
   chatId: string;
   type: 'claude_code';
+  provider?: AgentProvider;
   title: string;
   owner: string;
   repo: string;
@@ -122,6 +124,7 @@ export interface ChatJoinPayload {
 /** `chat:message` */
 export interface ChatMessagePayload {
   chatId: string;
+  provider?: AgentProvider;
   messageId?: string;
   content: string;
   files?: unknown[];
@@ -151,7 +154,7 @@ export interface ChatMarkReadPayload {
 /** `chat:update_settings` */
 export interface ChatUpdateSettingsPayload {
   chatId: string;
-  settings: { model?: string; permissions?: string; effort?: string };
+  settings: { provider?: AgentProvider; model?: string; permissions?: string; effort?: string };
 }
 
 /** `claude:interrupt` */
@@ -313,12 +316,16 @@ export interface ClaudeStreamBlock {
 /** `claude:stream` — one streamed block appended to the active assistant message. */
 export interface ClaudeStreamPayload {
   chatId: string;
+  provider?: AgentProvider;
+  /** `replace` updates an already-streamed block with the same blockId. */
+  operation?: 'append' | 'replace';
   block: ClaudeStreamBlock;
 }
 
 /** `claude:processing` — Claude began working on a chat (typing indicator on). */
 export interface ClaudeProcessingPayload {
   chatId: string;
+  provider?: AgentProvider;
 }
 
 /** Unified `claude:status` lifecycle values (mirrors the web handler). */
@@ -327,6 +334,7 @@ export type ClaudeRunStatus = 'running' | 'completed' | 'idle' | 'error';
 /** `claude:status` — unified status update (supersedes `claude:processing`). */
 export interface ClaudeStatusPayload {
   chatId: string;
+  provider?: AgentProvider;
   status: ClaudeRunStatus | string;
   repoPath?: string;
   task?: string;
@@ -335,11 +343,13 @@ export interface ClaudeStatusPayload {
 /** `claude:interrupted` — the user interrupted the run. */
 export interface ClaudeInterruptedPayload {
   chatId: string;
+  provider?: AgentProvider;
 }
 
 /** `claude:error` — the run errored; `errorBlock` (when present) renders inline. */
 export interface ClaudeErrorPayload {
   chatId: string;
+  provider?: AgentProvider;
   error: string;
   errorBlock?: ClaudeStreamBlock;
 }
@@ -353,6 +363,7 @@ export interface ClaudeErrorPayload {
 export interface ChatForkedPayload {
   oldChatId: string;
   newChatId: string;
+  provider?: AgentProvider;
 }
 
 /**
@@ -366,6 +377,7 @@ export interface ChatForkedPayload {
  */
 export interface ChatExternalMessagesPayload {
   chatId: string;
+  provider?: AgentProvider;
   messages: BufferedMessage[];
 }
 
@@ -375,6 +387,7 @@ export interface ChatExternalMessagesPayload {
  */
 export interface ChatSummaryUpdatedPayload {
   chatId: string;
+  provider?: AgentProvider;
   summary: string;
 }
 
@@ -384,6 +397,7 @@ export interface ChatSummaryUpdatedPayload {
  */
 export interface ContainerStatusPayload {
   chatId: string;
+  provider?: AgentProvider;
   status: 'creating' | 'ready' | 'health_check' | string;
   message: string;
 }
@@ -396,6 +410,7 @@ export interface ContainerStatusPayload {
  */
 export interface ChatLinkedIssueUpdatedPayload {
   chatId: string;
+  provider?: AgentProvider;
   linkedIssue: {
     owner: string;
     repo: string;
@@ -437,10 +452,17 @@ export interface UserRuntimeStatePayload {
  */
 export interface SessionReapedPayload {
   chatId: string;
+  provider?: AgentProvider;
   reason: 'idle' | 'manual' | 'memory';
   /** Idle duration that triggered the reap (ms), when reason is `idle`. */
   idleMs?: number;
   timestamp: number;
+}
+
+/** `chat:directory_changed` announces a newer filesystem discovery snapshot. */
+export interface ChatDirectoryChangedPayload {
+  revision: number;
+  providers?: AgentProvider[];
 }
 
 /**

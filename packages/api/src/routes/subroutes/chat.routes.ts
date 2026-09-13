@@ -1,5 +1,5 @@
 import { getUserWorkspaceDir, shouldLog } from '@vgit2/shared/constants';
-import { DEFAULT_MODEL_MODE } from '@vgit2/shared/models';
+import { DEFAULT_CODEX_PRESET, DEFAULT_MODEL_MODE } from '@vgit2/shared/models';
 import { getRepoFromPath } from '@vgit2/shared/utils/pathHelpers';
 import { Router } from 'express';
 
@@ -12,6 +12,7 @@ import { getAuthToken, extractMessagePreview } from '../utils/route-helpers.js';
 import type { LocalAiHelper } from '../../services/ai/LocalAiHelper.js';
 import type { ChatService } from '../../services/ChatService.js';
 import type { ClaudeService } from '../../services/ClaudeService.js';
+import type { CodexService } from '../../services/CodexService/index.js';
 import type { GitHubApiService } from '../../services/GitHubApiService.js';
 import type { IntentAnalysisService } from '../../services/IntentAnalysisService.js';
 import type { SuggestionsService } from '../../services/SuggestionsService.js';
@@ -28,6 +29,32 @@ import type {
   GenerateProjectNameResponse,
 } from '@vgit2/shared/types';
 
+interface CodexSessionStatusProvider {
+  getSession(chatId: string): { state: string } | undefined;
+}
+
+export function resolveChatListStatus(
+  chat: { id: string; provider?: string | null; status?: string | null },
+  claudeCodeSessions: Map<string, any>,
+  codexService?: CodexSessionStatusProvider
+): string {
+  if (chat.provider === 'codex') {
+    const state = codexService?.getSession(chat.id)?.state;
+    if (state === 'running' || state === 'waiting') return 'running';
+    if (state === 'idle') return 'idle';
+    if (state === 'error') return 'error';
+    if (chat.status === 'running' || chat.status === 'idle' || chat.status === 'error') {
+      return chat.status;
+    }
+    return 'completed';
+  }
+
+  const session = claudeCodeSessions.get(chat.id);
+  if (!session?.query || session.signal?.stopped) return 'completed';
+  if (session.isProcessing) return 'running';
+  return chat.status === 'idle' ? 'idle' : 'completed';
+}
+
 /**
  * Chat management and messaging routes
  */
@@ -39,7 +66,8 @@ export function createChatRoutes(
   claudeCodeSessions: Map<string, any>,
   sopService?: any,
   claudeService?: ClaudeService,
-  localAiHelper?: LocalAiHelper
+  localAiHelper?: LocalAiHelper,
+  codexService?: CodexService
 ): Router {
   const router = Router();
   // Stateless enumerator for the `/` slash-command picker (reads the shared
@@ -106,16 +134,22 @@ export function createChatRoutes(
       if (req.query.previews === 'false') {
         // Same repoFullName fallback as the full path below: legacy rows persisted
         // without `repo_full_name` resolve it from `repo_path` server-side.
-        const page = allChats.slice(offset, offset + limit).map((chat) => ({
-          ...chat,
-          repoFullName:
-            chat.repoFullName ??
-            getRepoFromPath(
-              chat.repo_path ?? undefined,
-              getUserWorkspaceDir(req.session.userEmail!)
-            ) ??
-            undefined,
-        }));
+        const page = allChats.slice(offset, offset + limit).map((chat) => {
+          const provider = chat.provider === 'codex' ? 'codex' : 'claude';
+          return {
+            ...chat,
+            provider,
+            status: resolveChatListStatus(chat, claudeCodeSessions, codexService),
+            model: chat.model || (provider === 'codex' ? DEFAULT_CODEX_PRESET : DEFAULT_MODEL_MODE),
+            repoFullName:
+              chat.repoFullName ??
+              getRepoFromPath(
+                chat.repo_path ?? undefined,
+                getUserWorkspaceDir(req.session.userEmail!)
+              ) ??
+              undefined,
+          };
+        });
         return res.json({ chats: page, hasMore, totalCount });
       }
 
@@ -146,21 +180,8 @@ export function createChatRoutes(
         chats.map(async (chat) => {
           // Check if session is actually running in memory
           // Match the logic from chat:join handler (SocketIOService.ts lines 364-381)
-          const session = claudeCodeSessions.get(chat.id);
-          let actualStatus: string;
-          if (!session || !session.query) {
-            // No session in memory - use completed
-            actualStatus = 'completed';
-          } else if (session.signal?.stopped) {
-            // Session is being stopped
-            actualStatus = 'completed';
-          } else if (session.isProcessing) {
-            // Session exists and is actively processing
-            actualStatus = 'running';
-          } else {
-            // Session exists but is idle (waiting for next message)
-            actualStatus = chat.status === 'idle' ? 'idle' : 'completed';
-          }
+          const provider = chat.provider === 'codex' ? 'codex' : 'claude';
+          const actualStatus = resolveChatListStatus(chat, claudeCodeSessions, codexService);
 
           // Message count and previews are already included from getChatsWithPreviews()
           const totalCount = chat.message_count || 0;
@@ -223,6 +244,7 @@ export function createChatRoutes(
 
           return {
             id: chat.id,
+            provider,
             type: chat.type,
             title: chat.title,
             messages: [], // Messages are loaded separately via polling (uses Task tool logic in getMessagesAfterId)
@@ -248,7 +270,7 @@ export function createChatRoutes(
             playwrightDevice: (chat.playwright_device as 'mobile' | 'desktop') || 'mobile',
             lastReadMessageId: chat.last_read_message_id || undefined,
             totalCount,
-            model: chat.model || DEFAULT_MODEL_MODE,
+            model: chat.model || (provider === 'codex' ? DEFAULT_CODEX_PRESET : DEFAULT_MODEL_MODE),
             permissions: chat.permissions, // Required - validated above
             agentSetupId: (chat as any).agentSetupId || chat.agent_setup_id, // Handle both camelCase (from adapter) and snake_case (legacy)
             linkedIssue, // Include linked issue if present

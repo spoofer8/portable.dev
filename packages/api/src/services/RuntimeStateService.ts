@@ -11,6 +11,24 @@ interface ClaudeSessionProvider {
   getClaudeSessionInfos(userId: string): RuntimeClaudeSessionPayload[];
 }
 
+interface CodexSessionProvider {
+  getSessionInfos(userId: string): Array<{
+    chatId: string;
+    threadId: string;
+    cwd?: string;
+    state: 'idle' | 'running' | 'waiting' | 'error' | 'stopped';
+    activeTurnId?: string;
+    updatedAt: number;
+  }>;
+}
+
+interface ExternalAgentSessionProvider {
+  getExternalAgentSessionInfos?(
+    userId: string,
+    excludedNativeIds?: readonly string[]
+  ): Promise<RuntimeClaudeSessionPayload[]>;
+}
+
 /**
  * RuntimeStateService
  *
@@ -28,7 +46,9 @@ export class RuntimeStateService {
     private runtimeStateFormatter?: RuntimeStateFormatter,
     private claudeService?: ClaudeSessionProvider, // live Claude sessions
     // rev12: TERMINAL `claude` sessions on this PC (hook-fed presence registry)
-    private externalClaudeSessionService?: ExternalClaudeSessionService
+    private externalClaudeSessionService?: ExternalClaudeSessionService,
+    private codexService?: CodexSessionProvider,
+    private externalAgentSessionProvider?: ExternalAgentSessionProvider
   ) {
     console.log('[RuntimeStateService] Initialized');
   }
@@ -88,7 +108,41 @@ export class RuntimeStateService {
         ...s,
         origin: s.origin ?? ('portable' as const),
       }));
-      const claudeSessions = [...apiSessions, ...this.collectExternalSessions(apiSessions)];
+      const terminalSessions = this.collectExternalSessions(apiSessions);
+      const now = Date.now();
+      const codexSessions = (this.codexService?.getSessionInfos(userId) ?? []).map((session) => {
+        const active = session.state === 'running' || session.state === 'waiting';
+        return {
+          chatId: session.chatId,
+          provider: 'codex' as const,
+          repoPath: session.cwd,
+          status:
+            session.state === 'waiting'
+              ? ('waiting' as const)
+              : active
+                ? ('running' as const)
+                : ('idle' as const),
+          isProcessing: active,
+          lastActivityAt: session.updatedAt,
+          idleMs: active ? 0 : Math.max(0, now - session.updatedAt),
+          resumable: true,
+          origin: 'portable' as const,
+        };
+      });
+      const ownedCodexThreadIds = (this.codexService?.getSessionInfos(userId) ?? []).map(
+        (session) => session.threadId
+      );
+      const externalCodexSessions =
+        (await this.externalAgentSessionProvider?.getExternalAgentSessionInfos?.(
+          userId,
+          ownedCodexThreadIds
+        )) ?? [];
+      const claudeSessions = [
+        ...apiSessions,
+        ...terminalSessions,
+        ...codexSessions,
+        ...externalCodexSessions,
+      ];
 
       // Only return state if there's something active
       if (tunnels.length === 0 && backgroundProcesses.length === 0 && claudeSessions.length === 0) {

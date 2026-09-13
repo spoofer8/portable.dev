@@ -67,6 +67,7 @@ function normalizeLegacyChat(id: string, raw: any): ChatRow | null {
   return {
     id: typeof raw.id === 'string' ? raw.id : id,
     user_id: raw.user_id,
+    provider: raw.provider === 'codex' ? 'codex' : 'claude',
     type: raw.type ?? 'claude_code',
     title: raw.title ?? '',
     summary: raw.summary ?? null,

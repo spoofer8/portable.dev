@@ -47,6 +47,12 @@ export interface DiscoveredTranscript {
   filePath: string;
   /** File mtime (ms) — drives the mtime-indexed cache (re-parse only changed files). */
   mtimeMs: number;
+  /** Size is part of the cache identity because mtime can be restored/coarsened. */
+  size: number;
+  /** ctime catches in-place rewrites that preserve both mtime and byte length. */
+  ctimeMs: number;
+  /** Inode distinguishes an atomically replaced transcript on POSIX/macOS. */
+  ino: number;
 }
 
 /**
@@ -82,13 +88,21 @@ export async function listProjectTranscripts(configDir: string): Promise<Discove
       const sessionId = entry.name.slice(0, -'.jsonl'.length);
       if (!sessionId) continue;
       const filePath = path.join(projPath, entry.name);
-      let mtimeMs = 0;
+      let stat: import('fs').Stats;
       try {
-        mtimeMs = (await fs.stat(filePath)).mtimeMs;
+        stat = await fs.stat(filePath);
       } catch {
         continue;
       }
-      out.push({ slug, sessionId, filePath, mtimeMs });
+      out.push({
+        slug,
+        sessionId,
+        filePath,
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+        ctimeMs: stat.ctimeMs,
+        ino: stat.ino,
+      });
     }
   }
   return out;

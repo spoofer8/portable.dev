@@ -97,6 +97,42 @@ describe('config: buildApiChildEnv / resolveApiPort', () => {
     ).toBe('/already/set');
   });
 
+  it('forwards Codex capability config and preserves provider env unchanged', () => {
+    const env = buildApiChildEnv(
+      {
+        CODEX_HOME: '/Users/dev/.codex-provider',
+        CLIPROXY_API_KEY: 'provider-secret',
+      },
+      {
+        codexBin: '/opt/homebrew/bin/codex',
+        codexPresetsJson: '{"supersol":{"model":"gpt-5.6-sol"}}',
+      }
+    );
+
+    expect(env.CODEX_BIN).toBe('/opt/homebrew/bin/codex');
+    expect(env.CODEX_PRESETS_JSON).toBe('{"supersol":{"model":"gpt-5.6-sol"}}');
+    expect(env.CODEX_HOME).toBe('/Users/dev/.codex-provider');
+    expect(env.CLIPROXY_API_KEY).toBe('provider-secret');
+  });
+
+  it('does not erase inherited Codex config when no discovery override is available', () => {
+    const env = buildApiChildEnv(
+      {
+        CODEX_BIN: '/configured/codex',
+        CODEX_PRESETS_JSON: '{"custom":{"model":"configured"}}',
+      },
+      {}
+    );
+
+    expect(env.CODEX_BIN).toBe('/configured/codex');
+    expect(env.CODEX_PRESETS_JSON).toBe('{"custom":{"model":"configured"}}');
+  });
+
+  it('never forwards a shell preset alias as the Codex executable', () => {
+    expect(buildApiChildEnv({ CODEX_BIN: 'supersol' }, {}).CODEX_BIN).toBeUndefined();
+    expect(buildApiChildEnv({ CODEX_BIN: 'superastra' }, {}).CODEX_BIN).toBeUndefined();
+  });
+
   it('resolves the api server entry to packages/api/src/server.ts', () => {
     expect(resolveApiServerEntry().replace(/\\/g, '/')).toMatch(/packages\/api\/src\/server\.ts$/);
   });
@@ -134,12 +170,51 @@ describe('config: resolveOperatorWorkspaceDir', () => {
 
   it('returns undefined when WORKSPACE_DIR is set nowhere (api keeps its own default)', () => {
     const envPath = writeEnv('OTHER=x\n');
-    expect(resolveOperatorWorkspaceDir({}, envPath)).toBeUndefined();
+    expect(resolveOperatorWorkspaceDir({}, envPath, 'linux')).toBeUndefined();
   });
 
   it('returns undefined (never throws) when the root .env does not exist', () => {
     expect(
-      resolveOperatorWorkspaceDir({}, path.join(os.tmpdir(), 'rev9-nonexistent-xyz', '.env'))
+      resolveOperatorWorkspaceDir(
+        {},
+        path.join(os.tmpdir(), 'rev9-nonexistent-xyz', '.env'),
+        'linux'
+      )
+    ).toBeUndefined();
+  });
+
+  it('defaults to ~/projects on macOS when the directory exists', () => {
+    const projects = path.join('/Users/dev', 'projects');
+    expect(
+      resolveOperatorWorkspaceDir(
+        {},
+        path.join(os.tmpdir(), 'rev9-nonexistent-xyz', '.env'),
+        'darwin',
+        () => '/Users/dev',
+        (candidate) => candidate === projects
+      )
+    ).toBe(projects);
+  });
+
+  it('keeps the existing fallback when ~/projects is absent or the host is not macOS', () => {
+    const missingEnv = path.join(os.tmpdir(), 'rev9-nonexistent-xyz', '.env');
+    expect(
+      resolveOperatorWorkspaceDir(
+        {},
+        missingEnv,
+        'darwin',
+        () => '/Users/dev',
+        () => false
+      )
+    ).toBeUndefined();
+    expect(
+      resolveOperatorWorkspaceDir(
+        {},
+        missingEnv,
+        'linux',
+        () => '/home/dev',
+        () => true
+      )
     ).toBeUndefined();
   });
 });

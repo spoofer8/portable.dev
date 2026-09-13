@@ -11,6 +11,8 @@ import type {
   GetConnectionsByServiceOptions,
   StoreConnectionOptions,
   RenameConnectionDbOptions,
+  AgentProvider,
+  RuntimeClaudeSessionPayload,
 } from '@vgit2/shared/types';
 
 /**
@@ -20,6 +22,7 @@ import type {
 export interface SaveChatOptions {
   userId: string;
   chatId: string;
+  provider?: AgentProvider;
   type: ChatType;
   title: string;
   status?: ChatStatus;
@@ -48,9 +51,10 @@ export interface SaveChatOptions {
  * and sending a message FORKS it (read-only on the source) instead of resuming in place.
  */
 export type ChatOrigin =
-  | { origin: 'sqlite' }
+  | { origin: 'sqlite'; provider?: AgentProvider }
   | {
       origin: 'discovered';
+      provider?: AgentProvider;
       /** The source transcript's session id (== the `.jsonl` filename, == the discovered chatId). */
       sourceSessionId: string;
       /** The transcript's REAL cwd — where the forked SDK run must execute. */
@@ -81,6 +85,11 @@ export type ChatOrigin =
  * transparently without changing business logic.
  */
 export interface DbAdapter {
+  /** Live external sessions discovered from provider-owned local state. */
+  getExternalAgentSessionInfos?(
+    userId: string,
+    excludedNativeIds?: readonly string[]
+  ): Promise<RuntimeClaudeSessionPayload[]>;
   /**
    * Initialize the database adapter
    * Returns true if initialization was successful

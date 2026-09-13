@@ -760,10 +760,37 @@ describe('Repository Routes Extended - Additional Coverage', () => {
 
       expect(response.status).toBe(200);
       expect(response.body).toEqual({
+        provider: 'claude',
         model: 'haiku',
         permissions: 'plan',
         agentSetupId: 'best-practice',
       });
+    });
+
+    it('accepts Codex presets and returns the immutable provider', async () => {
+      const chatId = 'settings-codex-roundtrip';
+      await dbAdapter.saveChat({
+        userId: testUserId,
+        chatId,
+        provider: 'codex',
+        type: 'claude_code',
+        title: 'Codex settings',
+        model: 'supersol',
+        permissions: 'default',
+        authToken,
+      });
+
+      const patch = await request(app)
+        .patch(`/api/chat/${chatId}/settings`)
+        .set('Authorization', `Bearer ${authToken}`)
+        .send({ model: 'superastra' });
+      expect(patch.status).toBe(200);
+
+      const response = await request(app)
+        .get(`/api/chat/${chatId}/settings`)
+        .set('Authorization', `Bearer ${authToken}`);
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({ provider: 'codex', model: 'superastra' });
     });
   });
 

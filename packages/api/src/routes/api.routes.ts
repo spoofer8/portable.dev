@@ -29,6 +29,7 @@ import { createUserRoutes } from './subroutes/user.routes.js';
 import type { LocalAiHelper } from '../services/ai/LocalAiHelper.js';
 import type { ClaudeOAuthService } from '../services/ClaudeOAuthService.js';
 import type { ClaudeService } from '../services/ClaudeService.js';
+import type { CodexService } from '../services/CodexService/index.js';
 import type { SocketIOService } from '../services/SocketIOService.js';
 import type { SOPService } from '../services/SOPService.js';
 import type { StorageService } from '../services/StorageService.js';
@@ -63,7 +64,8 @@ export function createApiRoutes(
   sopService?: any, // Optional: SOPService for SOP progress in chat summarization
   storageService?: StorageService, // Optional: Storage management service
   localAiHelper?: LocalAiHelper, // Optional: local-first one-shot AI helper (intent/suggestions/voice)
-  claudeOAuthService?: ClaudeOAuthService // Optional: Claude-account OAuth (login-from-phone, portable.dev#18)
+  claudeOAuthService?: ClaudeOAuthService, // Optional: Claude-account OAuth (login-from-phone, portable.dev#18)
+  codexService?: CodexService
 ): Router {
   const router = Router();
 
@@ -113,7 +115,8 @@ export function createApiRoutes(
       claudeCodeSessions,
       sopService,
       claudeService,
-      localAiHelper
+      localAiHelper,
+      codexService
     )
   );
 

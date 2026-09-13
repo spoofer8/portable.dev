@@ -49,6 +49,9 @@ export interface DiscoveredChat {
 
 interface CacheEntry {
   mtimeMs: number;
+  size: number;
+  ctimeMs: number;
+  ino: number;
   cwd: string | null;
   title: string | null;
   lastUpdated: number;
@@ -84,7 +87,7 @@ export class ClaudeProjectsChatIndex {
     );
     const out: DiscoveredChat[] = [];
     for (const t of transcripts) {
-      const entry = await this.summarize(t.filePath, t.mtimeMs);
+      const entry = await this.summarize(t.filePath, t);
       if (!entry || !entry.cwd) continue;
       if (entry.messageCount === 0) continue; // empty / meta-only / clear-only — never a phantom chat
       const match = await matchRepoReal(entry.cwd, repoRoots);
@@ -104,9 +107,20 @@ export class ClaudeProjectsChatIndex {
     return out;
   }
 
-  private async summarize(filePath: string, mtimeMs: number): Promise<CacheEntry | null> {
+  private async summarize(
+    filePath: string,
+    identity: { mtimeMs: number; size: number; ctimeMs: number; ino: number }
+  ): Promise<CacheEntry | null> {
     const cached = this.cache.get(filePath);
-    if (cached && cached.mtimeMs === mtimeMs) return cached;
+    if (
+      cached &&
+      cached.mtimeMs === identity.mtimeMs &&
+      cached.size === identity.size &&
+      cached.ctimeMs === identity.ctimeMs &&
+      cached.ino === identity.ino
+    ) {
+      return cached;
+    }
     let raw: string;
     try {
       raw = await fs.readFile(filePath, 'utf8');
@@ -118,10 +132,10 @@ export class ClaudeProjectsChatIndex {
     // Skip injected task-notification rows as preview candidates (public issue #11).
     const { firstUserMessage: firstUser, lastMessage: last } = pickPreviewRows(rows);
     const entry: CacheEntry = {
-      mtimeMs,
+      ...identity,
       cwd: transcriptCwd(lines),
       title: transcriptTitle(lines),
-      lastUpdated: transcriptLastTimestamp(lines) || mtimeMs,
+      lastUpdated: transcriptLastTimestamp(lines) || identity.mtimeMs,
       messageCount: rows.length,
       firstMessageData: firstUser?.data,
       lastMessageData: last?.data,

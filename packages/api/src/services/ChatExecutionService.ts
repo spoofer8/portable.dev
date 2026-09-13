@@ -20,7 +20,7 @@ import path from 'path';
 
 import { isWorkspaceChatTarget } from '@vgit2/shared/browserConstants';
 import { getUserWorkspaceDir, getWorkspaceTmpDir } from '@vgit2/shared/constants';
-import { DEFAULT_MODEL_MODE } from '@vgit2/shared/models';
+import { DEFAULT_CODEX_PRESET, DEFAULT_MODEL_MODE } from '@vgit2/shared/models';
 
 import { buildAiCredentialErrorBlock } from './aiCredentialErrorClassifier.js';
 import { isPidAlive } from './ExternalClaudeSessionService.js';
@@ -49,13 +49,46 @@ import { buildSystemPromptFromSetup } from '../prompts/systemPrompts.js';
 
 import type { ChatService } from './ChatService.js';
 import type { ClaudeService } from './ClaudeService.js';
+import type {
+  CodexApprovalRequest,
+  CodexService,
+  CodexStatusEvent,
+  CodexStreamEvent,
+  ThreadStartOptions,
+  TurnStartOptions,
+} from './CodexService/index.js';
 import type { IOutputEmitter } from './emitters/IOutputEmitter.js';
 import type { GitLocalService } from './GitLocalService.js';
 import type { TunnelService } from './TunnelService.js';
 import type { DbAdapter } from '../db/DbAdapter.js';
 import type { ExecutionContext } from './types/ExecutionContext.js';
 import type { AIStyleMode } from '@vgit2/shared/aiStyles';
-import type { PageContext, ChatStatus } from '@vgit2/shared/types';
+import type { AgentProvider, PageContext, ChatStatus } from '@vgit2/shared/types';
+
+interface CodexPresetConfig {
+  model?: string;
+  modelProvider?: string;
+  sandbox?: ThreadStartOptions['sandbox'];
+  effort?: string;
+  config?: Record<string, unknown>;
+}
+
+type CodexCwdValidator = (cwd: string, userId: string) => Promise<string>;
+
+async function validateCodexCwd(cwd: string, userId: string): Promise<string> {
+  const [root, canonicalCwd] = await Promise.all([
+    fs.realpath(getUserWorkspaceDir(userId)),
+    fs.realpath(cwd),
+  ]);
+  const relative = path.relative(root, canonicalCwd);
+  const contained =
+    relative === '' ||
+    (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+  if (!contained) throw new Error('Codex working directory is outside the configured workspace');
+  const stat = await fs.stat(canonicalCwd);
+  if (!stat.isDirectory()) throw new Error('Codex working directory is not a directory');
+  return canonicalCwd;
+}
 
 /**
  * Options for executing a message
@@ -87,6 +120,8 @@ export class ChatExecutionService {
   // Per-chat execution lock to prevent concurrent executeMessage() calls for the same chat
   private executingChats: Set<string> = new Set();
 
+  private codexExecutionContexts = new Map<string, ExecutionContext>();
+
   constructor(
     private chatService: ChatService,
     private claudeService: ClaudeService,
@@ -107,7 +142,9 @@ export class ChatExecutionService {
     private stopOnPcService?: import('./StopOnPcService.js').StopOnPcService,
     // portable.dev#17: validates a chat:create `worktree` path against the
     // repo's real worktree set (start a chat INSIDE a worktree).
-    private sourceControlService?: import('./SourceControlService.js').SourceControlService
+    private sourceControlService?: import('./SourceControlService.js').SourceControlService,
+    private codexService?: CodexService,
+    private readonly codexCwdValidator: CodexCwdValidator = validateCodexCwd
   ) {
     console.log('[ChatExecutionService] Initialized');
   }
@@ -146,7 +183,8 @@ export class ChatExecutionService {
     const title = chat?.title;
 
     // Determine actual status from session state
-    const actualStatus = this.getActualChatStatus(chatId, chat?.status);
+    const provider = chat?.provider === 'codex' ? 'codex' : 'claude';
+    const actualStatus = this.getActualChatStatus(chatId, chat?.status, provider);
 
     return {
       success: true,
@@ -155,6 +193,7 @@ export class ChatExecutionService {
       title,
       hasMore,
       totalCount,
+      provider,
       lastReadMessageId: chat?.last_read_message_id ?? undefined,
       permissions: chat?.permissions ?? null,
     };
@@ -163,7 +202,18 @@ export class ChatExecutionService {
   /**
    * Determine actual chat status from session state
    */
-  private getActualChatStatus(chatId: string, dbStatus?: ChatStatus | null): string {
+  private getActualChatStatus(
+    chatId: string,
+    dbStatus?: ChatStatus | null,
+    provider: AgentProvider = 'claude'
+  ): string {
+    if (provider === 'codex') {
+      const state = this.codexService?.getSession(chatId)?.state;
+      if (state === 'running' || state === 'waiting') return 'running';
+      if (state === 'idle') return 'idle';
+      if (state === 'error') return 'error';
+      return dbStatus === 'running' ? 'completed' : dbStatus || 'completed';
+    }
     if (!this.claudeCodeSessions) {
       return dbStatus || 'completed';
     }
@@ -365,6 +415,7 @@ export class ChatExecutionService {
     effectivePermissions?: string;
     effectiveAgentSetupId?: string;
     effectiveEffort?: string;
+    provider?: AgentProvider;
   }> {
     const { content, pageContext, model, permissions, agentSetupId, effort, files } = data;
     const { userId, authToken } = context;
@@ -393,9 +444,11 @@ export class ChatExecutionService {
 
       // Fetch chat to get defaults
       const chat = await this.chatService.getChat(chatId, userId, authToken);
+      const provider: AgentProvider = chat?.provider === 'codex' ? 'codex' : 'claude';
 
       // Resolve effective parameters (use provided values, fall back to chat defaults)
-      const effectiveModel = model || chat?.model || DEFAULT_MODEL_MODE;
+      const effectiveModel =
+        model || chat?.model || (provider === 'codex' ? DEFAULT_CODEX_PRESET : DEFAULT_MODEL_MODE);
       const effectivePermissions = permissions || chat?.permissions || 'ask_each_time';
       const effectiveAgentSetupId = agentSetupId || chat?.agent_setup_id || 'freestyle';
       // No forced default — an unset effort lets the SDK apply its own default.
@@ -429,6 +482,7 @@ export class ChatExecutionService {
         effectivePermissions,
         effectiveAgentSetupId,
         effectiveEffort,
+        provider,
       };
     } catch (error: any) {
       console.error(`[ChatExecutionService] Error preparing message for ${data.chatId}:`, error);
@@ -471,6 +525,40 @@ export class ChatExecutionService {
     const origin = await this.chatService.getChatOrigin(chatId, userId, authToken);
     if (origin.origin !== 'discovered') {
       return chatId; // normal Portable chat (or unknown) — resume/create as before
+    }
+
+    // A discovered Codex rollout is never adopted in place. Codex sessions may
+    // still be attached to another CLI or editor, and Portable has no lifecycle
+    // hook that can prove a single writer. Forking before the first write keeps
+    // the source rollout immutable and gives Portable its own thread.
+    if (origin.provider === 'codex') {
+      const newChatId = `chat-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+      await this.chatService.saveChat({
+        userId,
+        chatId: newChatId,
+        provider: 'codex',
+        type: 'claude_code',
+        title: origin.title,
+        status: 'completed',
+        repoPath: origin.cwd,
+        repoFullName: origin.repoFullName,
+        forkSourceSessionId: origin.sourceSessionId,
+        model: opts.model || DEFAULT_CODEX_PRESET,
+        permissions: opts.permissions || 'default',
+        agentSetupId: opts.agentSetupId || 'freestyle',
+        parentChatId: undefined,
+        authToken,
+      });
+
+      if (emitter.emitToUser && emitter.joinUserToRoom) {
+        const newChat = await this.chatService.getChat(newChatId, userId, authToken);
+        emitter.emitToUser(userId, 'chat:created', { chat: newChat });
+        emitter.joinUserToRoom(userId, newChatId);
+        emitter.emitToUser(userId, 'chat:forked', { oldChatId: chatId, newChatId });
+      }
+
+      if (this.reposCacheService && userId) this.reposCacheService.invalidateUser(userId);
+      return newChatId;
     }
 
     // ===== ADOPT-ON-FIRST-WRITE (rev12 D56) =====
@@ -642,6 +730,7 @@ export class ChatExecutionService {
     data: {
       chatId: string;
       type: 'claude_code';
+      provider?: AgentProvider;
       title: string;
       owner: string;
       repo: string;
@@ -673,9 +762,23 @@ export class ChatExecutionService {
       lastUpdated: number;
       hidden: boolean;
       archived: boolean;
+      provider: AgentProvider;
     };
   }> {
-    const { chatId, type, title, owner, repo, model, permissions, agentSetupId, worktree } = data;
+    const {
+      chatId,
+      type,
+      title,
+      owner,
+      repo,
+      model: requestedModel,
+      permissions,
+      agentSetupId,
+      worktree,
+      provider = 'claude',
+    } = data;
+    const model =
+      requestedModel || (provider === 'codex' ? DEFAULT_CODEX_PRESET : DEFAULT_MODEL_MODE);
     const { userId, authToken } = context;
 
     try {
@@ -691,6 +794,7 @@ export class ChatExecutionService {
         await this.chatService.saveChat({
           userId,
           chatId,
+          provider,
           type,
           title,
           status: 'completed',
@@ -725,6 +829,7 @@ export class ChatExecutionService {
             lastUpdated: Date.now(),
             hidden: false,
             archived: false,
+            provider,
           },
         };
       }
@@ -836,6 +941,7 @@ export class ChatExecutionService {
       await this.chatService.saveChat({
         userId,
         chatId,
+        provider,
         type,
         title,
         status: 'completed', // Initial status (not yet running)
@@ -878,6 +984,7 @@ export class ChatExecutionService {
           lastUpdated: Date.now(),
           hidden: false,
           archived: false,
+          provider,
         },
       };
     } catch (error: any) {
@@ -904,6 +1011,19 @@ export class ChatExecutionService {
 
       // Broadcast to all sockets in the room
       emitter.emit('chat:settings_updated', { chatId, settings });
+
+      const chat = await this.chatService.getChat(chatId, userId, authToken);
+      if (chat?.provider === 'codex' && settings.permissions) {
+        const stopped = await this.codexService?.stopSession(chatId);
+        if (stopped) {
+          emitter.emit('claude:interrupted', {
+            chatId,
+            provider: 'codex',
+            reason: 'permissions_changed',
+          });
+        }
+        return { success: true };
+      }
 
       // If permissions changed and there's an active session, interrupt it. Effort
       // is NOT interrupted the same way — it only affects reasoning depth (not tool
@@ -966,13 +1086,22 @@ export class ChatExecutionService {
     const { userId, emitter } = context;
 
     try {
-      console.log(`[ChatExecutionService] Claude interrupt requested for ${chatId} by ${userId}`);
+      const provider = await this.getProvider(chatId, userId, context.authToken);
+      console.log(
+        `[ChatExecutionService] ${provider} interrupt requested for ${chatId} by ${userId}`
+      );
 
-      const stopped = await this.claudeService.stopSession(chatId, userId);
+      const stopped =
+        provider === 'codex'
+          ? ((await this.codexService?.stopSession(chatId)) ?? false)
+          : await this.claudeService.stopSession(chatId, userId);
 
       if (stopped) {
         console.log(`[ChatExecutionService] Successfully stopped session ${chatId}`);
-        emitter.emit('claude:interrupted', { chatId });
+        emitter.emit(
+          'claude:interrupted',
+          provider === 'codex' ? { chatId, provider } : { chatId }
+        );
         return { success: true };
       } else {
         console.log(`[ChatExecutionService] Session ${chatId} not found or already stopped`);
@@ -1001,7 +1130,11 @@ export class ChatExecutionService {
     const { userId, emitter } = context;
 
     try {
-      const session = this.claudeService.getSession(chatId);
+      const provider = await this.getProvider(chatId, userId, context.authToken);
+      const session =
+        provider === 'codex'
+          ? this.codexService?.getSession(chatId)
+          : this.claudeService.getSession(chatId);
 
       if (!session) {
         return { success: false, error: 'Session not found' };
@@ -1017,7 +1150,10 @@ export class ChatExecutionService {
 
       console.log(`[ChatExecutionService] Kill-session requested for ${chatId} by ${userId}`);
 
-      const stopped = await this.claudeService.stopSession(chatId, userId);
+      const stopped =
+        provider === 'codex'
+          ? ((await this.codexService?.stopSession(chatId)) ?? false)
+          : await this.claudeService.stopSession(chatId, userId);
 
       // Refresh the runtime panel on every device (the session is now gone).
       if (emitter.broadcastRuntimeStateToUser) {
@@ -1026,7 +1162,10 @@ export class ChatExecutionService {
 
       if (stopped) {
         // Stop the chat UI's typing indicator if the chat is open.
-        emitter.emit('claude:interrupted', { chatId });
+        emitter.emit(
+          'claude:interrupted',
+          provider === 'codex' ? { chatId, provider } : { chatId }
+        );
         return { success: true };
       }
       return { success: false, error: 'Session not running' };
@@ -1043,7 +1182,7 @@ export class ChatExecutionService {
     context: ExecutionContext,
     data: { requestId: string; chatId: string; approved: boolean }
   ): Promise<{ success: boolean; message?: string; code?: string; error?: string }> {
-    const { requestId, approved } = data;
+    const { requestId, approved, chatId } = data;
     const { userId } = context;
 
     try {
@@ -1053,6 +1192,18 @@ export class ChatExecutionService {
         }`
       );
 
+      const provider = await this.getProvider(chatId, userId, context.authToken);
+      if (provider === 'codex') {
+        const resolved = this.codexService?.resolvePermissionRequest(
+          requestId,
+          approved ? 'accept' : 'decline',
+          chatId,
+          userId
+        );
+        return resolved
+          ? { success: true, message: 'Request resolved', code: 'request_resolved' }
+          : { success: false, message: 'Request not found', code: 'request_lost' };
+      }
       const result = this.claudeService.resolvePermissionRequest(requestId, approved);
       return result;
     } catch (error: any) {
@@ -1075,11 +1226,20 @@ export class ChatExecutionService {
       answers: Record<string, string[]>;
     }
   ): Promise<{ success: boolean; error?: string }> {
-    const { request_id, answers } = data;
+    const { request_id, answers, chat_id } = data;
     const { userId } = context;
 
     try {
       console.log(`[ChatExecutionService] User ${userId} answering question ${request_id}`);
+
+      const provider = await this.getProvider(chat_id, userId, context.authToken);
+      if (provider === 'codex') {
+        const success =
+          this.codexService?.resolveUserInputRequest(request_id, answers, chat_id, userId) ?? false;
+        return success
+          ? { success: true }
+          : { success: false, error: 'Request not found or already answered' };
+      }
 
       // Submit answers to MCP server
       const { submitAnswersToMcp } = await import('../mcp/AskUserMcpServer.js');
@@ -1145,6 +1305,12 @@ export class ChatExecutionService {
 
       // Track message hash (prevents duplicate submission within short time window)
       this.messageDeduplicationService.addHash(userId, chatId, message.content);
+
+      const provider = await this.getProvider(chatId, userId, authToken);
+      if (provider === 'codex') {
+        await this.executeCodexMessage(context, message, options);
+        return;
+      }
 
       // ===== EXECUTION =====
       // Try to restore session from database if not in memory
@@ -1287,8 +1453,12 @@ export class ChatExecutionService {
 
       const errorText = error.message || 'Failed to process message';
       const errorBlock = buildAiCredentialErrorBlock(errorText);
+      const errorProvider = await this.getProvider(chatId, userId, authToken).catch(
+        () => 'claude' as const
+      );
       emitter.emit('claude:error', {
         chatId,
+        ...(errorProvider === 'codex' ? { provider: 'codex' as const } : {}),
         error: errorText,
         ...(errorBlock ? { errorBlock } : {}),
       });
@@ -1296,6 +1466,258 @@ export class ChatExecutionService {
       // Re-throw error so callers can handle it (important for testing)
       throw error;
     }
+  }
+
+  private async getProvider(
+    chatId: string,
+    userId: string,
+    authToken?: string
+  ): Promise<AgentProvider> {
+    // Older embedders and focused unit doubles predate provider-aware chats.
+    // Preserve their Claude-default behavior while the real ChatService always
+    // supplies getChat.
+    if (typeof (this.chatService as any).getChat !== 'function') return 'claude';
+    const chat = await this.chatService.getChat(chatId, userId, authToken);
+    return chat?.provider === 'codex' ? 'codex' : 'claude';
+  }
+
+  private resolveCodexPreset(presetId?: string): CodexPresetConfig {
+    const selected = presetId || DEFAULT_CODEX_PRESET;
+    const raw = process.env.CODEX_PRESETS_JSON;
+    if (!raw) return {};
+    try {
+      const registry = JSON.parse(raw) as Record<string, unknown>;
+      const preset = registry[selected];
+      return preset && typeof preset === 'object' ? (preset as CodexPresetConfig) : {};
+    } catch (error) {
+      console.error('[ChatExecutionService] Invalid CODEX_PRESETS_JSON:', error);
+      return {};
+    }
+  }
+
+  private codexApprovalPolicy(permissions?: string): ThreadStartOptions['approvalPolicy'] {
+    return permissions === 'bypass_permissions' || permissions === 'allow_all'
+      ? 'never'
+      : 'on-request';
+  }
+
+  private codexSandbox(
+    permissions: string | undefined,
+    preset: CodexPresetConfig
+  ): ThreadStartOptions['sandbox'] {
+    if (permissions === 'bypass_permissions' || permissions === 'allow_all') {
+      return 'danger-full-access';
+    }
+    if (permissions === 'plan') return 'read-only';
+    return preset.sandbox === 'read-only' ? 'read-only' : 'workspace-write';
+  }
+
+  private async executeCodexMessage(
+    context: ExecutionContext,
+    message: { content: string; uploadedFiles?: any[]; context?: PageContext },
+    options: ExecuteMessageOptions
+  ): Promise<void> {
+    const { chatId, userId, authToken } = context;
+    if (!this.codexService) throw new Error('Codex is not available on this host');
+    if (message.uploadedFiles?.length) {
+      throw new Error('Codex file attachments are not supported yet');
+    }
+    if (this.executingChats.has(chatId)) {
+      throw new Error('This Codex chat is already starting a turn');
+    }
+
+    this.executingChats.add(chatId);
+    this.codexExecutionContexts.set(chatId, context);
+    try {
+      const chat = await this.chatService.getChat(chatId, userId, authToken);
+      if (!chat) throw new Error(`Chat ${chatId} not found in database`);
+
+      const presetId = options.model || chat.model || DEFAULT_CODEX_PRESET;
+      const preset = this.resolveCodexPreset(presetId);
+      const cwd = await this.codexCwdValidator(
+        chat.repo_path || getWorkspaceTmpDir(userId),
+        userId
+      );
+      const effectivePermissions = options.permissions || chat.permissions || 'ask_each_time';
+      const threadOptions: ThreadStartOptions = {
+        cwd,
+        model: preset.model,
+        modelProvider: preset.modelProvider,
+        sandbox: this.codexSandbox(effectivePermissions, preset),
+        effort: preset.effort,
+        config: preset.config,
+        approvalPolicy: this.codexApprovalPolicy(effectivePermissions),
+      };
+
+      let session = this.codexService.getSession(chatId);
+      if (!session) {
+        if (chat.session_id) {
+          session = await this.codexService.resumeCodexSession(
+            chatId,
+            chat.session_id,
+            threadOptions,
+            userId
+          );
+        } else if (chat.fork_source_session_id) {
+          session = await this.codexService.forkCodexSession(
+            chatId,
+            chat.fork_source_session_id,
+            threadOptions,
+            userId
+          );
+        } else {
+          session = await this.codexService.startCodexSession(chatId, threadOptions, userId);
+        }
+        await this.dbAdapter?.updateChatSession(chatId, userId, session.threadId, '', authToken);
+      }
+
+      const turnOptions: TurnStartOptions = {
+        cwd,
+        model: preset.model,
+        effort: options.effort || preset.effort,
+        approvalPolicy: this.codexApprovalPolicy(effectivePermissions),
+      };
+      await this.codexService.addMessageToSession(chatId, message.content, turnOptions);
+    } finally {
+      this.executingChats.delete(chatId);
+    }
+  }
+
+  async handleCodexStream(event: CodexStreamEvent): Promise<void> {
+    const context = this.codexExecutionContexts.get(event.chatId);
+    if (!context) return;
+    if (!this.assistantMessageAccumulator.has(event.chatId)) {
+      this.assistantMessageAccumulator.set(event.chatId, { blocks: [], userId: context.userId });
+    }
+    const blocks = this.assistantMessageAccumulator.get(event.chatId)!.blocks;
+    const existingIndex = blocks.findIndex(
+      (block) => block.blockId === event.block.blockId && block.type === event.block.type
+    );
+    if (event.operation === 'replace' && existingIndex >= 0) {
+      blocks[existingIndex] = event.block;
+    } else {
+      blocks.push(event.block);
+    }
+    await context.emitter.emit('claude:stream', {
+      chatId: event.chatId,
+      provider: 'codex',
+      operation: event.operation,
+      block: event.block,
+    });
+  }
+
+  async handleCodexStatus(event: CodexStatusEvent): Promise<void> {
+    const context = this.codexExecutionContexts.get(event.chatId);
+    if (!context) return;
+    const status =
+      event.state === 'stopped' ? 'completed' : event.state === 'error' ? 'error' : event.state;
+    await context.emitter.emit('claude:status', {
+      chatId: event.chatId,
+      provider: 'codex',
+      status,
+    });
+    await this.chatService.bufferMessage(
+      context.userId,
+      event.chatId,
+      'chat_status_update',
+      { status },
+      context.authToken
+    );
+    context.emitter.broadcastRuntimeStateToUser?.(context.userId);
+
+    if (event.state === 'idle' || event.state === 'stopped' || event.state === 'error') {
+      const preview = this.extractNotificationPreview(event.chatId);
+      await this.saveAccumulatedMessage(event.chatId, context.userId, context.authToken);
+      if (event.state === 'error') {
+        await context.emitter.emit('claude:error', {
+          chatId: event.chatId,
+          provider: 'codex',
+          error: event.error || 'Codex session error',
+        });
+      } else {
+        await this.sendPushNotificationIfOffline(
+          context.userId,
+          event.chatId,
+          context.authToken,
+          context.emitter,
+          preview
+        );
+      }
+    }
+  }
+
+  async handleCodexApproval(request: CodexApprovalRequest): Promise<void> {
+    if (!request.chatId) return;
+    const context = this.codexExecutionContexts.get(request.chatId);
+    if (!context) return;
+    const requestId = request.approvalToken;
+    if (request.kind === 'userInput') {
+      const rawQuestions = Array.isArray(request.params.questions) ? request.params.questions : [];
+      const questions = rawQuestions.map((raw, index) => {
+        const question = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+        const rawOptions = Array.isArray(question.options) ? question.options : [];
+        return {
+          question:
+            typeof question.question === 'string' ? question.question : `Question ${index + 1}`,
+          header: typeof question.header === 'string' ? question.header : `Q${index + 1}`,
+          multiSelect: false,
+          options: rawOptions.map((rawOption) => {
+            const option =
+              rawOption && typeof rawOption === 'object'
+                ? (rawOption as Record<string, unknown>)
+                : {};
+            const label =
+              typeof option.label === 'string'
+                ? option.label
+                : typeof rawOption === 'string'
+                  ? rawOption
+                  : 'Option';
+            return {
+              label,
+              description: typeof option.description === 'string' ? option.description : label,
+            };
+          }),
+        };
+      });
+      await context.emitter.emit('ask_user_question', {
+        chat_id: request.chatId,
+        request_id: requestId,
+        tool_use_id: request.itemId,
+        questions,
+        provider: 'codex',
+      });
+      context.emitter.broadcastRuntimeStateToUser?.(context.userId);
+      return;
+    }
+    const toolName =
+      request.kind === 'command'
+        ? 'Bash'
+        : request.kind === 'fileChange'
+          ? 'ApplyPatch'
+          : String(request.params.tool ?? request.method);
+    const accumulated = this.assistantMessageAccumulator.get(request.chatId);
+    const block = accumulated?.blocks
+      .slice()
+      .reverse()
+      .find(
+        (candidate) =>
+          candidate.type === 'tool_use' &&
+          (!request.itemId ||
+            candidate.id === request.itemId ||
+            candidate.blockId === request.itemId)
+      );
+    if (block) {
+      block.needsPermission = true;
+      block.permissionRequestId = requestId;
+    }
+    await context.emitter.emit('tool_permission_required', {
+      chat_id: request.chatId,
+      request_id: requestId,
+      tool_name: toolName,
+      tool_input: request.params,
+      provider: 'codex',
+    });
+    context.emitter.broadcastRuntimeStateToUser?.(context.userId);
   }
 
   /**

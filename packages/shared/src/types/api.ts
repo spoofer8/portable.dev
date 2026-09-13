@@ -130,6 +130,7 @@ export interface UpdateChatSettingsRequest {
 export interface UpdateChatSettingsResponse {
   success: boolean;
   updated?: {
+    provider?: import('./chat.js').AgentProvider;
     model?: string;
     permissions?: string;
     effort?: string;
@@ -143,6 +144,7 @@ export interface UpdateChatSettingsResponse {
  * own defaults for any omitted field.
  */
 export interface GetChatSettingsResponse {
+  provider?: import('./chat.js').AgentProvider;
   model?: string;
   permissions?: string;
   agentSetupId?: string;

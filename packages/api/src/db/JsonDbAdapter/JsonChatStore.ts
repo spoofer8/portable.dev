@@ -22,10 +22,14 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
 
+import type { AgentProvider } from '@vgit2/shared/types';
+
 /** A chat row in snake_case, matching the `chats` table shape. */
 export interface ChatRow {
   id: string;
   user_id: string;
+  /** Absent legacy JSON rows are interpreted as Claude by the adapters. */
+  provider?: AgentProvider;
   type: string;
   title: string;
   summary: string | null;

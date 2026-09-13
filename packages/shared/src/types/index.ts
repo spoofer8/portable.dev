@@ -31,6 +31,7 @@ export type {
 // ============================================================================
 export type {
   ChatStatus,
+  AgentProvider,
   ChatType,
   ChatCategory,
   MessageRole,
@@ -58,6 +59,7 @@ export type {
 
 // Export type guards as functions
 export {
+  resolveAgentProvider,
   isQuickActionDisplay,
   isCustomMessageDisplay,
   isPlainMessageDisplay,

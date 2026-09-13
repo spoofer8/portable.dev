@@ -7,12 +7,15 @@
  * Chat status enum
  */
 export type ChatStatus =
-  | 'running'
-  | 'completed'
-  | 'error'
-  | 'idle'
-  | 'interrupting'
-  | 'compressing';
+  'running' | 'completed' | 'error' | 'idle' | 'interrupting' | 'compressing';
+
+/** Agent runtime backing a chat. Omitted on legacy records and treated as Claude. */
+export type AgentProvider = 'claude' | 'codex';
+
+/** Preserve compatibility with records created before provider metadata existed. */
+export function resolveAgentProvider(provider?: AgentProvider | null): AgentProvider {
+  return provider ?? 'claude';
+}
 
 /**
  * Chat type enum
@@ -251,6 +254,7 @@ export interface ChatMessage {
  */
 export interface Chat {
   id: string;
+  provider?: AgentProvider;
   type: ChatType;
   title: string;
   summary?: string; // AI-generated summary of the chat's purpose (5-10 words)
@@ -296,6 +300,7 @@ export interface Chat {
  */
 export interface StoredChat {
   id: string;
+  provider?: AgentProvider | null;
   user_id: string;
   type: ChatType;
   title: string;
@@ -337,6 +342,7 @@ export interface StoredChat {
  */
 export interface ChatListItem {
   id: string;
+  provider?: AgentProvider;
   type: ChatType;
   title: string;
   summary?: string; // AI-generated summary of the chat's purpose (5-10 words)

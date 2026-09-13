@@ -47,12 +47,16 @@ function makeService(
       return true;
     },
     // After a claim, getChat(newId) returns a minimal row (no autopilot).
-    getChat: async (chatId: string) => ({
-      id: chatId,
-      model: 'opus',
-      permissions: 'default',
-      agent_setup_id: 'freestyle',
-    }),
+    getChat: async (chatId: string) => {
+      const saved = saveChatCalls.find((chat) => chat.chatId === chatId);
+      return {
+        id: chatId,
+        provider: saved?.provider,
+        model: saved?.model ?? 'opus',
+        permissions: 'default',
+        agent_setup_id: 'freestyle',
+      };
+    },
     bufferMessage: async (...args: any[]) => {
       bufferCalls.push(args);
     },
@@ -137,6 +141,38 @@ describe('fork-on-first-write — handleChatMessage', () => {
     // The user message is buffered under the NEW id (not the original CC id).
     expect(bufferCalls.length).toBeGreaterThan(0);
     expect(bufferCalls[0][1]).toBe(result.chatId); // (userId, chatId, type, …)
+  });
+
+  it('always forks a discovered Codex rollout and keeps the provider and preset', async () => {
+    const { svc, context, saveChatCalls, emitted } = makeService({
+      origin: 'discovered',
+      provider: 'codex',
+      sourceSessionId: 'thread-source',
+      cwd: '/ws/codex-app',
+      repoPath: '/ws/codex-app',
+      repoFullName: 'me/codex-app',
+      title: 'Existing Codex thread',
+      lastUpdated: COLD,
+    });
+
+    const result = await svc.handleChatMessage(context, {
+      chatId: 'codex:thread-source',
+      content: 'continue safely',
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.chatId).not.toBe('codex:thread-source');
+    expect(result.provider).toBe('codex');
+    expect(result.effectiveModel).toBe('supersol');
+    expect(saveChatCalls[0]).toMatchObject({
+      provider: 'codex',
+      forkSourceSessionId: 'thread-source',
+      model: 'supersol',
+    });
+    expect(emitted.find((event) => event.event === 'chat:forked')?.payload).toEqual({
+      oldChatId: 'codex:thread-source',
+      newChatId: result.chatId,
+    });
   });
 
   it('ADOPTS in place (rev12 D56): an ENDED registry row + cold transcript ⇒ same id, sessionId set, no fork emits', async () => {

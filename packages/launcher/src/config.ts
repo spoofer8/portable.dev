@@ -9,6 +9,7 @@
  * single public ingress to this PC.
  */
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -198,9 +199,10 @@ export interface ApiChildEnvOverrides {
    * The operator's `WORKSPACE_DIR`, resolved by the launcher from
    * its shell env or the monorepo-root `.env` ({@link resolveOperatorWorkspaceDir}).
    * Forwarded to the api child as `WORKSPACE_DIR` so portable operates on the repos
-   * the user already has cloned. Undefined when unset everywhere → the api keeps its
-   * own default (`~/claude-workspace`). The raw value is forwarded verbatim; tilde
-   * expansion happens on the child side in `@vgit2/shared/constants` (`expandTilde`).
+   * the user already has cloned. On macOS, an existing `~/projects` is used when no
+   * value is configured. Otherwise undefined keeps the api's own default
+   * (`~/claude-workspace`). Configured values are forwarded verbatim; tilde expansion
+   * happens on the child side in `@vgit2/shared/constants` (`expandTilde`).
    */
   workspaceDir?: string;
   /**
@@ -211,6 +213,10 @@ export interface ApiChildEnvOverrides {
    * everything (fail closed).
    */
   hookSecret?: string;
+  /** Resolved native Codex executable. Undefined keeps any inherited value. */
+  codexBin?: string;
+  /** JSON preset mapping used by the api's Codex app-server adapter. */
+  codexPresetsJson?: string;
 }
 
 /**
@@ -235,23 +241,36 @@ export function defaultRootEnvPath(): string {
  *     `@vgit2/shared/constants` SKIPS parsing the root `.env`.
  * So this targeted read is the ONLY path by which an operator's `.env` `WORKSPACE_DIR`
  * reaches the api child (forwarded via {@link ApiChildEnvOverrides.workspaceDir}).
- * Returns `undefined` when unset everywhere (the api keeps its own default). The raw
- * value is returned verbatim — tilde expansion is done on the child side.
+ * On macOS an existing `~/projects` is the final fallback. Returns `undefined` when
+ * unset everywhere and that directory is absent (the api keeps its own default).
+ * Configured values are returned verbatim; tilde expansion is done on the child side.
  */
 export function resolveOperatorWorkspaceDir(
   env: NodeJS.ProcessEnv = process.env,
-  rootEnvPath: string = defaultRootEnvPath()
+  rootEnvPath: string = defaultRootEnvPath(),
+  platform: NodeJS.Platform = process.platform,
+  homedir: () => string = os.homedir,
+  existsImpl: (candidate: string) => boolean = fs.existsSync
 ): string | undefined {
   const fromEnv = env.WORKSPACE_DIR?.trim();
   if (fromEnv) return fromEnv;
   try {
     const parsed = dotenv.parse(fs.readFileSync(rootEnvPath));
     const fromFile = parsed.WORKSPACE_DIR?.trim();
-    return fromFile && fromFile.length > 0 ? fromFile : undefined;
+    if (fromFile) return fromFile;
   } catch {
-    // No root .env (or unreadable) — fall back to the api's own default.
-    return undefined;
+    // No root .env (or unreadable). Continue to the macOS default below.
   }
+
+  if (platform === 'darwin') {
+    try {
+      const projects = path.join(homedir(), 'projects');
+      if (existsImpl(projects)) return projects;
+    } catch {
+      // Home lookup and the optional default are best-effort.
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -304,6 +323,11 @@ export function buildApiChildEnv(
   overrides: ApiChildEnvOverrides = {}
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
+  // Shell aliases are not executable under child_process.spawn. Preset names are
+  // carried by CODEX_PRESETS_JSON and must never occupy the executable slot.
+  if (env.CODEX_BIN === 'supersol' || env.CODEX_BIN === 'superastra') {
+    delete env.CODEX_BIN;
+  }
   env.API_BIND_HOST = LOCAL_BIND_HOST;
   env.VGIT_PORT = String(resolveApiPort(base));
   // The api uses DEV_BACKEND_PORT (= VGIT_PORT - 1) only for the Vite dev split.
@@ -346,6 +370,12 @@ export function buildApiChildEnv(
   // /api/internal/* (hook-relay + mcp-sidecar loopback traffic).
   if (overrides.hookSecret) {
     env.PORTABLE_HOOK_SECRET = overrides.hookSecret;
+  }
+  if (overrides.codexBin) {
+    env.CODEX_BIN = overrides.codexBin;
+  }
+  if (overrides.codexPresetsJson) {
+    env.CODEX_PRESETS_JSON = overrides.codexPresetsJson;
   }
   return env;
 }

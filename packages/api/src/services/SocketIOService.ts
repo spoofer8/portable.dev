@@ -16,7 +16,7 @@ import type { GitLocalService } from './GitLocalService.js';
 import type { TunnelService } from './TunnelService.js';
 import type { DbAdapter } from '../db/DbAdapter.js';
 import type { ExecutionContext } from './types/ExecutionContext.js';
-import type { PageContext, SandboxMetrics } from '@vgit2/shared/types';
+import type { AgentProvider, PageContext, SandboxMetrics } from '@vgit2/shared/types';
 import type { Server as HttpServer } from 'http';
 
 /**
@@ -461,6 +461,7 @@ export class SocketIOService {
         data: {
           chatId: string;
           type: 'claude_code';
+          provider?: AgentProvider;
           title: string;
           owner: string;
           repo: string;
@@ -637,10 +638,12 @@ export class SocketIOService {
               // Emit error to clients (transport concern)
               emitToRoom(this.io, effChatId, 'claude:status', {
                 chatId: effChatId,
+                ...(prepared.provider === 'codex' ? { provider: 'codex' as const } : {}),
                 status: 'error',
               });
               emitToRoom(this.io, effChatId, 'claude:error', {
                 chatId: effChatId,
+                ...(prepared.provider === 'codex' ? { provider: 'codex' as const } : {}),
                 error: error.message || 'Failed to process message',
               });
             }

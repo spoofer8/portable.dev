@@ -105,6 +105,7 @@ export class JsonDbAdapter implements DbAdapter {
     const {
       userId,
       chatId,
+      provider,
       type,
       title,
       status,
@@ -128,6 +129,7 @@ export class JsonDbAdapter implements DbAdapter {
       const row: ChatRow = {
         id: chatId,
         user_id: userId,
+        provider: provider ?? existing?.provider ?? 'claude',
         type,
         title,
         summary: summary !== undefined ? summary : (existing?.summary ?? null),

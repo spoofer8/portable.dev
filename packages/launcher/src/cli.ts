@@ -104,7 +104,8 @@ Prerequisites:
   - Bun (https://bun.sh)
   - cloudflared (auto-downloaded on first run; no account needed) — the default tunnel.
     With --ngrok instead: ngrok installed + authenticated (https://ngrok.com/download).
-  - For AI: a Claude subscription (the \`claude\` CLI) OR ANTHROPIC_API_KEY.
+  - For agents: a Claude subscription / ANTHROPIC_API_KEY and/or the Codex CLI.
+    Codex is optional; install it with \`npm install -g @openai/codex\`.
 
 No Clerk sign-in is needed on the PC: the launcher mints the pairing JWT locally
 with a per-install JWT_SECRET and the PC validates it itself. Scan the QR shown in

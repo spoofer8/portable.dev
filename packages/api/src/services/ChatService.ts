@@ -4,7 +4,13 @@ import { SOPService } from './SOPService.js';
 import { DbAdapter, type ChatOrigin } from '../db/DbAdapter.js';
 import { BufferedMessage } from '../types/index.js';
 
-import type { ChatStatus, StoredChat, ChatType, ChatCategory } from '@vgit2/shared/types';
+import type {
+  AgentProvider,
+  ChatStatus,
+  StoredChat,
+  ChatType,
+  ChatCategory,
+} from '@vgit2/shared/types';
 
 /**
  * Options for saving a chat via ChatService
@@ -15,6 +21,8 @@ import type { ChatStatus, StoredChat, ChatType, ChatCategory } from '@vgit2/shar
 export interface SaveChatServiceOptions {
   userId: string;
   chatId: string;
+  /** Runtime provider. Legacy/omitted records are Claude. */
+  provider?: AgentProvider;
   type: ChatType;
   title: string;
   status?: ChatStatus;
@@ -50,6 +58,11 @@ export class ChatService {
   public readonly dbAdapter: DbAdapter; // Public for use by other services
   private messageIdCounters: Map<string, number>;
   private onChatCreated?: (userId: string, chat: any) => void;
+  private providerArchiveHandler?: (input: {
+    provider: AgentProvider;
+    sessionId: string;
+    archived: boolean;
+  }) => Promise<void>;
   private sopService?: SOPService; // Optional: For SOP worksheet cleanup
 
   constructor(dbAdapter: DbAdapter, sopService?: SOPService) {
@@ -67,6 +80,16 @@ export class ChatService {
    */
   setOnChatCreated(callback: (userId: string, chat: any) => void): void {
     this.onChatCreated = callback;
+  }
+
+  setProviderArchiveHandler(
+    handler: (input: {
+      provider: AgentProvider;
+      sessionId: string;
+      archived: boolean;
+    }) => Promise<void>
+  ): void {
+    this.providerArchiveHandler = handler;
   }
 
   /**
@@ -156,6 +179,7 @@ export class ChatService {
         await this.dbAdapter.saveChat({
           userId,
           chatId,
+          provider: existingChat.provider ?? 'claude',
           type: 'claude_code',
           title: existingChat.title, // Preserve existing title
           status: 'running',
@@ -411,6 +435,7 @@ export class ChatService {
     const {
       userId,
       chatId,
+      provider,
       type,
       title,
       status,
@@ -448,6 +473,7 @@ export class ChatService {
     const result = await this.dbAdapter.saveChat({
       userId,
       chatId,
+      provider,
       type,
       title,
       status,
@@ -689,6 +715,38 @@ export class ChatService {
     archived: boolean = true,
     authToken?: string
   ): Promise<void> {
+    const chat = await this.dbAdapter.getChat(chatId, userId, authToken);
+    const origin = await this.dbAdapter.getChatOrigin(chatId, userId, authToken);
+    const originProvider = origin.origin === 'none' ? undefined : origin.provider;
+    const provider = chat?.provider === 'codex' || originProvider === 'codex' ? 'codex' : 'claude';
+    const sessionId =
+      chat?.session_id ??
+      chat?.fork_source_session_id ??
+      (origin.origin === 'discovered' ? origin.sourceSessionId : undefined);
+
+    if (provider === 'codex' && sessionId && this.providerArchiveHandler) {
+      await this.providerArchiveHandler({ provider, sessionId, archived });
+    }
+
+    // Discovered rows do not exist in SQLite yet. Materialize their metadata so
+    // the local archive flag remains stable even if the provider catalog changes.
+    if (origin.origin === 'discovered' && chat) {
+      await this.saveChat({
+        userId,
+        chatId,
+        provider,
+        type: chat.type,
+        title: chat.title,
+        status: chat.status ?? 'completed',
+        repoPath: origin.cwd,
+        repoFullName: origin.repoFullName,
+        forkSourceSessionId: sessionId,
+        agentSetupId: chat.agent_setup_id ?? 'freestyle',
+        model: chat.model ?? (provider === 'codex' ? 'supersol' : DEFAULT_MODEL_MODE),
+        permissions: chat.permissions ?? 'default',
+        authToken,
+      });
+    }
     await this.dbAdapter.archiveChat(chatId, userId, archived, authToken);
   }
 
@@ -702,6 +760,39 @@ export class ChatService {
     saved: boolean = true,
     authToken?: string
   ): Promise<void> {
+    if (saved) {
+      const chat = await this.dbAdapter.getChat(chatId, userId, authToken);
+      const origin = await this.dbAdapter.getChatOrigin(chatId, userId, authToken);
+      const originProvider = origin.origin === 'none' ? undefined : origin.provider;
+      const provider =
+        chat?.provider === 'codex' || originProvider === 'codex' ? 'codex' : 'claude';
+      const sessionId =
+        chat?.session_id ??
+        chat?.fork_source_session_id ??
+        (origin.origin === 'discovered' ? origin.sourceSessionId : undefined);
+
+      if (provider === 'codex' && chat?.archived && sessionId && this.providerArchiveHandler) {
+        await this.providerArchiveHandler({ provider, sessionId, archived: false });
+      }
+
+      if (origin.origin === 'discovered' && chat) {
+        await this.saveChat({
+          userId,
+          chatId,
+          provider,
+          type: chat.type,
+          title: chat.title,
+          status: chat.status ?? 'completed',
+          repoPath: origin.cwd,
+          repoFullName: origin.repoFullName,
+          forkSourceSessionId: sessionId,
+          agentSetupId: chat.agent_setup_id ?? 'freestyle',
+          model: chat.model ?? (provider === 'codex' ? 'supersol' : DEFAULT_MODEL_MODE),
+          permissions: chat.permissions ?? 'default',
+          authToken,
+        });
+      }
+    }
     await this.dbAdapter.setChatSaved(chatId, userId, saved, authToken);
   }
 
@@ -715,6 +806,27 @@ export class ChatService {
     pinned: boolean = true,
     authToken?: string
   ): Promise<void> {
+    const chat = await this.dbAdapter.getChat(chatId, userId, authToken);
+    const origin = await this.dbAdapter.getChatOrigin(chatId, userId, authToken);
+    if (origin.origin === 'discovered' && chat) {
+      const provider =
+        chat.provider === 'codex' || origin.provider === 'codex' ? 'codex' : 'claude';
+      await this.saveChat({
+        userId,
+        chatId,
+        provider,
+        type: chat.type,
+        title: chat.title,
+        status: chat.status ?? 'completed',
+        repoPath: origin.cwd,
+        repoFullName: origin.repoFullName,
+        forkSourceSessionId: origin.sourceSessionId,
+        agentSetupId: chat.agent_setup_id ?? 'freestyle',
+        model: chat.model ?? (provider === 'codex' ? 'supersol' : DEFAULT_MODEL_MODE),
+        permissions: chat.permissions ?? 'default',
+        authToken,
+      });
+    }
     await this.dbAdapter.setChatPinned(chatId, userId, pinned, authToken);
   }
 

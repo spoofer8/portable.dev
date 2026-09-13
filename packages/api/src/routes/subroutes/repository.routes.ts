@@ -3,7 +3,8 @@ import path from 'path';
 
 import { WORKSPACE_DIR } from '@vgit2/shared/constants';
 import { isEffortLevel, getSupportedEffortLevels } from '@vgit2/shared/effort';
-import { isModelMode, type ModelMode } from '@vgit2/shared/models';
+import { CODEX_PRESET_IDS, isModelMode, type ModelMode } from '@vgit2/shared/models';
+import { resolveAgentProvider } from '@vgit2/shared/types';
 import { getRepoFromPath } from '@vgit2/shared/utils/pathHelpers';
 import { Router } from 'express';
 
@@ -1033,6 +1034,7 @@ export function createRepositoryRoutes(
 
       // Omit null/empty so a missing value never clobbers a client-side default.
       const response: GetChatSettingsResponse = {};
+      response.provider = resolveAgentProvider(chat.provider);
       if (chat.model) response.model = chat.model;
       if (chat.permissions) response.permissions = chat.permissions;
       if (chat.agent_setup_id) response.agentSetupId = chat.agent_setup_id;
@@ -1062,6 +1064,7 @@ export function createRepositoryRoutes(
       if (!chat) {
         return res.status(404).json({ error: 'Chat not found' });
       }
+      const provider = resolveAgentProvider(chat.provider);
 
       // Now validate request body
       // Require at least one setting to be provided
@@ -1079,7 +1082,12 @@ export function createRepositoryRoutes(
 
       // Validate model if provided
       if (model) {
-        if (typeof model !== 'string' || !isModelMode(model)) {
+        const validModel =
+          typeof model === 'string' &&
+          (provider === 'codex'
+            ? CODEX_PRESET_IDS.includes(model as (typeof CODEX_PRESET_IDS)[number])
+            : isModelMode(model));
+        if (!validModel) {
           return res.status(400).json({ error: 'Invalid model' });
         }
       }
@@ -1095,7 +1103,7 @@ export function createRepositoryRoutes(
       // Validate effort if provided — must be a known level AND supported by the
       // chat's (possibly-just-updated) model, so a chat can never end up with an
       // effort value its model rejects (e.g. Haiku, or 'xhigh' on Sonnet).
-      if (effort) {
+      if (effort && provider === 'claude') {
         if (typeof effort !== 'string' || !isEffortLevel(effort)) {
           return res.status(400).json({ error: 'Invalid effort level' });
         }

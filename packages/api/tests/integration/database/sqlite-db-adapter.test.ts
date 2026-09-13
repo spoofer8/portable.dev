@@ -116,6 +116,7 @@ describe('SqliteDbAdapter - chat/message persistence on SQLite', () => {
     expect(chat!.id).toBe('chat-1');
     expect(chat!.user_id).toBe(USER);
     expect(chat!.title).toBe('My first chat');
+    expect(chat!.provider).toBe('claude');
     expect(chat!.repo_path).toBe('/workspace/repo-a');
     // Defaults match the schema defaults
     expect(chat!.model).toBe('opus');
@@ -126,6 +127,23 @@ describe('SqliteDbAdapter - chat/message persistence on SQLite', () => {
     // camelCase aliases present (drop-in parity with the legacy adapter output)
     expect((chat as any).repoPath).toBe('/workspace/repo-a');
     expect((chat as any).agentSetupId).toBe('freestyle');
+  });
+
+  it('persists the provider used to create a Codex chat', async () => {
+    await adapter.saveChat({
+      userId: USER,
+      chatId: 'codex-chat',
+      provider: 'codex',
+      type: 'claude_code',
+      title: 'Codex chat',
+      sessionId: 'thread-1',
+    });
+
+    expect((await adapter.getChat('codex-chat', USER))?.provider).toBe('codex');
+    adapter.close();
+    adapter = new SqliteDbAdapter(dataDir, dataDir);
+    await adapter.initialize();
+    expect((await adapter.getChat('codex-chat', USER))?.provider).toBe('codex');
   });
 
   it('does not leak chats across users', async () => {

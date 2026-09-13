@@ -2,6 +2,8 @@
  * Runtime types - tunnels, processes
  */
 
+import type { AgentProvider } from './chat.js';
+
 // ============================================================================
 // TUNNEL DATA
 // ============================================================================
@@ -32,8 +34,7 @@ export interface TunnelData {
  *                       instead of showing a confusing Cloudflare error page.
  */
 export type TunnelRepairResult =
-  | { status: 'repaired'; port: number; url: string }
-  | { status: 'dev_server_down'; port: number };
+  { status: 'repaired'; port: number; url: string } | { status: 'dev_server_down'; port: number };
 
 // ============================================================================
 // PROCESS DATA
@@ -81,6 +82,8 @@ export type ClaudeSessionOrigin = 'portable' | 'terminal';
 export interface RuntimeClaudeSessionPayload {
   /** Owning chat id (also the resume key). */
   chatId: string;
+  /** Agent provider. Absent on older payloads and therefore Claude. */
+  provider?: AgentProvider;
   /** Workspace repo path the session runs against (clients derive owner/repo). */
   repoPath?: string;
   status: ClaudeSessionStatus;

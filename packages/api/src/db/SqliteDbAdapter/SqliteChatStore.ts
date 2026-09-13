@@ -36,6 +36,7 @@ export const SQLITE_DB_FILE = 'chats.sqlite';
 interface DbChatRow {
   id: string;
   user_id: string;
+  provider: string;
   type: string;
   title: string;
   summary: string | null;
@@ -72,7 +73,7 @@ interface DbMessageRow {
 }
 
 const CHAT_COLUMNS =
-  'id, user_id, type, title, summary, status, hidden, archived, saved, pinned, last_updated, ' +
+  'id, user_id, provider, type, title, summary, status, hidden, archived, saved, pinned, last_updated, ' +
   'repo_path, repo_full_name, session_id, fork_source_session_id, system_prompt, playwright_device, model, permissions, ' +
   'effort, agent_setup_id, parent_chat_id, workflow_run_id, routine_id, ' +
   'last_read_message_id, linked_issue, created_at';
@@ -123,6 +124,7 @@ export class SqliteChatStore {
       CREATE TABLE IF NOT EXISTS chats (
         id TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,
+        provider TEXT NOT NULL DEFAULT 'claude',
         type TEXT NOT NULL,
         title TEXT NOT NULL,
         summary TEXT,
@@ -172,6 +174,11 @@ export class SqliteChatStore {
         // Column already exists.
       }
     }
+    try {
+      this.db.exec("ALTER TABLE chats ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude'");
+    } catch {
+      // Column already exists.
+    }
     // Add fork_source_session_id (fork-on-first-write) + repo_full_name + effort to a
     // PRE-EXISTING chats table the same way — nullable TEXT, idempotent (ALTER throws
     // once present, caught). repo_full_name was previously synthesized-only (never a
@@ -220,6 +227,7 @@ export class SqliteChatStore {
     }
     return {
       ...raw,
+      provider: raw.provider === 'codex' ? 'codex' : 'claude',
       hidden: !!raw.hidden,
       archived: !!raw.archived,
       saved: !!raw.saved,
@@ -246,6 +254,7 @@ export class SqliteChatStore {
       .run(
         row.id,
         row.user_id,
+        row.provider ?? 'claude',
         row.type,
         row.title,
         row.summary,
@@ -393,6 +402,7 @@ export class SqliteChatStore {
         insertChat.run(
           row.id,
           row.user_id,
+          row.provider ?? 'claude',
           row.type,
           row.title,
           row.summary,

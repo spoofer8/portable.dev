@@ -233,6 +233,24 @@ describe('ClaudeProjectsChatIndex.discoverChats', () => {
     expect(chat.repoPath).toBe(linkRepo); // display stays the listed (link) path
     expect(chat.cwd).toBe(realRepo); // locate key stays the real recorded cwd
   });
+
+  it('invalidates a cached summary when contents change but mtime is restored', async () => {
+    const repoCwd = path.join(wsRoot, 'cache-app');
+    await writeTranscript(repoCwd, 'sess-cache');
+    const transcript = path.join(configDir, 'projects', slugForCwd(repoCwd), 'sess-cache.jsonl');
+    const originalStat = await fs.stat(transcript);
+    const index = new ClaudeProjectsChatIndex(configDir);
+    const repos = [{ full_name: 'me/cache-app', localPath: repoCwd }];
+    expect((await index.discoverChats(repos))[0].title).toBe('A friendly greeting');
+
+    await fs.appendFile(
+      transcript,
+      `\n${jline({ type: 'custom-title', customTitle: 'Changed despite stable mtime' })}`
+    );
+    await fs.utimes(transcript, originalStat.atime, originalStat.mtime);
+
+    expect((await index.discoverChats(repos))[0].title).toBe('Changed despite stable mtime');
+  });
 });
 
 describe('ClaudeProjectsMessageStore', () => {
