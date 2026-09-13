@@ -13,8 +13,9 @@
  * analysis OR the explicit project selection → project creation → first message).
  */
 
-import { MODELS, MODEL_MODES, type ModelMode } from '@vgit2/shared/models';
+import { getAgentModelLabel, getAgentModelOptions } from '@vgit2/shared/models';
 import { PERMISSIONS, PERMISSION_MODES, type PermissionMode } from '@vgit2/shared/permissions';
+import { resolveAgentProvider, type AgentProvider } from '@vgit2/shared/types';
 import { type ReactNode, useRef, useState } from 'react';
 import { Image, Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
@@ -47,7 +48,12 @@ export interface ChatComposerProps extends UseChatComposerOptions {
   headerRight?: ReactNode;
 }
 
-type SheetKind = 'model' | 'permissions' | 'agent' | 'project' | null;
+type SheetKind = 'provider' | 'model' | 'permissions' | 'agent' | 'project' | null;
+
+const PROVIDER_OPTIONS: { id: AgentProvider; name: string }[] = [
+  { id: 'claude', name: 'Claude' },
+  { id: 'codex', name: 'Codex' },
+];
 
 export function ChatComposer({ headerRight, ...props }: ChatComposerProps) {
   const composer = useChatComposer(props);
@@ -77,6 +83,10 @@ export function ChatComposer({ headerRight, ...props }: ChatComposerProps) {
   const permissionColor =
     PERMISSIONS[composer.settings.permissions as PermissionMode]?.color ??
     theme.colors.textSecondary;
+  const provider = resolveAgentProvider(composer.settings.provider);
+  const providerLabel = provider === 'codex' ? 'Codex' : 'Claude';
+  const modelOptions = getAgentModelOptions(provider);
+  const modelLabel = getAgentModelLabel(provider, composer.settings.model);
 
   const hasText = composer.text.trim().length > 0;
   const isExpanded = isFocused || hasText || attachmentCount > 0;
@@ -115,6 +125,22 @@ export function ChatComposer({ headerRight, ...props }: ChatComposerProps) {
               hidden in the control row below) so the active default is visible at a
               glance without expanding the composer. */}
           <Pressable
+            testID="composer-provider-trigger"
+            accessibilityRole="button"
+            accessibilityLabel={`Agent provider: ${providerLabel}`}
+            style={[styles.projectTrigger, styles.providerTrigger]}
+            onPress={() => setSheet('provider')}
+          >
+            <Text
+              style={[styles.projectTriggerText, { color: theme.colors.textTertiary }]}
+              numberOfLines={1}
+            >
+              {providerLabel}
+            </Text>
+            <Icon name="chevron-down" size={10} color={theme.colors.textTertiary} />
+          </Pressable>
+
+          <Pressable
             testID="composer-permissions-trigger"
             accessibilityRole="button"
             accessibilityLabel={`Default permission: ${PERMISSIONS[composer.settings.permissions as PermissionMode]?.label ?? composer.settings.permissions}`}
@@ -139,7 +165,7 @@ export function ChatComposer({ headerRight, ...props }: ChatComposerProps) {
           <Pressable
             testID="composer-model-trigger"
             accessibilityRole="button"
-            accessibilityLabel={`Default model: ${MODELS[composer.settings.model as ModelMode]?.label ?? composer.settings.model}`}
+            accessibilityLabel={`Default model: ${modelLabel}`}
             style={[styles.projectTrigger, styles.modelTrigger]}
             onPress={() => setSheet('model')}
           >
@@ -147,7 +173,7 @@ export function ChatComposer({ headerRight, ...props }: ChatComposerProps) {
               style={[styles.projectTriggerText, { color: theme.colors.textTertiary }]}
               numberOfLines={1}
             >
-              {MODELS[composer.settings.model as ModelMode]?.label ?? composer.settings.model}
+              {modelLabel}
             </Text>
             <Icon name="chevron-down" size={10} color={theme.colors.textTertiary} />
           </Pressable>
@@ -213,15 +239,17 @@ export function ChatComposer({ headerRight, ...props }: ChatComposerProps) {
           <View style={styles.controlRow}>
             <AttachButton variant="row" onPress={() => attachRef.current?.openSourceSheet()} />
 
-            <Pressable
-              testID="open-agent-sheet"
-              accessibilityRole="button"
-              style={styles.control}
-              onPress={() => setSheet('agent')}
-            >
-              <AgentAvatar setup={currentSetup} size={18} />
-              <Icon name="chevron-up" size={10} color={theme.colors.textSecondary} />
-            </Pressable>
+            {provider === 'claude' ? (
+              <Pressable
+                testID="open-agent-sheet"
+                accessibilityRole="button"
+                style={styles.control}
+                onPress={() => setSheet('agent')}
+              >
+                <AgentAvatar setup={currentSetup} size={18} />
+                <Icon name="chevron-up" size={10} color={theme.colors.textSecondary} />
+              </Pressable>
+            ) : null}
 
             <Pressable
               testID="open-permissions-sheet"
@@ -300,11 +328,29 @@ export function ChatComposer({ headerRight, ...props }: ChatComposerProps) {
 
       {/* Model bottom sheet */}
       <SelectorSheet
+        testID="provider-sheet"
+        visible={sheet === 'provider'}
+        title="Agent Provider"
+        onClose={() => setSheet(null)}
+        options={PROVIDER_OPTIONS}
+        selectedId={provider}
+        optionTestIdPrefix="provider-option"
+        onSelect={(id) => {
+          composer.setProvider(id as AgentProvider);
+          setSheet(null);
+        }}
+      />
+
+      <SelectorSheet
         testID="model-sheet"
         visible={sheet === 'model'}
         title="Select Model"
         onClose={() => setSheet(null)}
-        options={MODEL_MODES.map((m) => ({ id: m, name: MODELS[m].label }))}
+        options={modelOptions.map((option) => ({
+          id: option.id,
+          name: option.label,
+          description: option.description,
+        }))}
         selectedId={composer.settings.model}
         optionTestIdPrefix="model-option"
         onSelect={(id) => {
@@ -530,6 +576,7 @@ const styles = StyleSheet.create({
   // The permissions label is short ("Ask for Edit" is the longest) — cap it well below
   // the project trigger's 220 so the pair always leaves room for the profile pill.
   permissionsTrigger: { flexShrink: 2, maxWidth: 110 },
+  providerTrigger: { flexShrink: 1, maxWidth: 74 },
   // Model labels ("Sonnet 4.6", "Opus 4.8") are similarly short — same cap so the
   // project + permissions + model triple still leaves room for the profile pill.
   modelTrigger: { flexShrink: 2, maxWidth: 110 },

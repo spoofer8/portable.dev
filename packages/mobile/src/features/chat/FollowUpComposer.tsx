@@ -39,9 +39,9 @@ import {
   getSupportedEffortLevels,
   type EffortLevel,
 } from '@vgit2/shared/effort';
-import { isModelMode, MODELS, MODEL_MODES, type ModelMode } from '@vgit2/shared/models';
+import { getAgentModelOptions, isModelMode, type ModelMode } from '@vgit2/shared/models';
 import { PERMISSIONS, PERMISSION_MODES, type PermissionMode } from '@vgit2/shared/permissions';
-import type { AgentSetup, ChatStatus } from '@vgit2/shared/types';
+import { resolveAgentProvider, type AgentSetup, type ChatStatus } from '@vgit2/shared/types';
 import { router } from 'expo-router';
 import { forwardRef, useImperativeHandle, useMemo, useRef, useState } from 'react';
 import { Pressable, StyleSheet, TextInput, View } from 'react-native';
@@ -134,6 +134,8 @@ export const FollowUpComposer = forwardRef<FollowUpComposerHandle, FollowUpCompo
     }, [agentSetupsQuery.data]);
 
     const currentSetup = agentSetups.find((a) => a.id === settings.agentSetupId) ?? agentSetups[0];
+    const provider = resolveAgentProvider(settings.provider);
+    const modelOptions = getAgentModelOptions(provider);
     const permissionColor =
       PERMISSIONS[settings.permissions as PermissionMode]?.color ?? theme.colors.textSecondary;
 
@@ -273,15 +275,17 @@ export const FollowUpComposer = forwardRef<FollowUpComposerHandle, FollowUpCompo
           <View style={styles.controlRow}>
             <AttachButton variant="row" onPress={() => attachRef.current?.openSourceSheet()} />
 
-            <Pressable
-              testID="open-agent-sheet"
-              accessibilityRole="button"
-              style={styles.control}
-              onPress={() => setSheet('agent')}
-            >
-              <AgentAvatar setup={currentSetup} size={18} />
-              <Icon name="chevron-up" size={10} color={theme.colors.textSecondary} />
-            </Pressable>
+            {provider === 'claude' ? (
+              <Pressable
+                testID="open-agent-sheet"
+                accessibilityRole="button"
+                style={styles.control}
+                onPress={() => setSheet('agent')}
+              >
+                <AgentAvatar setup={currentSetup} size={18} />
+                <Icon name="chevron-up" size={10} color={theme.colors.textSecondary} />
+              </Pressable>
+            ) : null}
 
             <Pressable
               testID="open-permissions-sheet"
@@ -348,7 +352,11 @@ export const FollowUpComposer = forwardRef<FollowUpComposerHandle, FollowUpCompo
           visible={sheet === 'model'}
           title="Select Model"
           onClose={() => setSheet(null)}
-          options={MODEL_MODES.map((m) => ({ id: m, name: MODELS[m].label }))}
+          options={modelOptions.map((option) => ({
+            id: option.id,
+            name: option.label,
+            description: option.description,
+          }))}
           selectedId={settings.model}
           optionTestIdPrefix="model-option"
           onSelect={(id) => {

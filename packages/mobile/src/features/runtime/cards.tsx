@@ -11,6 +11,7 @@ import type { ProcessData, TunnelData } from '@vgit2/shared/types';
 
 import { useAppTheme } from '../../theme';
 import { Icon } from '../../theme/icons/Icon';
+import { resolveAgentProvider } from '@vgit2/shared/types';
 import type { ClaudeSessionData } from '../state/runtimeStore';
 import {
   claudeSessionStatusColor,
@@ -50,9 +51,9 @@ function RepoLine({ repoPath }: { repoPath: string | undefined }) {
   );
 }
 
-function Badge({ label, color }: { label: string; color: string }) {
+function Badge({ label, color, testID }: { label: string; color: string; testID?: string }) {
   return (
-    <View style={[styles.badge, { borderColor: color }]}>
+    <View testID={testID} style={[styles.badge, { borderColor: color }]}>
       <Text style={[styles.badgeText, { color }]}>{label}</Text>
     </View>
   );
@@ -170,13 +171,19 @@ export function ClaudeSessionCard({
   const { theme } = useAppTheme();
   const color = claudeSessionStatusColor(session.status, theme.colors);
   const repo = repoLabel(session.repoPath);
+  const providerLabel = resolveAgentProvider(session.provider) === 'codex' ? 'Codex' : 'Claude';
   return (
     <CardShell testID={testID}>
       <View style={styles.row}>
         <StatusDot color={color} />
         <Text style={[styles.claudeTitle, { color: theme.colors.text }]} numberOfLines={1}>
-          {repo ?? 'Claude session'}
+          {repo ?? `${providerLabel} session`}
         </Text>
+        <Badge
+          label={providerLabel}
+          color={theme.colors.textTertiary}
+          testID={`${testID}-provider`}
+        />
         <Badge label={claudeSessionStatusLabel(session.status)} color={color} />
         {/* rev12: the user's own terminal `claude` on the PC (not api-spawned). */}
         {session.origin === 'terminal' ? (

@@ -137,6 +137,7 @@ const claudeSessions: RuntimeClaudeSessionPayload[] = [
   },
   {
     chatId: 'chat-b',
+    provider: 'codex' as const,
     repoPath: '/ws/acme/api',
     status: 'running',
     isProcessing: true,
@@ -284,6 +285,10 @@ describe('runtime — RuntimeOverviewScreen', () => {
     expect(screen.getByTestId('runtime-claude-session-chat-a')).toBeTruthy();
     expect(screen.getByTestId('runtime-claude-session-chat-b')).toBeTruthy();
     expect(screen.getByTestId('runtime-claude-sessions-count')).toHaveTextContent('2');
+    expect(screen.getByTestId('runtime-claude-session-chat-a-provider')).toHaveTextContent(
+      'Claude'
+    );
+    expect(screen.getByTestId('runtime-claude-session-chat-b-provider')).toHaveTextContent('Codex');
     // 600_000 ms → "10m"
     expect(screen.getByTestId('runtime-claude-ttl')).toHaveTextContent(/10m/);
   });

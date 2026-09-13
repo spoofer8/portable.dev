@@ -178,6 +178,7 @@ function createGate(): { release: () => void; wait: Promise<void> } {
 }
 
 const SETTINGS = {
+  provider: 'claude' as const,
   model: 'sonnet',
   permissions: 'bypass_permissions',
   agentSetupId: 'best-practice',
@@ -212,6 +213,22 @@ function buildFlowDeps(partial: Partial<NewChatFlowDeps> = {}): {
 }
 
 describe('createNewChatFlow stages + first message', () => {
+  it('threads the selected provider through chat creation and the first message', async () => {
+    const created: unknown[] = [];
+    const { deps, sent } = buildFlowDeps({
+      settings: { ...SETTINGS, provider: 'codex', model: 'superastra' },
+      emitCreateChat: async (payload) => {
+        created.push(payload);
+        return { success: true };
+      },
+    });
+
+    await createNewChatFlow(deps);
+
+    expect(created[0]).toMatchObject({ provider: 'codex', model: 'superastra' });
+    expect(sent[0]).toMatchObject({ provider: 'codex', model: 'superastra' });
+  });
+
   it('new-repo: analyzing → creating-project → starting-chat, prompt content + customDisplay', async () => {
     const { deps, stages, sent } = buildFlowDeps({
       analyzeIntent: async () => ({

@@ -48,6 +48,7 @@ beforeEach(() => {
 
 describe('resolveNewChatSettings — precedence', () => {
   const global: NewChatSettings = {
+    provider: 'claude',
     model: 'opus',
     permissions: 'bypass_permissions',
     agentSetupId: 'orchestrator',
@@ -71,6 +72,7 @@ describe('resolveNewChatSettings — precedence', () => {
 
   it('defaults to freestyle when neither global nor project is set', () => {
     expect(resolveNewChatSettings(DEFAULT_NEW_CHAT_SETTINGS, {}).agentSetupId).toBe('freestyle');
+    expect(resolveNewChatSettings(DEFAULT_NEW_CHAT_SETTINGS, {}).provider).toBe('claude');
   });
 });
 
@@ -144,6 +146,7 @@ describe('v1 migration — stale best-practice default → freestyle', () => {
     await useChatStore.persist.rehydrate();
 
     expect(useChatStore.getState().newChatSettings.agentSetupId).toBe('freestyle');
+    expect(useChatStore.getState().newChatSettings.provider).toBe('claude');
     // The new per-project map is seeded.
     expect(useChatStore.getState().settingsByProject).toEqual({});
   });
@@ -168,5 +171,6 @@ describe('v1 migration — stale best-practice default → freestyle', () => {
     await useChatStore.persist.rehydrate();
 
     expect(useChatStore.getState().newChatSettings.agentSetupId).toBe('orchestrator');
+    expect(useChatStore.getState().newChatSettings.provider).toBe('claude');
   });
 });

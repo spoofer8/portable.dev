@@ -51,7 +51,12 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import type { ChatCategory, ChatListItem } from '@vgit2/shared/types';
+import {
+  resolveAgentProvider,
+  type AgentProvider,
+  type ChatCategory,
+  type ChatListItem,
+} from '@vgit2/shared/types';
 
 import { ChatCardBody } from '../home/ChatCardBody';
 import { Icon, mixColors, useAppTheme, withAlpha } from '../../theme';
@@ -68,6 +73,7 @@ export interface ChatDirectoryScreenProps {
 }
 
 type DirectoryTab = 'project' | 'active' | 'saved' | 'archived';
+type ProviderFilter = 'all' | AgentProvider;
 
 /** Tab strip labels (the "Project" tab is the project-grouped default view). */
 const TAB_LABELS: Record<DirectoryTab, string> = {
@@ -104,6 +110,7 @@ export function ChatDirectoryScreen({ archived = false }: ChatDirectoryScreenPro
   // most-useful view), "Active" (flat recency list), "Archived" (flat). `Project`
   // and `Active` are the same non-archived data, just grouped vs. flat.
   const [tab, setTab] = useState<DirectoryTab>(archived ? 'archived' : 'project');
+  const [providerFilter, setProviderFilter] = useState<ProviderFilter>('all');
   const isArchived = tab === 'archived';
   const grouped = tab === 'project';
   const category = TAB_CATEGORY[tab];
@@ -126,9 +133,16 @@ export function ChatDirectoryScreen({ archived = false }: ChatDirectoryScreenPro
     }, [])
   );
 
+  const visibleChats = useMemo(
+    () =>
+      providerFilter === 'all'
+        ? dir.chats
+        : dir.chats.filter((chat) => resolveAgentProvider(chat.provider) === providerFilter),
+    [dir.chats, providerFilter]
+  );
   const sections = useMemo(
-    () => (grouped ? groupChatsByProject(dir.chats) : []),
-    [grouped, dir.chats]
+    () => (grouped ? groupChatsByProject(visibleChats) : []),
+    [grouped, visibleChats]
   );
 
   // The chat queued for deletion — drives the confirmation modal (null = closed).
@@ -168,13 +182,19 @@ export function ChatDirectoryScreen({ archived = false }: ChatDirectoryScreenPro
   const listEmpty = (
     <View style={styles.center}>
       <Text style={[styles.empty, { color: theme.colors.textSecondary }]}>
-        {tab === 'archived'
-          ? 'No archived chats'
-          : tab === 'saved'
-            ? 'No saved chats'
-            : 'No chats yet'}
+        {providerFilter !== 'all'
+          ? `No ${providerFilter === 'codex' ? 'Codex' : 'Claude'} chats in this view`
+          : tab === 'archived'
+            ? 'No archived chats'
+            : tab === 'saved'
+              ? 'No saved chats'
+              : 'No chats yet'}
       </Text>
-      {tab === 'saved' ? (
+      {providerFilter !== 'all' ? (
+        <Text style={[styles.emptyHint, { color: theme.colors.textTertiary }]}>
+          Start a {providerFilter === 'codex' ? 'Codex' : 'Claude'} chat or choose another filter.
+        </Text>
+      ) : tab === 'saved' ? (
         <Text style={[styles.emptyHint, { color: theme.colors.textTertiary }]}>
           Long-press a chat and choose Save to keep it here for later.
         </Text>
@@ -237,8 +257,44 @@ export function ChatDirectoryScreen({ archived = false }: ChatDirectoryScreenPro
         })}
       </View>
 
+      <View style={styles.providerFilters} accessibilityRole="tablist">
+        {(['all', 'claude', 'codex'] as const).map((provider) => {
+          const selected = providerFilter === provider;
+          const label =
+            provider === 'all' ? 'All agents' : provider === 'claude' ? 'Claude' : 'Codex';
+          return (
+            <Pressable
+              key={provider}
+              testID={`chat-provider-filter-${provider}`}
+              accessibilityRole="tab"
+              accessibilityState={{ selected }}
+              accessibilityLabel={`Show ${label}`}
+              onPress={() => setProviderFilter(provider)}
+              style={[
+                styles.providerFilter,
+                {
+                  borderColor: selected ? theme.colors.primary : theme.colors.border,
+                  backgroundColor: selected
+                    ? mixColors(theme.colors.surface, theme.colors.primary, 0.1)
+                    : theme.colors.surface,
+                },
+              ]}
+            >
+              <Text
+                style={[
+                  styles.providerFilterText,
+                  { color: selected ? theme.colors.text : theme.colors.textSecondary },
+                ]}
+              >
+                {label}
+              </Text>
+            </Pressable>
+          );
+        })}
+      </View>
+
       <Text style={styles.count} testID="chat-directory-count">
-        {dir.chats.length}
+        {visibleChats.length}
       </Text>
 
       {dir.isLoading ? (
@@ -267,7 +323,7 @@ export function ChatDirectoryScreen({ archived = false }: ChatDirectoryScreenPro
       ) : (
         <FlatList
           testID="chat-directory-list"
-          data={dir.chats}
+          data={visibleChats}
           keyExtractor={(c) => c.id}
           showsVerticalScrollIndicator={false}
           contentContainerStyle={[styles.listContent, { paddingBottom: insets.bottom + 16 }]}
@@ -542,6 +598,16 @@ const styles = StyleSheet.create({
   tabBar: { flexDirection: 'row', borderBottomWidth: 1, marginBottom: 4 },
   tab: { paddingVertical: 10, marginRight: 24, borderBottomWidth: 2 },
   tabText: { fontSize: 15 },
+  providerFilters: { flexDirection: 'row', gap: 8, paddingVertical: 4 },
+  providerFilter: {
+    minHeight: 44,
+    paddingHorizontal: 14,
+    borderWidth: 1,
+    borderRadius: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  providerFilterText: { fontSize: 13, fontWeight: '600' },
   count: { fontSize: 12, opacity: 0, height: 0 },
   center: { paddingVertical: 32, alignItems: 'center', gap: 6 },
   muted: { fontSize: 14 },

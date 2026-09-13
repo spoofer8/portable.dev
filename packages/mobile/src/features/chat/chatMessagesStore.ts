@@ -72,8 +72,24 @@ function hasDuplicateBlock(existing: ClaudeStreamBlock[], block: ClaudeStreamBlo
  */
 export function appendBlockToMessages(
   messages: MobileChatMessage[],
-  block: ClaudeStreamBlock
+  block: ClaudeStreamBlock,
+  operation: 'append' | 'replace' = 'append'
 ): MobileChatMessage[] {
+  if (operation === 'replace' && block.blockId) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (message.role !== 'assistant' || !message.blocks) continue;
+      const blockIndex = message.blocks.findIndex(
+        (candidate) => candidate.blockId === block.blockId && candidate.type === block.type
+      );
+      if (blockIndex === -1) continue;
+      const blocks = [...message.blocks];
+      blocks[blockIndex] = block;
+      const updated = { ...message, blocks };
+      return [...messages.slice(0, i), updated, ...messages.slice(i + 1)];
+    }
+  }
+
   // tool_result: attach to the message containing the matching tool_use.
   if (block.type === 'tool_result' && block.id) {
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -235,7 +251,7 @@ export interface ChatMessagesState {
    */
   applyJoinedHistory: (chatId: string, joined: MobileChatMessage[], ackStatus?: ChatStatus) => void;
   /** Append a streamed block (`claude:stream`). */
-  appendBlock: (chatId: string, block: ClaudeStreamBlock) => void;
+  appendBlock: (chatId: string, block: ClaudeStreamBlock, operation?: 'append' | 'replace') => void;
   /** Append / reconcile a user message (`user_message`, replaces an optimistic echo). */
   appendUserMessage: (chatId: string, message: MobileChatMessage) => void;
   /**
@@ -329,10 +345,10 @@ export const useChatMessagesStore = create<ChatMessagesState>()((set, get) => ({
       return { messages, statuses };
     }),
 
-  appendBlock: (chatId, block) =>
+  appendBlock: (chatId, block, operation = 'append') =>
     set((state) => {
       const current = state.messages[chatId] ?? [];
-      const next = appendBlockToMessages(current, block);
+      const next = appendBlockToMessages(current, block, operation);
       if (next === current) return {};
       return { messages: { ...state.messages, [chatId]: next } };
     }),

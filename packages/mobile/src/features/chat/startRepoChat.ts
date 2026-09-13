@@ -66,6 +66,7 @@ export async function startRepoChatFlow(deps: StartRepoChatDeps): Promise<string
   const ack = await emitCreateChat({
     chatId,
     type: 'claude_code',
+    provider: settings.provider,
     title: message ?? `${owner}/${repo}`,
     owner,
     repo,
@@ -95,6 +96,7 @@ export async function startRepoChatFlow(deps: StartRepoChatDeps): Promise<string
     try {
       await emitSendMessage({
         chatId,
+        provider: settings.provider,
         content: message,
         model: settings.model,
         permissions: settings.permissions,

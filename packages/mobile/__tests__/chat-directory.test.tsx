@@ -618,4 +618,34 @@ describe('chat directory / navigation / settings', () => {
     expect(screen.getByTestId('chat-row-c50')).toBeTruthy();
     expect(screen.queryByTestId('chat-row-c0')).toBeNull();
   });
+
+  it('shows every provider by default and filters Claude or Codex locally', async () => {
+    gateway.on('GET', chatsUrl(0), () => ({
+      body: {
+        chats: [
+          { ...makeChats(1)[0], provider: undefined },
+          { ...makeChats(1, 1)[0], provider: 'codex' },
+        ],
+        hasMore: false,
+        totalCount: 2,
+      } satisfies GetChatsResponse,
+    }));
+
+    const client = buildClient(gateway);
+    renderChatApp(client, newQueryClient(), { initialUrl: '/chat/directory' });
+
+    await waitFor(() => expect(screen.getByTestId('chat-directory-count').props.children).toBe(2));
+    expect(screen.getByTestId('chat-provider-badge-c0').props.children).toBe('Claude');
+    expect(screen.getByTestId('chat-provider-badge-c1').props.children).toBe('Codex');
+
+    fireEvent.press(screen.getByTestId('chat-provider-filter-codex'));
+    expect(screen.getByTestId('chat-directory-count').props.children).toBe(1);
+    expect(screen.queryByTestId('chat-row-c0')).toBeNull();
+    expect(screen.getByTestId('chat-row-c1')).toBeTruthy();
+
+    fireEvent.press(screen.getByTestId('chat-provider-filter-claude'));
+    expect(screen.getByTestId('chat-directory-count').props.children).toBe(1);
+    expect(screen.getByTestId('chat-row-c0')).toBeTruthy();
+    expect(screen.queryByTestId('chat-row-c1')).toBeNull();
+  });
 });

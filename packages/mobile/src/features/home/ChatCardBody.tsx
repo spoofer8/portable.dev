@@ -16,6 +16,7 @@ import { Image, StyleSheet, Text, View } from 'react-native';
 import { stripTaskNotificationsForPreview } from '../chat/taskNotification';
 
 import type { ChatListItem } from '@vgit2/shared/types';
+import { resolveAgentProvider } from '@vgit2/shared/types';
 
 import type { LinkedIssue } from '../chat/chrome/chatChromeStore';
 import {
@@ -73,6 +74,7 @@ export function ChatCardBody({ chat, onOpenLinkedIssue }: ChatCardBodyProps) {
   // Local repos have no GitHub remote — show the name, suppress the avatar.
   const showOwnerAvatar = !!repoOwner && repoOwner !== 'local';
   const isRunning = chat.status === 'running';
+  const providerLabel = resolveAgentProvider(chat.provider) === 'codex' ? 'Codex' : 'Claude';
 
   return (
     <>
@@ -137,6 +139,12 @@ export function ChatCardBody({ chat, onOpenLinkedIssue }: ChatCardBodyProps) {
         </View>
 
         <View style={styles.rightMeta}>
+          <Text
+            testID={`chat-provider-badge-${chat.id}`}
+            style={[styles.providerBadge, { color: theme.colors.textTertiary }]}
+          >
+            {providerLabel}
+          </Text>
           {isRunning ? (
             <View style={styles.runningDots}>
               {[0, 1, 2].map((i) => (
@@ -168,6 +176,7 @@ const styles = StyleSheet.create({
   ownerAvatar: { width: 16, height: 16, borderRadius: 8 },
   repoText: { fontSize: 12, flexShrink: 1 },
   rightMeta: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  providerBadge: { fontSize: 11, fontWeight: '600' },
   runningDots: { flexDirection: 'row', alignItems: 'center', gap: 3 },
   runningDot: { width: 4, height: 4, borderRadius: 2 },
   time: { fontSize: 12 },

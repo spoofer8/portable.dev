@@ -10,12 +10,14 @@
 import { DEFAULT_AI_STYLE, type AIStyleMode } from '@vgit2/shared/aiStyles';
 import { DEFAULT_EFFORT_LEVEL } from '@vgit2/shared/effort';
 import { DEFAULT_MODEL_MODE } from '@vgit2/shared/models';
+import type { AgentProvider } from '@vgit2/shared/types';
 import { create } from 'zustand';
 import { createJSONStorage, persist } from 'zustand/middleware';
 import { mmkvStateStorage } from './storage';
 
 /** Per-chat overrides persisted alongside drafts (also synced to /api/chat/:id/settings). */
 export interface ChatSettings {
+  provider?: AgentProvider;
   model?: string;
   permissions?: string;
   agentSetupId?: string;
@@ -34,6 +36,7 @@ export type NewChatSettings = Required<ChatSettings>;
 /** New-chat defaults (same values as `chat/chatSettingsDefaults.NEW_CHAT_SETTINGS`).
  *  Agent defaults to `freestyle` (the unopinionated direct-execution agent). */
 export const DEFAULT_NEW_CHAT_SETTINGS: NewChatSettings = {
+  provider: 'claude',
   model: DEFAULT_MODEL_MODE,
   permissions: 'bypass_permissions',
   agentSetupId: 'freestyle',
@@ -196,7 +199,7 @@ export const useChatStore = create<ChatState>()(
       // 'best-practice'` baked into MMKV — changing DEFAULT_NEW_CHAT_SETTINGS never
       // migrated it, so the composer kept sending best-practice. Map that stale
       // default to freestyle once, and seed the new per-project map.
-      version: 1,
+      version: 2,
       migrate: (persisted, fromVersion) => {
         const state = (persisted ?? {}) as Partial<ChatData>;
         if (fromVersion < 1) {
@@ -204,6 +207,23 @@ export const useChatStore = create<ChatState>()(
             state.newChatSettings = { ...state.newChatSettings, agentSetupId: 'freestyle' };
           }
           if (!state.settingsByProject) state.settingsByProject = {};
+        }
+        if (fromVersion < 2) {
+          state.newChatSettings = {
+            ...DEFAULT_NEW_CHAT_SETTINGS,
+            ...state.newChatSettings,
+            provider: state.newChatSettings?.provider ?? 'claude',
+          };
+          state.settingsByProject = Object.fromEntries(
+            Object.entries(state.settingsByProject ?? {}).map(([key, settings]) => [
+              key,
+              {
+                ...DEFAULT_NEW_CHAT_SETTINGS,
+                ...settings,
+                provider: settings.provider ?? 'claude',
+              },
+            ])
+          );
         }
         return state as ChatData;
       },

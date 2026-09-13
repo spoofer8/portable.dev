@@ -31,12 +31,27 @@ import { useSocketStore } from '../socket/socketStore';
 export function ChatListSync(): null {
   const queryClient = useQueryClient();
   const lastCreatedChatId = useSocketStore((s) => s.lastCreatedChatId);
+  const directoryRevision = useSocketStore((s) => s.directoryRevision);
+  const reconnectSeq = useSocketStore((s) => s.reconnectSeq);
 
   useEffect(() => {
     // null on mount / after a socket reset — only a real `chat:created` invalidates.
     if (!lastCreatedChatId) return;
     void queryClient.invalidateQueries({ queryKey: queryKeys.chatDirectory('active') });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.chats() });
   }, [lastCreatedChatId, queryClient]);
+
+  useEffect(() => {
+    if (directoryRevision === null) return;
+    void queryClient.invalidateQueries({ queryKey: ['chat-directory'] });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.chats() });
+  }, [directoryRevision, queryClient]);
+
+  useEffect(() => {
+    if (reconnectSeq <= 0) return;
+    void queryClient.invalidateQueries({ queryKey: ['chat-directory'] });
+    void queryClient.invalidateQueries({ queryKey: queryKeys.chats() });
+  }, [queryClient, reconnectSeq]);
 
   return null;
 }

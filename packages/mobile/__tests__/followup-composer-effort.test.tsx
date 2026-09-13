@@ -88,6 +88,7 @@ describe('FollowUpComposer — Effort control', () => {
     const onUpdateSettings = jest.fn();
     await renderComposer(
       {
+        provider: 'claude',
         model: 'opus',
         permissions: 'bypass_permissions',
         agentSetupId: 'freestyle',
@@ -110,6 +111,7 @@ describe('FollowUpComposer — Effort control', () => {
     const onUpdateSettings = jest.fn();
     await renderComposer(
       {
+        provider: 'claude',
         model: 'sonnet',
         permissions: 'bypass_permissions',
         agentSetupId: 'freestyle',
@@ -129,6 +131,7 @@ describe('FollowUpComposer — Effort control', () => {
     const onUpdateSettings = jest.fn();
     await renderComposer(
       {
+        provider: 'claude',
         model: 'haiku',
         permissions: 'bypass_permissions',
         agentSetupId: 'freestyle',
@@ -138,5 +141,48 @@ describe('FollowUpComposer — Effort control', () => {
     );
 
     expect(screen.queryByTestId('open-effort-sheet')).toBeNull();
+  });
+
+  it('offers Codex presets and hides Claude-only agent and effort controls', async () => {
+    const onUpdateSettings = jest.fn();
+    await renderComposer(
+      {
+        provider: 'codex',
+        model: 'superastra',
+        permissions: 'bypass_permissions',
+        agentSetupId: 'freestyle',
+        effort: 'high',
+      },
+      onUpdateSettings
+    );
+
+    expect(screen.queryByTestId('open-agent-sheet')).toBeNull();
+    expect(screen.queryByTestId('open-effort-sheet')).toBeNull();
+    fireEvent.press(screen.getByTestId('open-model-sheet'));
+    expect(screen.getByTestId('model-option-supersol')).toBeTruthy();
+    expect(screen.getByTestId('model-option-superastra')).toBeTruthy();
+    expect(screen.queryByTestId('model-option-opus')).toBeNull();
+
+    fireEvent.press(screen.getByTestId('model-option-supersol'));
+    expect(onUpdateSettings).toHaveBeenCalledWith({ model: 'supersol' });
+  });
+
+  it('treats a missing legacy provider as Claude', async () => {
+    const onUpdateSettings = jest.fn();
+    await renderComposer(
+      {
+        model: 'opus',
+        permissions: 'bypass_permissions',
+        agentSetupId: 'freestyle',
+        effort: 'high',
+      } as Required<ChatSettings>,
+      onUpdateSettings
+    );
+
+    expect(screen.getByTestId('open-agent-sheet')).toBeTruthy();
+    expect(screen.getByTestId('open-effort-sheet')).toBeTruthy();
+    fireEvent.press(screen.getByTestId('open-model-sheet'));
+    expect(screen.getByTestId('model-option-opus')).toBeTruthy();
+    expect(screen.queryByTestId('model-option-supersol')).toBeNull();
   });
 });

@@ -134,6 +134,7 @@ describe('chat input (selectors, draft, create-chat flow)', () => {
       useChatStore.setState({
         drafts: {},
         newChatSettings: {
+          provider: 'claude',
           model: 'sonnet',
           permissions: 'bypass_permissions',
           agentSetupId: 'best-practice',
@@ -244,6 +245,28 @@ describe('chat input (selectors, draft, create-chat flow)', () => {
     await waitFor(() => expect(screen.getByTestId('agent-option-freestyle')).toBeTruthy());
     fireEvent.press(screen.getByTestId('agent-option-freestyle'));
     expect(useChatStore.getState().newChatSettings.agentSetupId).toBe('freestyle');
+  });
+
+  it("switches provider and offers only that provider's models or presets", async () => {
+    await mount();
+
+    fireEvent.press(screen.getByTestId('composer-provider-trigger'));
+    fireEvent.press(screen.getByTestId('provider-option-codex'));
+
+    expect(useChatStore.getState().newChatSettings).toMatchObject({
+      provider: 'codex',
+      model: 'supersol',
+      permissions: 'ask_each_time',
+    });
+    expect(screen.getByText('SuperSol')).toBeTruthy();
+
+    fireEvent.press(screen.getByTestId('composer-model-trigger'));
+    expect(screen.getByTestId('model-option-supersol')).toBeTruthy();
+    expect(screen.getByTestId('model-option-superastra')).toBeTruthy();
+    expect(screen.queryByTestId('model-option-opus')).toBeNull();
+
+    fireEvent.press(screen.getByTestId('model-option-superastra'));
+    expect(useChatStore.getState().newChatSettings.model).toBe('superastra');
   });
 
   it('shows a default-permissions button beside "Auto detect" that sets the new-chat default without expanding the composer', async () => {

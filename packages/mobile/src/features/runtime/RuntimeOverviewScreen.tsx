@@ -259,9 +259,9 @@ export function RuntimeOverviewScreen({
           )}
         </Section>
 
-        {/* Claude sessions — live per-chat subprocesses + manual kill. */}
+        {/* Agent sessions: live Claude and Codex processes plus manual kill. */}
         <Section
-          title="Claude sessions"
+          title="Agent sessions"
           icon="bolt"
           count={claudeSessions.length}
           countTestID="runtime-claude-sessions-count"
@@ -280,7 +280,7 @@ export function RuntimeOverviewScreen({
               style={[styles.empty, { color: theme.colors.textSecondary }]}
               testID="runtime-claude-sessions-empty"
             >
-              No active Claude sessions
+              No active agent sessions
             </Text>
           ) : (
             claudeSessions.map((s) => (

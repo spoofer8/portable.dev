@@ -24,6 +24,7 @@ import {
   createSocket,
   createSocketEmitters,
   type ChatCreatePayload,
+  type ChatDirectoryChangedPayload,
   type ChatExternalMessagesPayload,
   type ChatJoinPayload,
   type ChatSummaryUpdatedPayload,
@@ -504,6 +505,11 @@ export function useNativeSocket(deps: NativeSocketDeps = {}): NativeSocket {
         useSocketStore.getState().setLastCreatedChatId(chatId);
         onChatCreatedRef.current?.(chatId);
       };
+      const handleChatDirectoryChanged = (...args: unknown[]) => {
+        const data = args[0] as Partial<ChatDirectoryChangedPayload> | undefined;
+        if (typeof data?.revision !== 'number' || !Number.isFinite(data.revision)) return;
+        useSocketStore.getState().setDirectoryRevision(data.revision);
+      };
       // Fork-on-first-write: the PC forked a Claude Code chat into a new Portable chat.
       // Record it so the screen with `oldChatId` open redirects to `newChatId` (the
       // companion `chat:created` already refreshed the directory + seeded its repo path).
@@ -545,7 +551,9 @@ export function useNativeSocket(deps: NativeSocketDeps = {}): NativeSocket {
       const handleClaudeStream = (...args: unknown[]) => {
         const data = args[0] as Partial<ClaudeStreamPayload> | undefined;
         if (!data?.chatId || !data.block) return;
-        useChatMessagesStore.getState().appendBlock(data.chatId, data.block);
+        useChatMessagesStore
+          .getState()
+          .appendBlock(data.chatId, data.block, data.operation ?? 'append');
       };
       const handleClaudeProcessing = (...args: unknown[]) => {
         const data = args[0] as Partial<ClaudeProcessingPayload> | undefined;
@@ -719,6 +727,7 @@ export function useNativeSocket(deps: NativeSocketDeps = {}): NativeSocket {
       sock.on(SERVER_EVENTS.DISCONNECT, handleDisconnect);
       sock.on(SERVER_EVENTS.CONNECT_ERROR, handleConnectError);
       sock.on(SERVER_EVENTS.CHAT_CREATED, handleChatCreated);
+      sock.on(SERVER_EVENTS.CHAT_DIRECTORY_CHANGED, handleChatDirectoryChanged);
       sock.on(SERVER_EVENTS.CHAT_FORKED, handleChatForked);
       sock.on(SERVER_EVENTS.CHAT_EXTERNAL_TURN_COMPLETED, handleExternalTurnCompleted);
       sock.on(SERVER_EVENTS.CHAT_EXTERNAL_MESSAGES, handleExternalMessages);

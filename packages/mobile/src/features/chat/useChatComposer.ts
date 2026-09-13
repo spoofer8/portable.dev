@@ -19,11 +19,13 @@ import { router } from 'expo-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import type {
+  AgentProvider,
   AgentSetup,
   CreateLocalFolderResponse,
   CreateProjectResponse,
   UploadedFile,
 } from '@vgit2/shared/types';
+import { DEFAULT_CODEX_PRESET, DEFAULT_MODEL_MODE } from '@vgit2/shared/models';
 
 import { useApi } from '../api/ApiProvider';
 import { useAgentSetups } from '../api/hooks';
@@ -129,6 +131,7 @@ export interface UseChatComposer {
   /** Resolved new-chat settings (model/permissions/agentSetup). */
   settings: NewChatSettings;
   setModel: (model: string) => void;
+  setProvider: (provider: AgentProvider) => void;
   setPermissions: (permissions: string) => void;
   setAgentSetupId: (agentSetupId: string) => void;
   /** Available agent setups (full objects; always includes the built-in default). */
@@ -250,6 +253,17 @@ export function useChatComposer(options: UseChatComposerOptions = {}): UseChatCo
 
   const setModel = useCallback(
     (model: string) => setNewChatSettings({ model }),
+    [setNewChatSettings]
+  );
+  const setProvider = useCallback(
+    (provider: AgentProvider) =>
+      setNewChatSettings({
+        provider,
+        model: provider === 'codex' ? DEFAULT_CODEX_PRESET : DEFAULT_MODEL_MODE,
+        // Codex can execute arbitrary local commands. Selecting the provider must
+        // never inherit the legacy global bypass default silently.
+        permissions: provider === 'codex' ? 'ask_each_time' : 'bypass_permissions',
+      }),
     [setNewChatSettings]
   );
   const setPermissions = useCallback(
@@ -504,6 +518,7 @@ export function useChatComposer(options: UseChatComposerOptions = {}): UseChatCo
     text,
     setText,
     settings,
+    setProvider,
     setModel,
     setPermissions,
     setAgentSetupId,

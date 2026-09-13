@@ -62,6 +62,7 @@ function buildClient(gateway: MockGateway): RelayApiClient {
 }
 
 const SETTINGS: Required<ChatSettings> = {
+  provider: 'claude',
   model: 'opus',
   permissions: 'bypass_permissions',
   agentSetupId: 'freestyle',

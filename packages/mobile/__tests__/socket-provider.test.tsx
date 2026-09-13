@@ -111,10 +111,12 @@ function createNetInfoController(): { netInfo: NetInfoLike; emit: (isConnected: 
 function StateProbe() {
   const connectionState = useSocketStore((s) => s.connectionState);
   const lastCreatedChatId = useSocketStore((s) => s.lastCreatedChatId);
+  const directoryRevision = useSocketStore((s) => s.directoryRevision);
   return (
     <>
       <Text testID="conn">{connectionState}</Text>
       <Text testID="created">{lastCreatedChatId ?? 'none'}</Text>
+      <Text testID="directory-revision">{directoryRevision}</Text>
     </>
   );
 }
@@ -320,6 +322,25 @@ describe('RN socket provider on the shared core', () => {
       expect(dispatchSpy).not.toHaveBeenCalled();
       dispatchSpy.mockRestore();
     }
+  });
+
+  it('records only newer chat directory revisions', async () => {
+    await mountProvider();
+
+    act(() => {
+      controller.emitServerEvent(SERVER_EVENTS.CHAT_DIRECTORY_CHANGED, {
+        revision: 4,
+        providers: ['claude', 'codex'],
+      });
+      controller.emitServerEvent(SERVER_EVENTS.CHAT_DIRECTORY_CHANGED, { revision: 4 });
+      controller.emitServerEvent(SERVER_EVENTS.CHAT_DIRECTORY_CHANGED, { revision: 3 });
+    });
+    expect(screen.getByTestId('directory-revision').props.children).toBe(4);
+
+    act(() => {
+      controller.emitServerEvent(SERVER_EVENTS.CHAT_DIRECTORY_CHANGED, { revision: 5 });
+    });
+    expect(screen.getByTestId('directory-revision').props.children).toBe(5);
   });
 
   it("records 'chat:forked' into lastForkedChat (the redirect signal) with a monotonic seq", async () => {

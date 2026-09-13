@@ -18,6 +18,7 @@ import { generateProjectCreationPrompt } from '@vgit2/shared/projectPrompts';
 
 import type { ChatCreatePayload, ChatMessagePayload, SocketAck } from '@vgit2/shared/socket';
 import type { CustomDisplay, UploadedFile } from '@vgit2/shared/types';
+import type { AgentProvider } from '@vgit2/shared/types';
 
 import { useChatMessagesStore } from './chatMessagesStore';
 
@@ -84,6 +85,7 @@ export type NewChatFlowStage =
 
 /** The model/permissions/agentSetup a new chat is created with. */
 export interface NewChatFlowSettings {
+  provider: AgentProvider;
   model: string;
   permissions: string;
   agentSetupId: string;
@@ -237,6 +239,7 @@ export async function createNewChatFlow(deps: NewChatFlowDeps): Promise<NewChatF
   const createAck = await deps.emitCreateChat({
     chatId,
     type: 'claude_code',
+    provider: settings.provider,
     title: message,
     owner,
     repo,
@@ -273,6 +276,7 @@ export async function createNewChatFlow(deps: NewChatFlowDeps): Promise<NewChatF
   try {
     const sendAck = await deps.sendMessage({
       chatId,
+      provider: settings.provider,
       messageId: deps.makeMessageId?.(),
       content,
       customDisplay,

@@ -62,7 +62,7 @@ const SANDBOX_BASE = 'https://sandbox.portable.test';
 const onlineNetInfo: NetInfoLike = { addEventListener: () => () => {} };
 
 /** Full URL of the Active directory page (offset 0) — the mock matches it exactly. */
-const chatsUrl = `${SANDBOX_BASE}/api/chats?limit=50&offset=0&archived=false`;
+const chatsUrl = `${SANDBOX_BASE}/api/chats?limit=50&offset=0&category=active`;
 
 function chatsBody(n: number): GetChatsResponse {
   return {
@@ -88,7 +88,7 @@ function DirectoryProbe() {
     queryKey: queryKeys.chatDirectory('active'),
     initialPageParam: 0,
     queryFn: ({ pageParam }) =>
-      api.get<GetChatsResponse>(`/api/chats?limit=50&offset=${pageParam}&archived=false`),
+      api.get<GetChatsResponse>(`/api/chats?limit=50&offset=${pageParam}&category=active`),
     getNextPageParam: () => undefined,
   });
   const count = query.data?.pages.flatMap((p) => p.chats).length ?? -1;
@@ -116,13 +116,13 @@ describe('ChatListSync — refresh chat directory on chat:created', () => {
     secureStore.__store.clear();
     secureStore.__store.set(RELAY_URL_KEY, SANDBOX_BASE);
     secureStore.__store.set(AUTH_TOKEN_KEY, 'good-token');
-    act(() => useSocketStore.setState({ lastCreatedChatId: null }));
+    act(() => useSocketStore.getState().reset());
     gateway = createMockGateway();
     onlineManager.setOnline(true);
   });
 
   afterEach(() => {
-    act(() => useSocketStore.setState({ lastCreatedChatId: null }));
+    act(() => useSocketStore.getState().reset());
     queryClient?.clear();
     queryClient = undefined;
     onlineManager.setOnline(true);
@@ -162,5 +162,36 @@ describe('ChatListSync — refresh chat directory on chat:created', () => {
       await Promise.resolve();
     });
     expect(gateway.requests.filter((r) => r.url === chatsUrl)).toHaveLength(1);
+  });
+
+  it('refetches once for each newer directory revision and ignores duplicates', async () => {
+    gateway.on('GET', chatsUrl, () => ({ body: chatsBody(1) }));
+    mount(buildClient(gateway));
+    await waitFor(() => expect(gateway.requests.filter((r) => r.url === chatsUrl)).toHaveLength(1));
+
+    act(() => useSocketStore.getState().setDirectoryRevision(7));
+    await waitFor(() => expect(gateway.requests.filter((r) => r.url === chatsUrl)).toHaveLength(2));
+
+    act(() => useSocketStore.getState().setDirectoryRevision(7));
+    await act(async () => void (await Promise.resolve()));
+    expect(gateway.requests.filter((r) => r.url === chatsUrl)).toHaveLength(2);
+
+    act(() => useSocketStore.getState().setDirectoryRevision(8));
+    await waitFor(() => expect(gateway.requests.filter((r) => r.url === chatsUrl)).toHaveLength(3));
+  });
+
+  it('refetches after a socket reconnect even without a directory event', async () => {
+    gateway.on('GET', chatsUrl, () => ({ body: chatsBody(1) }));
+    mount(buildClient(gateway));
+    await waitFor(() => expect(gateway.requests.filter((r) => r.url === chatsUrl)).toHaveLength(1));
+
+    act(() => useSocketStore.getState().markConnected('first'));
+    expect(useSocketStore.getState().reconnectSeq).toBe(0);
+    act(() => {
+      useSocketStore.getState().markDisconnected();
+      useSocketStore.getState().markConnected('second');
+    });
+
+    await waitFor(() => expect(gateway.requests.filter((r) => r.url === chatsUrl)).toHaveLength(2));
   });
 });

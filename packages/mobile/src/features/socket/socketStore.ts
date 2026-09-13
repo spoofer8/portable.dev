@@ -33,6 +33,10 @@ export interface SocketConnectionState {
    * changes here (or via the provider's `onChatCreated` callback).
    */
   lastCreatedChatId: string | null;
+  /** Latest accepted filesystem directory revision. Duplicate/older events are ignored. */
+  directoryRevision: number | null;
+  /** Increments only after a transport reconnect, not on the first connection. */
+  reconnectSeq: number;
   /**
    * The most recent server `chat:forked` event (fork-on-first-write): Portable forked a
    * Claude Code chat (`oldChatId`) into a new Portable chat (`newChatId`). The screen with
@@ -55,6 +59,8 @@ export interface SocketConnectionState {
   setConnectionState: (state: ConnectionState) => void;
   /** Record the latest server-created chat id. */
   setLastCreatedChatId: (chatId: string) => void;
+  /** Accept a newer `chat:directory_changed` revision. */
+  setDirectoryRevision: (revision: number) => void;
   /** Record the latest server fork (chat:forked) so the open screen can redirect. */
   setLastForkedChat: (oldChatId: string, newChatId: string) => void;
   /** Record a completed terminal turn (chat:external_turn_completed). */
@@ -69,6 +75,8 @@ const initialState = {
   socketId: null as string | null,
   hasConnectedOnce: false,
   lastCreatedChatId: null as string | null,
+  directoryRevision: null as number | null,
+  reconnectSeq: 0,
   lastForkedChat: null as { oldChatId: string; newChatId: string; seq: number } | null,
   lastExternalTurn: null as { chatId: string; seq: number } | null,
 };
@@ -76,11 +84,23 @@ const initialState = {
 export const useSocketStore = create<SocketConnectionState>()((set) => ({
   ...initialState,
   markConnected: (socketId) =>
-    set({ connected: true, connectionState: 'connected', socketId, hasConnectedOnce: true }),
+    set((state) => ({
+      connected: true,
+      connectionState: 'connected',
+      socketId,
+      hasConnectedOnce: true,
+      reconnectSeq: state.hasConnectedOnce ? state.reconnectSeq + 1 : state.reconnectSeq,
+    })),
   markDisconnected: () =>
     set({ connected: false, connectionState: 'disconnected', socketId: null }),
   setConnectionState: (connectionState) => set({ connectionState }),
   setLastCreatedChatId: (lastCreatedChatId) => set({ lastCreatedChatId }),
+  setDirectoryRevision: (revision) =>
+    set((state) =>
+      state.directoryRevision === null || revision > state.directoryRevision
+        ? { directoryRevision: revision }
+        : state
+    ),
   setLastForkedChat: (oldChatId, newChatId) =>
     set((s) => ({
       lastForkedChat: { oldChatId, newChatId, seq: (s.lastForkedChat?.seq ?? 0) + 1 },

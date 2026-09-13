@@ -163,6 +163,14 @@ describe('transformBufferedMessages (chat:join history → renderable messages)'
 });
 
 describe('appendBlockToMessages blockId dedup (duplicate React key regression)', () => {
+  it('replaces a streamed block in place when a provider sends cumulative text', () => {
+    const first = { type: 'text' as const, blockId: 'codex-item', content: 'Hel' };
+    const updated = { ...first, content: 'Hello' };
+    const messages = appendBlockToMessages(assistant([first]), updated, 'replace');
+
+    expect(messages[0].blocks).toEqual([updated]);
+  });
+
   const assistant = (blocks: ClaudeStreamBlock[]) => [
     { role: 'assistant' as const, content: '', blocks },
   ];

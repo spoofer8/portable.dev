@@ -19,6 +19,7 @@ import type { ChatSettings } from '../state';
  *   effort = DEFAULT_EFFORT_LEVEL ('high', the SDK's own default).
  */
 export const NEW_CHAT_SETTINGS: Required<ChatSettings> = {
+  provider: 'claude',
   model: DEFAULT_MODEL_MODE,
   permissions: 'bypass_permissions',
   agentSetupId: 'freestyle',
@@ -29,6 +30,7 @@ export const NEW_CHAT_SETTINGS: Required<ChatSettings> = {
 function defined(settings?: Partial<ChatSettings>): Partial<ChatSettings> {
   if (!settings) return {};
   const out: Partial<ChatSettings> = {};
+  if (settings.provider !== undefined) out.provider = settings.provider;
   if (settings.model !== undefined) out.model = settings.model;
   if (settings.permissions !== undefined) out.permissions = settings.permissions;
   if (settings.agentSetupId !== undefined) out.agentSetupId = settings.agentSetupId;
