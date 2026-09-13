@@ -4,6 +4,22 @@ Patch notes for the Portable CLI, published to npm as
 [`@volter-ai/portable.dev`](https://www.npmjs.com/package/@volter-ai/portable.dev).
 Versions follow the monorepo release version.
 
+## Unreleased
+
+### Added
+
+- First-class Codex sessions alongside Claude, including local discovery, new sessions,
+  safe continuation through forks, streamed output, approvals, interruption, and archive state.
+- `supersol` and `superastra` Codex presets backed by the native CLI configuration.
+- Provider labels and filters in the mobile chat directory and runtime view.
+
+### Fixed
+
+- New terminal sessions now refresh through filesystem events, startup scanning, and periodic
+  reconciliation instead of waiting indefinitely behind the mobile query cache.
+- Transcript caches now detect replacements and same-timestamp changes using file identity and
+  size metadata in addition to modification time.
+
 ## [3.5.4] - 2026-08-01
 
 ### Added

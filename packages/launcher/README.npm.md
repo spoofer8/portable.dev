@@ -33,9 +33,9 @@ Then install the mobile app, sign in, and **scan the QR**:
 - [Google Play](https://play.google.com/store/apps/details?id=dev.portable.app)
 
 In the happy path there is **nothing to configure**: the launcher discovers the Claude and
-GitHub credentials already on your machine (the `claude` CLI's login, `gh`, your git
-credential helper), provisions cloudflared and Chromium on first run, and pairs purely from
-the QR. Re-opening the app later reconnects automatically — no re-scan needed.
+GitHub credentials already on your machine, detects the local `codex` CLI, provisions
+cloudflared and Chromium on first run, and pairs purely from the QR. Re-opening the app later
+reconnects automatically — no re-scan needed.
 
 ## Commands
 
@@ -63,8 +63,15 @@ Portable is **local-first**. The backend runs on **your PC**, bound to `127.0.0.
 everything in local SQLite — no Docker, no Postgres, no cloud database. The launcher
 publishes it through a Cloudflare Quick Tunnel and registers that URL with a public relay;
 the mobile app talks to a stable address on the relay, which reverse-proxies to your PC. The
-relay never holds your AI credential or your data — it only forwards traffic. AI calls go
-**direct** to `api.anthropic.com` with your own Claude account.
+relay never holds your AI credential or your data. It only forwards traffic. Agent calls use
+the local Claude or Codex CLI configuration on your computer.
+
+On macOS, Portable detects `codex` without invoking interactive shell aliases. The
+`supersol` and `superastra` app choices map to native Codex app-server settings. If Codex is
+not installed, Portable continues in Claude-only mode and prints the official npm install
+command. `CODEX_HOME` and provider environment variables are forwarded unchanged and never
+persisted by the launcher. When `WORKSPACE_DIR` is unset and `~/projects` exists, that folder
+becomes the default session discovery root.
 
 To keep everything on infrastructure you control, you can self-host the relay and point the
 CLI at it with `PORTABLE_RELAY_URL`. Prefer a different tunnel? `portable --ngrok` fronts your

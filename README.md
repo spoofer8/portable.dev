@@ -100,8 +100,10 @@ portable                 # or, from a source checkout: bun run portable
 
 ## What you get
 
-- **Chat with Claude about your code** — full Claude Agent SDK with tools, running on your
-  machine with access to your real repos.
+- **Chat with Claude or Codex about your code** — Claude uses the Agent SDK and Codex uses
+  its local app-server, both running on your machine with access to your real repos.
+- **Continue local sessions from your phone** — sessions created by either CLI are discovered
+  automatically and appear in one provider-labelled chat directory.
 - **GitHub built in** — browse repositories, issues, PRs, branches, and Actions; let the AI
   read files, search code, and manage issues/PRs on your behalf.
 - **Your data stays on your PC** — chats, connections, themes, and settings persist in
@@ -171,11 +173,11 @@ secret and the api validates it locally. The QR you scan carries everything the 
 
 The launcher provisions almost everything itself. You only bring three things.
 
-| Requirement                 | Why                                                                        | Get it                                                                                                  |
-| --------------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| **[Bun](https://bun.sh)**   | Runs the launcher and the api (this is a Bun monorepo).                    | `curl -fsSL https://bun.sh/install \| bash` (macOS/Linux) · `irm bun.sh/install.ps1 \| iex` (Windows)   |
-| **A Claude subscription**   | The AI itself. Signed in via the `claude` CLI's token (no API key needed). | `claude setup-token` (or the launcher runs it for you on first boot)                                    |
-| **The Portable mobile app** | The client you actually use Portable from.                                 | Build it from `packages/mobile` with [Expo](https://docs.expo.dev/), or use the team's published build. |
+| Requirement                 | Why                                                                      | Get it                                                                                                  |
+| --------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------- |
+| **[Bun](https://bun.sh)**   | Runs the launcher and the api (this is a Bun monorepo).                  | `curl -fsSL https://bun.sh/install \| bash` (macOS/Linux) · `irm bun.sh/install.ps1 \| iex` (Windows)   |
+| **A Claude or Codex login** | The local AI runtime. Portable reuses the corresponding CLI credentials. | `claude setup-token` and/or `codex login`                                                               |
+| **The Portable mobile app** | The client you actually use Portable from.                               | Build it from `packages/mobile` with [Expo](https://docs.expo.dev/), or use the team's published build. |
 
 **Provisioned automatically on first run — you do _not_ install these:**
 
@@ -200,6 +202,22 @@ The launcher provisions almost everything itself. You only bring three things.
   automatically.
 
 **Platforms:** macOS, Linux, and Windows.
+
+### Codex sessions
+
+Codex support currently targets macOS. If `codex` is available, the launcher detects its
+native executable and starts a local app-server only when needed. Existing Codex threads under
+`~/projects` appear beside Claude sessions, with a provider filter in the mobile app. New
+sessions can use the built-in `supersol` and `superastra` presets, which reproduce the local
+shell aliases without trying to execute aliases from a non-interactive process.
+
+Session discovery uses filesystem events for prompt updates and also performs startup and
+periodic reconciliation, so a dropped filesystem event or a session created while Portable was
+offline is repaired automatically. Codex databases and rollout files are always read-only;
+mutations go through the official app-server protocol.
+
+See [Codex session support](docs/codex-sessions.md) for the provider, migration, safety, and
+verification details.
 
 ---
 

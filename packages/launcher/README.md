@@ -1,7 +1,8 @@
 # @vgit2/launcher — the `portable` CLI (local-first launcher / tunnel-router)
 
 One command runs the local-first PC runtime: it finds your Anthropic + GitHub
-credentials (or logs you in right in the terminal), spawns the api on loopback,
+credentials (or logs you in right in the terminal), detects the local Codex CLI,
+spawns the api on loopback,
 opens a Cloudflare tunnel, mints the data-path JWT itself, and shows a **pairing
 QR** you scan from the Portable mobile app. No cloud login on the PC — the launcher
 owns a per-install `JWT_SECRET` and the api validates the token locally (rev6).
@@ -73,6 +74,29 @@ spawns:
 Discovered/obtained credentials are written into the SAME secret-store keys + env
 the api child reads, so the api picks them up with no extra wiring.
 
+## Codex CLI and presets (macOS)
+
+Codex support is optional. At startup Portable probes the native `codex` executable
+with `codex --version`. A missing or broken executable prints setup guidance and does
+not block Claude-only startup. Install the CLI with the current
+[official OpenAI command](https://developers.openai.com/codex/cli/):
+
+```bash
+npm install -g @openai/codex
+```
+
+Portable does not try to spawn zsh aliases. The `supersol` and `superastra` choices
+are translated to app-server configuration and the detected `codex` executable is
+used for both. Their built-in mappings preserve the current model, `cliproxy`
+provider, ultra effort, context-window, and compaction settings. Portable starts
+Codex with workspace isolation and approval prompts; choosing bypass permissions is
+the explicit path to full filesystem access. Set `CODEX_PRESETS_JSON` to replace the mapping.
+
+`CODEX_HOME` and provider environment variables pass straight through to the local
+api child. Portable does not read or persist their values. Keep credentials out of
+`CODEX_PRESETS_JSON`; provider authentication belongs in the Codex CLI configuration
+or provider environment.
+
 ## Prerequisites
 
 - **Bun** — <https://bun.sh> (runs the launcher + the api; this is a Bun monorepo).
@@ -88,7 +112,7 @@ the api child reads, so the api picks them up with no extra wiring.
   MCP). On bare Debian/Ubuntu you may need a one-time
   `sudo playwright install-deps chromium` for system libraries (the launcher prints
   the hint).
-- **For AI** — a Claude subscription (the `claude` CLI) OR `ANTHROPIC_API_KEY`.
+- **For AI** — a Claude subscription or `ANTHROPIC_API_KEY`, and/or a local Codex CLI login.
 
 **Platforms:** macOS, Linux, and Windows. On Windows cloudflared is often installed
 (winget/MSI) without being added to PATH, so the launcher also probes the default
@@ -106,7 +130,10 @@ install dirs (`%ProgramFiles(x86)%\cloudflared`, the winget Links dir, scoop shi
 | `PORTABLE_TUNNEL_PROVIDER` | `ngrok` to use ngrok instead of cloudflared (same as the `--ngrok` flag). Default cloudflared. |
 | `PORTABLE_NGROK_BIN`       | Full path to an `ngrok` binary (else resolved on PATH / win32 probe). `--ngrok` only.          |
 | `NGROK_AUTHTOKEN`          | ngrok authtoken; satisfies the `--ngrok` auth preflight (else a configured ngrok authtoken).   |
-| `WORKSPACE_DIR`            | The dir whose git repos Portable operates on (forwarded to the api child).                     |
+| `WORKSPACE_DIR`            | The repo root Portable scans. On macOS it defaults to `~/projects` when that directory exists. |
+| `CODEX_BIN`                | Optional Codex executable override. A detected native executable is otherwise forwarded.       |
+| `CODEX_HOME`               | Optional Codex home/config location, forwarded unchanged and never persisted by Portable.      |
+| `CODEX_PRESETS_JSON`       | Optional JSON replacement for the built-in `supersol` and `superastra` preset mapping.         |
 
 ## Modules
 
@@ -120,6 +147,7 @@ install dirs (`%ProgramFiles(x86)%\cloudflared`, the winget Links dir, scoop shi
 | `InteractiveCredentialLogin.ts` / `prepareCredentials.ts`            | Login fallback (Claude `setup-token`, GitHub device flow) + the boot orchestrator over discovery+login. |
 | `ApiProcess.ts`                                                      | Spawn + supervise the api child; `waitForHealth` poller.                                                |
 | `ChromiumProvisioner.ts` / `CloudflaredProvisioner.ts`               | Auto-provision the Playwright Chromium + the cloudflared binary.                                        |
+| `CodexCapability.ts`                                                 | Optional native Codex executable/version probe and alias-safe preset mapping.                           |
 | `CloudflaredTunnel.ts` / `TunnelRouter.ts`                           | Spawn/supervise cloudflared; route each public URL to the registration agent.                           |
 | `TunnelRegistrationAgent.ts`                                         | Register/heartbeat `pcId → tunnel URL` with the relay (pcId-keyed, no Clerk).                           |
 | `TunnelHealthMonitor.ts`                                             | Self-heal: probe the public relay path and cycle cloudflared on a stale gateway mapping.                |
