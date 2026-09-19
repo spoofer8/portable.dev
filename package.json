@@ -6,6 +6,9 @@
   "workspaces": [
     "packages/*"
   ],
+  "overrides": {
+    "expo-modules-jsi": "56.0.13"
+  },
   "trustedDependencies": [
     "@sentry/cli"
   ],
@@ -84,5 +87,8 @@
       "prettier --write"
     ]
   },
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "patchedDependencies": {
+    "@bacons/apple-targets@4.0.7": "patches-bun/@bacons%2Fapple-targets@4.0.7.patch"
+  }
 }

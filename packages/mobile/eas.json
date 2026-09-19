@@ -1,25 +1,24 @@
 {
   "cli": {
     "version": ">= 18.0.0",
-    "appVersionSource": "local"
+    "appVersionSource": "remote"
   },
   "build": {
-    "production": {
-      "autoIncrement": false,
+    "preview": {
+      "distribution": "internal",
+      "channel": "preview",
+      "environment": "preview",
       "ios": {
         "credentialsSource": "remote"
-      },
-      "android": {
-        "credentialsSource": "local",
-        "buildType": "app-bundle"
       }
-    }
-  },
-  "submit": {
+    },
     "production": {
+      "distribution": "store",
+      "channel": "production",
+      "environment": "production",
+      "autoIncrement": true,
       "ios": {
-        "ascAppId": "6758861546",
-        "appleTeamId": "R78F2929PW"
+        "credentialsSource": "remote"
       }
     }
   }

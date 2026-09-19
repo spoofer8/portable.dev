@@ -28,15 +28,17 @@ jest.mock('react-native-mmkv', () => {
 });
 
 import {
-  MOBILE_SENTRY_DSN,
   resolveSentryDsn,
   isSentryTestEnabled,
+  redactSentryText,
+  sanitizeSentryAttributes,
   type SentryEnv,
 } from '../src/features/observability/sentryConfig';
 import { initSentry, getSentryRuntimeInfo } from '../src/features/observability/initSentry';
 import { AppErrorBoundary, ErrorFallback } from '../src/features/observability/AppErrorBoundary';
 import { useSentryTest } from '../src/features/observability/useSentryTest';
 import { SentryTestScreen } from '../src/features/observability/SentryTestScreen';
+import { socketLog } from '../src/features/socket/socketLog';
 
 const SAFE_AREA_METRICS = {
   insets: { top: 0, bottom: 0, left: 0, right: 0 },
@@ -60,17 +62,17 @@ describe('resolveSentryDsn', () => {
     expect(resolveSentryDsn(true, env())).toBeUndefined();
   });
 
-  it('dev + EXPO_PUBLIC_ENABLE_SENTRY_TEST → the bundled DSN', () => {
-    expect(resolveSentryDsn(true, env({ enableTest: true }))).toBe(MOBILE_SENTRY_DSN);
+  it('dev test mode still requires an explicit DSN', () => {
+    expect(resolveSentryDsn(true, env({ enableTest: true }))).toBeUndefined();
   });
 
-  it('a release build (dev=false) → the bundled DSN automatically', () => {
-    expect(resolveSentryDsn(false, env())).toBe(MOBILE_SENTRY_DSN);
+  it('a release build without a configured DSN stays disabled', () => {
+    expect(resolveSentryDsn(false, env())).toBeUndefined();
   });
 
-  it('a blank/whitespace override falls through to the dev/release rule', () => {
+  it('a blank/whitespace override is treated as missing', () => {
     expect(resolveSentryDsn(true, env({ dsn: '   ' }))).toBeUndefined();
-    expect(resolveSentryDsn(false, env({ dsn: '' }))).toBe(MOBILE_SENTRY_DSN);
+    expect(resolveSentryDsn(false, env({ dsn: '' }))).toBeUndefined();
   });
 
   it('isSentryTestEnabled reads the flag', () => {
@@ -80,20 +82,83 @@ describe('resolveSentryDsn', () => {
 });
 
 describe('initSentry', () => {
-  it('calls Sentry.init (DSN resolves with __DEV__ false in jest) and reports active', () => {
-    // __DEV__ is false in jest.setup → getSentryDsn() returns the bundled DSN.
-    const started = initSentry();
+  it('calls Sentry.init with a configured DSN and reports active', () => {
+    const dsn = 'https://public@example.invalid/1';
+    const started = initSentry('mobile', dsn);
     expect(started).toBe(true);
     expect(Sentry.init).toHaveBeenCalledTimes(1);
     const opts = (Sentry.init as jest.Mock).mock.calls[0][0];
     // release/dist are deliberately UNSET (auto-detected from the native build).
     expect(opts.release).toBeUndefined();
     expect(opts.dist).toBeUndefined();
-    expect(opts.dsn).toBe(MOBILE_SENTRY_DSN);
+    expect(opts.dsn).toBe(dsn);
     expect(opts.initialScope.tags.service).toBe('mobile');
+    expect(opts.enableLogs).toBe(true);
+    expect(opts.enableAutoConsoleLogs).toBe(false);
+    expect(
+      opts.beforeSendLog({
+        level: 'warn',
+        message: 'retrying https://private.example/path',
+        attributes: { attempt: 2, token: 'secret-token' },
+      })
+    ).toEqual({
+      level: 'warn',
+      message: 'retrying [url]',
+      attributes: { attempt: 2 },
+    });
     // beforeSend drops non-error levels.
     expect(opts.beforeSend({ level: 'info' })).toBeNull();
     expect(opts.beforeSend({ level: 'error', extra: { a: 1 } })).toMatchObject({ level: 'error' });
+
+    const event = opts.beforeSend({
+      level: 'error',
+      message: 'failed for user@example.com at /Users/example/repo',
+      exception: { values: [{ type: 'Error', value: 'token=secret-token' }] },
+      breadcrumbs: [
+        {
+          message: 'request https://private.example/path',
+          data: { status: 'failed', token: 'secret-token' },
+        },
+      ],
+      tags: { service: 'mobile', token: 'secret-token' },
+      user: { id: 'private-user' },
+      request: { url: 'https://private.example/path' },
+      contexts: { device: { name: 'Umair Phone' } },
+      extra: { prompt: 'private prompt' },
+    });
+
+    expect(event).toMatchObject({
+      message: 'failed for [email] at [path]',
+      exception: { values: [{ type: 'Error', value: 'token=[redacted]' }] },
+      breadcrumbs: [{ message: 'request [url]', data: { status: 'failed' } }],
+      tags: { service: 'mobile' },
+    });
+    expect(event).not.toHaveProperty('user');
+    expect(event).not.toHaveProperty('request');
+    expect(event).not.toHaveProperty('contexts');
+    expect(event).not.toHaveProperty('extra');
+  });
+
+  it('redacts sensitive log fields while preserving operational state', () => {
+    expect(
+      sanitizeSentryAttributes({
+        attempt: 2,
+        reconnect: true,
+        token: 'secret-token',
+        path: '/Users/example/private/repo',
+        reason: 'transport closed at https://private.example/path',
+      })
+    ).toEqual({
+      attempt: 2,
+      reconnect: true,
+      reason: 'transport closed at [url]',
+    });
+    expect(redactSentryText('Bearer secret-token at /Users/example/private/repo')).toBe(
+      'Bearer [redacted] at [path]'
+    );
+    expect(redactSentryText('email=user@example.com token=secret-token password: hunter2')).toBe(
+      'email=[email] token=[redacted] password=[redacted]'
+    );
   });
 
   it('getSentryRuntimeInfo reflects the active client options', () => {
@@ -109,6 +174,26 @@ describe('initSentry', () => {
       environment: 'ios',
       release: 'dev.portable.app@1.5.0+1042',
       dist: '1042',
+    });
+  });
+});
+
+describe('structured Sentry logs', () => {
+  it('sends allowlisted socket state without identifiers or paths', () => {
+    socketLog('connect', {
+      reconnect: true,
+      id: 'socket-secret',
+      path: '/t/private-machine',
+    });
+
+    expect(Sentry.addBreadcrumb).toHaveBeenCalledWith({
+      category: 'socket',
+      message: 'connect',
+      level: 'info',
+      data: { reconnect: true },
+    });
+    expect(Sentry.logger.info).toHaveBeenCalledWith('[socket] connect', {
+      reconnect: true,
     });
   });
 });

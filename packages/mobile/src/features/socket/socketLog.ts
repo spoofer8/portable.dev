@@ -9,27 +9,34 @@
  */
 import * as Sentry from '@sentry/react-native';
 
+import { redactSentryText, sanitizeSentryAttributes } from '@/features/observability/sentryConfig';
+
 export type SocketLogLevel = 'info' | 'warning' | 'error';
 
-/** Suppress the console channel under Jest only — keep it in dev + release builds. */
+/** Keep diagnostics in development, but never place connection metadata in release device logs. */
 const IS_TEST = typeof process !== 'undefined' && process.env?.NODE_ENV === 'test';
+const SHOULD_LOG_TO_CONSOLE = __DEV__ && !IS_TEST;
 
 export function socketLog(
   event: string,
   data?: Record<string, unknown>,
   level: SocketLogLevel = 'info'
 ): void {
-  const tag = `[socket] ${event}`;
+  const safeEvent = redactSentryText(event);
+  const tag = `[socket] ${safeEvent}`;
+  const sentryData = sanitizeSentryAttributes(data);
   // Console — the primary channel while debugging a dev build (Metro / Xcode /
-  // logcat). Silenced only under Jest so the test suite stays clean.
-  if (!IS_TEST) {
-    if (level === 'error') console.error(tag, data ?? '');
-    else if (level === 'warning') console.warn(tag, data ?? '');
-    else console.log(tag, data ?? '');
+  // logcat). It receives the same sanitized fields as Sentry and is disabled in release.
+  if (SHOULD_LOG_TO_CONSOLE) {
+    if (level === 'error') console.error(tag, sentryData ?? '');
+    else if (level === 'warning') console.warn(tag, sentryData ?? '');
+    else console.log(tag, sentryData ?? '');
   }
-  // Sentry breadcrumb — so the trail survives into a release build's reports.
   try {
-    Sentry.addBreadcrumb({ category: 'socket', message: event, level, data });
+    Sentry.addBreadcrumb({ category: 'socket', message: safeEvent, level, data: sentryData });
+    if (level === 'error') Sentry.logger.error(tag, sentryData);
+    else if (level === 'warning') Sentry.logger.warn(tag, sentryData);
+    else Sentry.logger.info(tag, sentryData);
   } catch {
     // Sentry not initialized (plain `expo start` with no DSN) — the console suffices.
   }

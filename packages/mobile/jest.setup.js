@@ -59,6 +59,11 @@ jest.mock('@sentry/react-native', () => {
     captureException: jest.fn(() => 'test-event-id'),
     captureMessage: jest.fn(() => 'test-event-id'),
     addBreadcrumb: jest.fn(),
+    logger: {
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    },
     setUser: jest.fn(),
     setTag: jest.fn(),
     setContext: jest.fn(),

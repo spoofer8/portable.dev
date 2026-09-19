@@ -10,8 +10,8 @@
     "icon": "./assets/images/icon.png",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "dev.portable.app",
-      "appleTeamId": "R78F2929PW",
+      "bundleIdentifier": "cloud.umair.portable",
+      "appleTeamId": "37A9CY6R6P",
       "googleServicesFile": "./GoogleService-Info.plist",
       "icon": {
         "light": "./assets/images/icon.png",
@@ -19,7 +19,12 @@
       },
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
-        "NSSupportsLiveActivities": true
+        "NSSupportsLiveActivities": true,
+        "NSSpeechRecognitionUsageDescription": "Portable transcribes your speech so you can dictate messages — on-device by default, or off-device when on-device recognition isn't available or you choose Cloud mode.",
+        "NSMicrophoneUsageDescription": "Portable uses the microphone so you can dictate messages."
+      },
+      "runtimeVersion": {
+        "policy": "fingerprint"
       }
     },
     "android": {
@@ -83,15 +88,14 @@
         "@sentry/react-native/expo",
         {
           "url": "https://sentry.io/",
-          "note": "Use SENTRY_AUTH_TOKEN env to authenticate with Sentry (NEVER put the token here).",
-          "organization": "oliver-volter-maybe",
-          "project": "4511016585199616"
+          "note": "Use SENTRY_AUTH_TOKEN, SENTRY_ORG, and SENTRY_PROJECT environment variables during builds. Never put the token here."
         }
       ],
       "@bacons/apple-targets",
       "@react-native-firebase/app",
       "@react-native-firebase/messaging",
-      "./plugins/withModularHeaders"
+      "./plugins/withModularHeaders",
+      "./plugins/withIosSceneLifecycle"
     ],
     "experiments": {
       "typedRoutes": false
@@ -99,9 +103,31 @@
     "extra": {
       "router": {},
       "eas": {
-        "projectId": "60ecdd1a-87ba-468e-81a3-80a11b107a53"
+        "build": {
+          "experimental": {
+            "ios": {
+              "appExtensions": [
+                {
+                  "bundleIdentifier": "cloud.umair.portable.widget",
+                  "targetName": "ClaudeWidgets"
+                }
+              ]
+            }
+          }
+        },
+        "projectId": "114bef50-b96c-4db6-9c47-3c610bcdf321"
       }
     },
-    "owner": "volter-ai"
+    "owner": "spo0fer",
+    "updates": {
+      "url": "https://u.expo.dev/114bef50-b96c-4db6-9c47-3c610bcdf321",
+      "checkAutomatically": "ON_LOAD",
+      "fallbackToCacheTimeout": 0,
+      "codeSigningCertificate": "./certs/certificate.pem",
+      "codeSigningMetadata": {
+        "keyid": "main",
+        "alg": "rsa-v1_5-sha256"
+      }
+    }
   }
 }

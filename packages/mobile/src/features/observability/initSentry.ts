@@ -23,7 +23,12 @@ import { Platform } from 'react-native';
 
 import { buildSentryConfig } from '@vgit2/shared/sentry';
 
-import { getSentryDsn, getSentryEnvironment } from './sentryConfig';
+import {
+  getSentryDsn,
+  getSentryEnvironment,
+  redactSentryText,
+  sanitizeSentryAttributes,
+} from './sentryConfig';
 
 let initialized = false;
 
@@ -31,14 +36,14 @@ let initialized = false;
  * Initialize Sentry once. Safe to call repeatedly (guarded). Returns whether a
  * client was actually started (a DSN resolved).
  */
-export function initSentry(service = 'mobile'): boolean {
+export function initSentry(service = 'mobile', dsn = getSentryDsn()): boolean {
   if (initialized) return Boolean(Sentry.getClient());
 
   // Bucket events by platform (ios|android) when no explicit environment is set
-  // (the CI pipeline sets `VITE_SENTRY_ENVIRONMENT=android`).
+  // (the CI pipeline may set `EXPO_PUBLIC_SENTRY_ENVIRONMENT=android`).
   const environment = getSentryEnvironment() ?? Platform.OS;
 
-  const config = buildSentryConfig({ service, dsn: getSentryDsn(), environment });
+  const config = buildSentryConfig({ service, dsn, environment });
   if (!config) return false; // No DSN → skip (plain dev).
 
   initialized = true;
@@ -47,15 +52,60 @@ export function initSentry(service = 'mobile'): boolean {
     environment: config.environment,
     initialScope: config.initialScope,
     sendDefaultPii: false,
+    enableLogs: true,
+    enableAutoConsoleLogs: false,
     // Crash/error reporting only — no tracing, no Session Replay, no navigation
     // instrumentation (omit `tracesSampleRate`, `release`, `dist`).
     beforeSend(event) {
-      // Only forward error/fatal; drop `extra` but KEEP breadcrumbs for debugging
-      // context.
-      if (event.level !== 'error' && event.level !== 'fatal') return null;
+      // Exception events do not always carry an explicit level. Keep those, plus
+      // explicit error/fatal events, and discard lower-severity message events.
+      if (!event.exception && event.level !== 'error' && event.level !== 'fatal') return null;
+
+      if (event.message) event.message = redactSentryText(event.message);
+      if (event.transaction) event.transaction = redactSentryText(event.transaction);
+      if (event.logentry?.message) {
+        event.logentry.message = redactSentryText(event.logentry.message);
+        delete event.logentry.params;
+      }
+      if (event.exception?.values) {
+        event.exception.values = event.exception.values.map((value) => ({
+          ...value,
+          value: value.value ? redactSentryText(value.value) : value.value,
+        }));
+      }
+      if (event.breadcrumbs) {
+        event.breadcrumbs = event.breadcrumbs.map((breadcrumb) => ({
+          ...breadcrumb,
+          message: breadcrumb.message ? redactSentryText(breadcrumb.message) : breadcrumb.message,
+          data: sanitizeSentryAttributes(breadcrumb.data),
+        }));
+      }
+      event.tags = sanitizeSentryAttributes(event.tags);
       delete event.extra;
+      delete event.user;
+      delete event.request;
+      delete event.contexts;
       return event;
     },
+    beforeBreadcrumb(breadcrumb) {
+      return {
+        ...breadcrumb,
+        message: breadcrumb.message ? redactSentryText(breadcrumb.message) : breadcrumb.message,
+        data: sanitizeSentryAttributes(breadcrumb.data),
+      };
+    },
+    beforeSendLog(log) {
+      return {
+        ...log,
+        message: redactSentryText(log.message),
+        attributes: sanitizeSentryAttributes(log.attributes),
+      };
+    },
+  });
+  Sentry.logger.info('mobile.initialized', {
+    service,
+    platform: Platform.OS,
+    environment,
   });
   return true;
 }

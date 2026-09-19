@@ -1,5 +1,4 @@
-# Public-repo CI (volter-ai/portable.dev). Lives ONLY in the public mirror.
-# Minimal, contains no secrets. Build + typecheck + tests + secret scan.
+# Public-repo CI. Minimal, with no runtime or deployment secrets.
 name: CI
 
 on:
@@ -12,29 +11,28 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: latest
+          bun-version: 1.3.13
       - name: Install
-        run: bun install --frozen-lockfile || bun install
+        run: bun install --frozen-lockfile
       - name: Typecheck
         run: bun run typecheck
       - name: Mobile tests
-        # jest-expo distributes test files across workers by cached timing, so a cluster
-        # of socket/api/voice suites can flake on a hostile schedule yet pass on a re-run
-        # (the full run is the source of truth). DO NOT add --runInBand — it serializes the
-        # shared onlineManager singleton and makes flakes worse. Re-run once on failure.
+        # The attachment suite is order-sensitive when it shares a Jest process with
+        # the full app suite. Run it in a fresh process while still covering every test.
         run: |
           cd packages/mobile
-          bun run test || { echo "::warning::mobile tests flaked; re-running once"; bun run test; }
+          bun run test -- --runInBand --forceExit --testPathIgnorePatterns=chat-attachments.test.tsx
+          bun run test -- --runInBand --forceExit __tests__/chat-attachments.test.tsx
       - name: Expo bundle check
-        run: cd packages/mobile && bunx expo export --platform all || true
+        run: cd packages/mobile && bunx expo export --platform ios
 
   secret-scan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # NOTE: gitleaks/gitleaks-action@v2 requires a PAID GITLEAKS_LICENSE for
       # organization-owned repos (volter-ai). The gitleaks CLI itself is free, so
       # run it directly with the shipped .gitleaks.toml — the SAME invocation the

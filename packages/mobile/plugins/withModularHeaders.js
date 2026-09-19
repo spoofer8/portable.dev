@@ -1,5 +1,5 @@
 /**
- * Expo config plugin — adds `use_modular_headers!` to the generated iOS Podfile.
+ * Expo config plugin for CocoaPods settings not covered by the generated Podfile.
  *
  * WHY: the Firebase iOS SDK 11 (pulled in by `@react-native-firebase/messaging`
  * for the iOS FCM-token fix) ships `FirebaseCoreInternal` as a **Swift** pod that
@@ -17,30 +17,52 @@
  * module maps so the Swift Firebase pods can import them as static libraries.
  *
  * `expo-build-properties` only exposes `modular_headers` PER-POD inside `extraPods`
- * (not a global `use_modular_headers!`), so this dangerous-mod is the clean CNG way
- * to add the global directive. It is idempotent and re-applies on every prebuild
- * (the Podfile is regenerated each time).
+ * (not a global `use_modular_headers!`), so this config plugin adds the global
+ * directive. It is idempotent and re-applies on every prebuild.
  */
-const { withDangerousMod } = require('expo/config-plugins');
-const fs = require('fs');
-const path = require('path');
+const { CodeGenerator, withPodfile, withPodfileProperties } = require('expo/config-plugins');
 
 const DIRECTIVE = 'use_modular_headers!';
+const IOS_DEPLOYMENT_TARGET = '16.4';
+const DEPLOYMENT_TARGET_TAG = 'portable-xcode-27-resource-bundle-targets';
+
+const RESOURCE_BUNDLE_DEPLOYMENT_TARGET = [
+  `    minimum_ios_deployment_target = Gem::Version.new(podfile_properties['ios.deploymentTarget'] || '${IOS_DEPLOYMENT_TARGET}')`,
+  '    installer.pods_project.targets.each do |pod_target|',
+  "      next unless pod_target.respond_to?(:product_type) && pod_target.product_type == 'com.apple.product-type.bundle'",
+  '      pod_target.build_configurations.each do |build_configuration|',
+  "        current_target = build_configuration.build_settings['IPHONEOS_DEPLOYMENT_TARGET']",
+  '        next if current_target && Gem::Version.new(current_target) >= minimum_ios_deployment_target',
+  "        build_configuration.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = minimum_ios_deployment_target.to_s",
+  '      end',
+  '    end',
+].join('\n');
+
+function patchPodfile(contents) {
+  if (!contents.includes(DIRECTIVE)) {
+    contents = contents.replace(/^(platform :ios.*$)/m, `$1\n${DIRECTIVE}`);
+  }
+
+  return CodeGenerator.mergeContents({
+    tag: DEPLOYMENT_TARGET_TAG,
+    src: contents,
+    newSrc: RESOURCE_BUNDLE_DEPLOYMENT_TARGET,
+    anchor: /^\s*post_install do \|installer\|/m,
+    offset: 1,
+    comment: '#',
+  }).contents;
+}
 
 module.exports = function withModularHeaders(config) {
-  return withDangerousMod(config, [
-    'ios',
-    (cfg) => {
-      const podfilePath = path.join(cfg.modRequest.platformProjectRoot, 'Podfile');
-      let contents = fs.readFileSync(podfilePath, 'utf8');
+  config = withPodfileProperties(config, (cfg) => {
+    cfg.modResults['ios.deploymentTarget'] = IOS_DEPLOYMENT_TARGET;
+    return cfg;
+  });
 
-      if (!contents.includes(DIRECTIVE)) {
-        // Insert as a top-level directive right after the `platform :ios …` line.
-        contents = contents.replace(/^(platform :ios.*$)/m, `$1\n${DIRECTIVE}`);
-        fs.writeFileSync(podfilePath, contents, 'utf8');
-      }
-
-      return cfg;
-    },
-  ]);
+  return withPodfile(config, (cfg) => {
+    cfg.modResults.contents = patchPodfile(cfg.modResults.contents);
+    return cfg;
+  });
 };
+
+module.exports.patchPodfile = patchPodfile;

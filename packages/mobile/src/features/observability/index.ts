@@ -13,7 +13,6 @@ export { SentryTestScreen } from './SentryTestScreen';
 export { useSentryTest } from './useSentryTest';
 export type { SentryTestDeps, SentryTestViewModel } from './useSentryTest';
 export {
-  MOBILE_SENTRY_DSN,
   resolveSentryDsn,
   getSentryDsn,
   isSentryTestEnabled,

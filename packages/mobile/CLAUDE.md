@@ -841,18 +841,25 @@ web-only extras aren't wiped. **CSS `135deg` gradient ↔ RN `start={{0,0}} end=
 
 ## Sentry (`src/features/observability/`)
 
-`@sentry/react-native@8.14.0` (pinned exactly — Expo's bundled `~7.11.0` lacks the SDK-56
-`expo/fetch` fix). The config plugin `@sentry/react-native/expo` (in `app.json`) injects the native
-source-map upload build phases on `expo prebuild` — NEVER put an `authToken` key there. `metro.config.js`
-swaps `getDefaultConfig` → `getSentryExpoConfig` (installs the Debug-ID serializer; **never set
-`config.serializer.customSerializer`** or it's clobbered). `initSentry()` runs at module scope in
-`app/_layout.tsx` with `export default Sentry.wrap(RootLayout)` + an outermost `AppErrorBoundary`;
-it deliberately leaves `release`/`dist` UNSET (auto-detected from the native build so events ↔ maps
-match). Crash/error only — no tracing/Replay. DSN gating: `EXPO_PUBLIC_SENTRY_DSN` wins; else a
-release build (or `EXPO_PUBLIC_ENABLE_SENTRY_TEST=true`) falls back to the bundled public DSN; else
-plain `expo start` → undefined → init skipped. CI source-map upload writes
-`packages/mobile/.env.sentry-build-plugin` from the repo-level `SENTRY_AUTH_TOKEN` secret before
-`eas build --local` (the isolated native build-phase shell doesn't reliably inherit CI env).
+`@sentry/react-native@8.14.0` is pinned exactly because Expo's bundled `~7.11.0` lacks the SDK-56
+`expo/fetch` fix. The `@sentry/react-native/expo` config plugin in `app.json` injects native
+source-map upload build phases on `expo prebuild`. It reads `SENTRY_ORG`, `SENTRY_PROJECT`, and
+`SENTRY_AUTH_TOKEN` from the build environment. Keep the token out of `app.json` and every
+`EXPO_PUBLIC_*` variable. `metro.config.js` uses `getSentryExpoConfig` for Debug-ID source maps;
+never replace `config.serializer.customSerializer`.
+
+`initSentry()` runs at module scope in `app/_layout.tsx`, with `Sentry.wrap(RootLayout)` and an
+outermost `AppErrorBoundary`. It leaves `release` and `dist` unset so the SDK and uploader agree on
+native release identity. `EXPO_PUBLIC_SENTRY_DSN` is required to enable reporting; a build without
+it skips Sentry instead of sending events to another fork's project. Tracing and Replay remain off.
+Structured socket logs use an allowlist and redact URLs, filesystem paths, bearer tokens, prompts,
+responses, and connection identifiers before they reach Sentry.
+
+Native EAS builds upload their maps through the config plugin. OTA publication needs a separate
+upload after `eas update`: `.github/workflows/mobile-release.yml` runs
+`bunx sentry-expo-upload-sourcemaps dist` with the same Sentry organization, project, and token.
+Keep this explicit step beside the OTA command; publishing an update alone does not guarantee
+symbolicated OTA stacks.
 
 ## Commands
 
@@ -884,27 +891,54 @@ Custom native modules ⇒ a dev build (`expo run:ios` / `expo run:android` / EAS
 - App icons + splash are brand assets in `assets/images/`, wired in `app.json`
   (`ios.icon.{light,dark}`, `adaptive-icon.png`, the `expo-splash-screen` config plugin).
 
-## Store release pipeline (CI → TestFlight + Google Play)
+## Mobile delivery pipeline (EAS Update + EAS Build)
 
-`.github/workflows/release-mobile.yml`. Trigger: a `pull_request` targeting `live` that touches
-`packages/mobile/**` (+ a `workflow_dispatch` escape hatch). Jobs: `version-ios`/`version-android`
-query TestFlight/Play for the highest existing build number → `version` publishes
-`max(store) + 1` (floored at `1000`, overridable; falls back to `1000 + run_number` if both queries
-are unavailable — detection can never fail the run) → `build-ios` (`macos-26`, EAS local, SDK major
-≥ 26) → `submit-testflight` (fastlane pilot, a separate job so a flaky upload re-runs without a
-rebuild) ‖ `build-android` (EAS local → Play internal `draft`).
+The fork owns Expo project `@spo0fer/portable-mobile` (`114bef50-b96c-4db6-9c47-3c610bcdf321`).
+`.github/workflows/mobile-release.yml` validates each delivery with a frozen install, repository
+typecheck, mobile Jest suite, and iOS Expo export. A push to `main` then targets `preview`:
 
-- **iOS signing = EAS remote credentials** (cert + profile on expo.dev, fetched via `EXPO_TOKEN`).
-  ASC app id `6758861546`, team `R78F2929PW`. **`dev.portable.app` is a shared bundle id — run any
-  `eas credentials`/`eas build` with `EXPO_NO_CAPABILITY_SYNC=1`** (EAS's auto capability-sync tries
-  to turn off Sign-in-with-Apple / Associated Domains and Apple rejects it). The RN app doesn't need
-  the native capabilities (Apple sign-in goes through Clerk web OAuth).
-- **Android signing = the keystore GitHub secrets** (`android` environment) →
-  `credentials.json` (`eas.json` `credentialsSource: "local"`, `buildType: "app-bundle"`).
-- `eas.json`: `appVersionSource: "local"` + `autoIncrement: false`; the build number is injected
-  into `app.json` at build time (ephemeral, never committed).
-- **Secrets layout:** the `iOS` env (`ASC_*`), the `android` env (keystore +
-  `GOOGLE_PLAY_SERVICE_ACCOUNT_JSON`), and repo-level shared (`EXPO_TOKEN` secret +
-  `SENTRY_AUTH_TOKEN` secret; the four `EXPO_PUBLIC_*` as public repo **Variables**, since they're
-  inlined into the shipped bundle — a preflight fails loud on a missing one).
-- Firebase config files are committed (no CI secret). No Skia, no `eas-build-post-install` hook.
+- JavaScript-only changes publish an iOS OTA update to the `preview` channel, then explicitly
+  upload `dist` source maps with `sentry-expo-upload-sourcemaps`.
+- Native-impacting changes start an iOS EAS build with the `preview` profile. The classifier treats
+  dependency manifests, Expo/EAS config, native plugins/modules/targets, assets, Metro/Babel config,
+  the mobile gitignore, and Bun patches as native inputs.
+- `workflow_dispatch` can target `preview` or `production`; set `native_build` to start a binary
+  build instead of an OTA update. Both GitHub deployment environments accept only the `main`
+  branch, and the delivery job also rejects manual dispatches from any other ref.
+
+`preview` builds use internal distribution and the preview update channel. `production` builds use
+store distribution, the production channel, remote app-version management, and automatic build
+number increments. Production submission is manual while the fork is being tested. Submit the
+resulting build to App Store Connect/TestFlight after verification; automated submission remains
+deferred until that flow has been exercised successfully.
+
+`ios.runtimeVersion.policy` is `fingerprint`. An OTA update is offered only to installed binaries
+with the same native fingerprint. Any native dependency or configuration change therefore needs a
+new EAS build before its JavaScript can reach that device. Keep the workflow's native-input list in
+sync when adding another source of native build changes. The native app pins
+`certs/certificate.pem`; CI signs OTA manifests with the matching private key from the
+`EAS_UPDATE_PRIVATE_KEY` GitHub secret.
+
+Configure delivery credentials in both systems:
+
+Run `./scripts/setup-mobile-delivery.sh` from the repository root for the guided setup. It opens
+the Sentry and Expo pages, reads secret values with hidden input, writes them directly to the
+protected GitHub environments and EAS environments, and can start the first preview build.
+
+- GitHub `preview` and `production` Environment Secrets: `EXPO_TOKEN`, `SENTRY_AUTH_TOKEN`,
+  `EAS_UPDATE_PRIVATE_KEY`, and `GOOGLE_SERVICE_INFO_PLIST_BASE64`. Keep deployment credentials
+  out of repository-level secrets so another workflow cannot bypass the environment branch gate.
+  Keep the local signing key under the ignored `packages/mobile/.secrets/eas-updates/` directory
+  and back it up securely.
+- GitHub Variables: `SENTRY_ORG`, `SENTRY_PROJECT`, `EXPO_PUBLIC_SENTRY_DSN`,
+  `EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY`, and `EXPO_PUBLIC_GATEWAY_URL`. Add the optional `_DEV`
+  Clerk/gateway values and `EXPO_PUBLIC_GITHUB_APP_NAME[_DEV]` when those overrides are used.
+- EAS `preview` and `production` environments: `SENTRY_AUTH_TOKEN`, `SENTRY_ORG`,
+  `SENTRY_PROJECT`, `EXPO_PUBLIC_SENTRY_ENVIRONMENT` (`preview` or `production`), and the matching
+  `EXPO_PUBLIC_*` values. EAS needs its own copies because a remote builder does not inherit
+  GitHub's job environment.
+
+EAS stores the iOS signing certificate and provisioning profile remotely. The first preview build
+may require an interactive `eas build --profile preview --platform ios` to finish Apple credential
+setup. After credentials exist, CI starts remote builds non-interactively and waits for EAS to
+report the final result, so compile, signing, or source-map failures fail the GitHub Actions run.

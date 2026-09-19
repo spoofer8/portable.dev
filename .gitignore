@@ -89,6 +89,9 @@ web-build/
 
 .env.*
 
+# Local Firebase configuration. CI reconstructs this from a GitHub secret.
+packages/mobile/GoogleService-Info.plist
+
 # Dangerous utility scripts
 kill-ports.sh
 

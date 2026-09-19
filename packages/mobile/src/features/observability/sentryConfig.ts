@@ -7,18 +7,6 @@
  * `process.env` in tests — babel-preset-expo inlines `EXPO_PUBLIC_*`).
  */
 
-/**
- * Sentry DSN — a PUBLIC client identifier (safe to bundle; it only authorizes
- * SENDING events to this project, never reading them). Sentry org
- * `oliver-volter-maybe`, project `4511016585199616`, so RN
- * events land bucketed by the `service: 'mobile'` tag and the
- * `ios`/`android` environment. CI may override it with `EXPO_PUBLIC_SENTRY_DSN`;
- * otherwise this bundled value is used so a release build reports with zero env
- * setup.
- */
-export const MOBILE_SENTRY_DSN =
-  'https://3698ef423005e5ccbcdda38f9d30795f@o4507742853070848.ingest.us.sentry.io/4511016585199616';
-
 /** Env snapshot consumed by the pure resolvers (injectable for tests). */
 export interface SentryEnv {
   /** `EXPO_PUBLIC_SENTRY_DSN` — CI override; always wins when set. */
@@ -27,6 +15,53 @@ export interface SentryEnv {
   enableTest: boolean;
   /** `EXPO_PUBLIC_SENTRY_ENVIRONMENT` — explicit environment override (else `Platform.OS`). */
   environment?: string;
+}
+
+const SAFE_LOG_ATTRIBUTES = new Set([
+  'attempt',
+  'attempts',
+  'code',
+  'connected',
+  'e2eConfigured',
+  'encrypted',
+  'environment',
+  'hasToken',
+  'level',
+  'platform',
+  'reason',
+  'reconnect',
+  'service',
+  'state',
+  'status',
+  'transport',
+]);
+
+export function redactSentryText(value: string): string {
+  return value
+    .replace(/\bBearer\s+\S+/gi, 'Bearer [redacted]')
+    .replace(
+      /\b(token|secret|password|authorization|api[_-]?key)\s*[:=]\s*["']?[^,\s"']+/gi,
+      '$1=[redacted]'
+    )
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '[email]')
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[token]')
+    .replace(/https?:\/\/\S+/gi, '[url]')
+    .replace(/\/(?:Users|home|private|var)\/\S+/g, '[path]')
+    .slice(0, 256);
+}
+
+export function sanitizeSentryAttributes(
+  attributes: Record<string, unknown> | undefined
+): Record<string, string | number | boolean> | undefined {
+  if (!attributes) return undefined;
+
+  const sanitized: Record<string, string | number | boolean> = {};
+  for (const [key, value] of Object.entries(attributes)) {
+    if (!SAFE_LOG_ATTRIBUTES.has(key)) continue;
+    if (typeof value === 'string') sanitized[key] = redactSentryText(value);
+    else if (typeof value === 'number' || typeof value === 'boolean') sanitized[key] = value;
+  }
+  return sanitized;
 }
 
 /**
@@ -50,19 +85,16 @@ export function isSentryTestEnabled(env: SentryEnv = readSentryEnv()): boolean {
 /**
  * Resolve which DSN (if any) the runtime SDK initializes with — the pure core.
  *
- *   1. `EXPO_PUBLIC_SENTRY_DSN` (CI override) always wins.
- *   2. Else, in a RELEASE build (`dev === false`) OR a dedicated Sentry-test build
- *      (`EXPO_PUBLIC_ENABLE_SENTRY_TEST=true`), fall back to the bundled DSN — so
- *      TestFlight/Play builds report automatically AND a local test build can opt in.
- *   3. Else (plain `expo start` dev) → `undefined` → `Sentry.init` is SKIPPED, so
- *      everyday Metro dev never floods Sentry (`buildSentryConfig` returns null).
+ * `EXPO_PUBLIC_SENTRY_DSN` is required in every build that should report errors.
+ * Keeping the DSN out of the repository prevents forks and local builds from
+ * sending events to somebody else's project. Builds without the variable skip
+ * Sentry entirely.
  */
 export function resolveSentryDsn(
-  dev: boolean,
+  _dev: boolean,
   env: SentryEnv = readSentryEnv()
 ): string | undefined {
   if (env.dsn && env.dsn.trim() !== '') return env.dsn;
-  if (!dev || env.enableTest) return MOBILE_SENTRY_DSN;
   return undefined;
 }
 
