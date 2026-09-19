@@ -121,6 +121,8 @@ export interface LaunchdServiceDeps {
   daemonLogPath?: string;
   /** Command runner seam (defaults to {@link runCommandReal}). */
   runCommand?: (cmd: string, args: string[]) => Promise<RunCommandResult>;
+  /** Delay seam used while launchd finishes an asynchronous bootout. */
+  sleep?: (ms: number) => Promise<void>;
   /** Plist write seam (mkdir -p + write). */
   writeFile?: (p: string, content: string) => void;
   /** mkdir -p seam (the daemon-log dir — launchd won't create parent dirs). */
@@ -141,6 +143,7 @@ export class LaunchdServiceManager implements ServiceManager {
   private readonly uid: number;
   private readonly daemonLogPath: string;
   private readonly run: (cmd: string, args: string[]) => Promise<RunCommandResult>;
+  private readonly sleep: (ms: number) => Promise<void>;
   private readonly writeFile: (p: string, content: string) => void;
   private readonly ensureDir: (dir: string) => void;
   private readonly removeFile: (p: string) => void;
@@ -154,6 +157,7 @@ export class LaunchdServiceManager implements ServiceManager {
     this.uid = deps.uid ?? process.getuid?.() ?? 501;
     this.daemonLogPath = deps.daemonLogPath ?? defaultDaemonLogPath();
     this.run = deps.runCommand ?? runCommandReal;
+    this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.writeFile =
       deps.writeFile ??
       ((p, content) => {
@@ -199,12 +203,7 @@ export class LaunchdServiceManager implements ServiceManager {
     await this.launchctl(['enable', this.target]);
     // Reinstall idempotence: bootstrap errors on an already-loaded agent.
     await this.launchctl(['bootout', this.target]); // best-effort (not loaded = fine)
-    const bootstrap = await this.launchctl(['bootstrap', `gui/${this.uid}`, this.plistPath]);
-    if (bootstrap.code !== 0) {
-      throw new Error(
-        `launchctl bootstrap failed: ${(bootstrap.stderr || bootstrap.stdout).trim()}`
-      );
-    }
+    await this.bootstrapWithRetry();
     this.log('[service] installed + started (launchd LaunchAgent).');
   }
 
@@ -239,12 +238,26 @@ export class LaunchdServiceManager implements ServiceManager {
 
   async start(): Promise<void> {
     await this.launchctl(['enable', this.target]);
-    // Load if not loaded (already-loaded errors are fine), then poke it.
-    await this.launchctl(['bootstrap', `gui/${this.uid}`, this.plistPath]);
-    const kick = await this.launchctl(['kickstart', this.target]);
+    await this.bootstrapWithRetry();
+    const kick = await this.launchctl(['kickstart', '-k', this.target]);
     if (kick.code !== 0) {
       throw new Error(`launchctl kickstart failed: ${(kick.stderr || kick.stdout).trim()}`);
     }
+  }
+
+  private async bootstrapWithRetry(): Promise<void> {
+    let last: RunCommandResult | undefined;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      last = await this.launchctl(['bootstrap', `gui/${this.uid}`, this.plistPath]);
+      if (
+        last.code === 0 ||
+        /already loaded|service already loaded|operation already in progress/i.test(last.stderr)
+      ) {
+        return;
+      }
+      if (attempt < 19) await this.sleep(250);
+    }
+    throw new Error(`launchctl bootstrap failed: ${(last?.stderr || last?.stdout || '').trim()}`);
   }
 
   async stop(): Promise<void> {

@@ -48,6 +48,7 @@ function harness(
         stderr: result?.stderr ?? '',
       };
     },
+    sleep: async () => {},
     writeFile: (p, content) => {
       files.set(p, content);
     },
@@ -179,8 +180,26 @@ describe('LaunchdServiceManager', () => {
     expect(h.commands).toEqual([
       `launchctl enable gui/501/${LAUNCHD_LABEL}`,
       `launchctl bootstrap gui/501 /Users/u/Library/LaunchAgents/dev.portable.daemon.plist`,
-      `launchctl kickstart gui/501/${LAUNCHD_LABEL}`,
+      `launchctl kickstart -k gui/501/${LAUNCHD_LABEL}`,
     ]);
+  });
+
+  it('retries bootstrap while launchd finishes removing the old service', async () => {
+    const h = harness();
+    let attempts = 0;
+    h.deps.runCommand = async (cmd, args) => {
+      const key = [cmd, ...args].join(' ');
+      h.commands.push(key);
+      if (args[0] === 'bootstrap' && attempts++ === 0) {
+        return { code: 5, stdout: '', stderr: 'Bootstrap failed: 5: Input/output error' };
+      }
+      return { code: 0, stdout: '', stderr: '' };
+    };
+
+    await new LaunchdServiceManager(h.deps).start();
+
+    expect(attempts).toBe(2);
+    expect(h.commands.at(-1)).toBe(`launchctl kickstart -k gui/501/${LAUNCHD_LABEL}`);
   });
 
   it('stop boots the agent out (KeepAlive cannot revive an unloaded agent)', async () => {
