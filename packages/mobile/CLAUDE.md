@@ -922,8 +922,8 @@ sync when adding another source of native build changes. The native app pins
 Configure delivery credentials in both systems:
 
 Run `./scripts/setup-mobile-delivery.sh` from the repository root for the guided setup. It opens
-the Sentry and Expo pages, reads secret values with hidden input, writes them directly to the
-protected GitHub environments and EAS environments, and can start the first preview build.
+the Expo access-token page, reads the authenticated Sentry CLI configuration, writes secrets
+directly to the protected GitHub and EAS environments, and can start the first preview build.
 
 - GitHub `preview` and `production` Environment Secrets: `EXPO_TOKEN`, `SENTRY_AUTH_TOKEN`,
   `EAS_UPDATE_PRIVATE_KEY`, and `GOOGLE_SERVICE_INFO_PLIST_BASE64`. Keep deployment credentials
@@ -935,8 +935,9 @@ protected GitHub environments and EAS environments, and can start the first prev
   Clerk/gateway values and `EXPO_PUBLIC_GITHUB_APP_NAME[_DEV]` when those overrides are used.
 - EAS `preview` and `production` environments: `SENTRY_AUTH_TOKEN`, `SENTRY_ORG`,
   `SENTRY_PROJECT`, `EXPO_PUBLIC_SENTRY_ENVIRONMENT` (`preview` or `production`), and the matching
-  `EXPO_PUBLIC_*` values. EAS needs its own copies because a remote builder does not inherit
-  GitHub's job environment.
+  `EXPO_PUBLIC_*` values, plus `GOOGLE_SERVICES_FILE` as a secret file variable. `app.config.js`
+  swaps that remote path into `ios.googleServicesFile`. EAS needs its own copies because a remote
+  builder does not inherit GitHub's job environment or upload the git-ignored local plist.
 
 EAS stores the iOS signing certificate and provisioning profile remotely. The first preview build
 may require an interactive `eas build --profile preview --platform ios` to finish Apple credential

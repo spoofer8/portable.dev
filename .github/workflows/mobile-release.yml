@@ -79,6 +79,7 @@ jobs:
               package.json \
               bun.lock \
               packages/mobile/package.json \
+              packages/mobile/app.config.* \
               packages/mobile/app.json \
               packages/mobile/eas.json \
               packages/mobile/.gitignore \

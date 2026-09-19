@@ -184,7 +184,7 @@ finish() {
 # Replace the example below. Set TOTAL_STAGES to match the stages you write.
 # ──────────────────────────────────────────────────────────────────────────
 
-TOTAL_STAGES=5
+TOTAL_STAGES=4
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
@@ -227,38 +227,57 @@ set_eas_var() {
   printf '  %s✓ set%s EAS %s variable %s\n' "$GREEN" "$RESET" "$environment" "$name"
 }
 
+set_eas_file() {
+  local environment="$1" name="$2" file_path="$3"
+  (
+    cd "$MOBILE_DIR"
+    EXPO_TOKEN="$EXPO_TOKEN" "${EAS_CLI[@]}" env:set "$environment" \
+      --name "$name" \
+      --value "$file_path" \
+      --type file \
+      --visibility sensitive \
+      --scope project \
+      --non-interactive >/dev/null
+  )
+  printf '  %s✓ set%s EAS %s file %s\n' "$GREEN" "$RESET" "$environment" "$name"
+}
+
 command -v gh >/dev/null 2>&1 || { printf 'gh is required\n' >&2; exit 1; }
 gh auth status >/dev/null 2>&1 || { printf 'Run gh auth login first\n' >&2; exit 1; }
+command -v sentry >/dev/null 2>&1 || { printf 'The Sentry CLI is required\n' >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { printf 'jq is required\n' >&2; exit 1; }
 
 banner "Portable mobile delivery setup"
 
-stage "Create the Sentry project"
-say "Create or select an organization you own, then add a React Native project named portable-mobile."
-open_url "https://sentry.io/organizations/"
-step "In Sentry, open Settings > Projects > Create Project and choose React Native."
-step "Copy the organization slug, project slug, and public DSN from Project Settings > Client Keys."
-ask SENTRY_ORG "Sentry organization slug:"
-ask SENTRY_PROJECT "Sentry project slug [portable-mobile]:"
-SENTRY_PROJECT=${SENTRY_PROJECT:-portable-mobile}
-ask EXPO_PUBLIC_SENTRY_DSN "Public Sentry DSN:"
-require_value SENTRY_ORG "Sentry organization slug"
-require_value SENTRY_PROJECT "Sentry project slug"
-require_value EXPO_PUBLIC_SENTRY_DSN "Sentry DSN"
-[[ "$EXPO_PUBLIC_SENTRY_DSN" == https://* ]] || { warn "The Sentry DSN must start with https://"; exit 1; }
-
-stage "Create the Sentry upload token"
-say "This token lets CI upload source maps. It is never printed or committed."
-open_url "https://sentry.io/settings/account/api/auth-tokens/"
-step "Create a token with org:read and project:releases access, then copy it."
-ask_secret SENTRY_AUTH_TOKEN "Sentry auth token:"
-require_value SENTRY_AUTH_TOKEN "Sentry auth token"
-if curl -fsS -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" \
-  "https://sentry.io/api/0/organizations/$SENTRY_ORG/" >/dev/null; then
-  printf '  %s✓ verified%s Sentry token access\n' "$GREEN" "$RESET"
-else
-  warn "Sentry rejected the token or organization slug. Re-run after correcting them."
-  exit 1
+stage "Read Sentry configuration"
+say "The Sentry CLI supplies the project, DSN, and upload token without printing the token."
+if ! sentry auth status >/dev/null 2>&1; then
+  sentry auth login
 fi
+sentry_info=$(sentry info --json 2>/dev/null || true)
+SENTRY_ORG=$(printf '%s' "$sentry_info" | jq -r '.config.org // empty')
+SENTRY_PROJECT=$(printf '%s' "$sentry_info" | jq -r '.config.project // empty')
+
+if [[ -z "$SENTRY_ORG" || -z "$SENTRY_PROJECT" ]]; then
+  say "No default Sentry project is configured, so this wizard will create one."
+  ask SENTRY_ORG "Sentry organization slug:"
+  ask SENTRY_PROJECT_NAME "New project name [portable-mobile]:"
+  SENTRY_PROJECT_NAME=${SENTRY_PROJECT_NAME:-portable-mobile}
+  require_value SENTRY_ORG "Sentry organization slug"
+  project_json=$(sentry project create "$SENTRY_ORG/$SENTRY_PROJECT_NAME:react-native" --json)
+  SENTRY_PROJECT=$(printf '%s' "$project_json" | jq -er '.project.slug')
+  EXPO_PUBLIC_SENTRY_DSN=$(printf '%s' "$project_json" | jq -er '.dsn')
+  sentry cli defaults org "$SENTRY_ORG" --yes >/dev/null
+  sentry cli defaults project "$SENTRY_PROJECT" --yes >/dev/null
+else
+  project_json=$(sentry project view "$SENTRY_ORG/$SENTRY_PROJECT" --json)
+  EXPO_PUBLIC_SENTRY_DSN=$(printf '%s' "$project_json" | jq -er '.[0].dsn')
+fi
+
+SENTRY_AUTH_TOKEN=$(sentry auth token)
+require_value SENTRY_AUTH_TOKEN "Sentry auth token"
+printf '  %s✓ detected%s %s/%s and verified CLI authentication\n' \
+  "$GREEN" "$RESET" "$SENTRY_ORG" "$SENTRY_PROJECT"
 
 stage "Create the Expo access token"
 say "This token lets GitHub Actions publish OTA updates and start EAS builds."
@@ -314,6 +333,7 @@ for deployment_environment in preview production; do
   set_eas_var "$deployment_environment" SENTRY_PROJECT "$SENTRY_PROJECT" plaintext
   set_eas_var "$deployment_environment" EXPO_PUBLIC_SENTRY_DSN "$EXPO_PUBLIC_SENTRY_DSN" plaintext
   set_eas_var "$deployment_environment" EXPO_PUBLIC_SENTRY_ENVIRONMENT "$deployment_environment" plaintext
+  set_eas_file "$deployment_environment" GOOGLE_SERVICES_FILE "$FIREBASE_PLIST_PATH"
 done
 
 stage "Build the untethered preview"
