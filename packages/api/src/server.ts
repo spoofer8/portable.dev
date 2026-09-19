@@ -70,6 +70,7 @@ import { StandardMcpServer } from './services/mcp/servers/StandardMcpServer.js';
 import { McpValidator } from './services/mcp/utils/McpValidator.js';
 import { ReposCacheService } from './services/ReposCacheService.js';
 import { RepoViewTrackerService } from './services/RepoViewTrackerService.js';
+import { PowerAssertionService } from './services/PowerAssertionService.js';
 import { SecretsService } from './services/SecretsService.js';
 import { SocketIOService } from './services/SocketIOService.js';
 import { SOPService } from './services/SOPService.js';
@@ -689,6 +690,7 @@ class Server {
     // outdated-client check after boot rarely waits on the network.
     this.handshakeVerificationGate = new HandshakeVerificationGate();
     this.handshakeVerificationGate.prime();
+    const powerAssertionService = new PowerAssertionService();
 
     // Initialize ChatExecutionService (core execution logic, decoupled from Socket.IO)
     this.chatExecutionService = new ChatExecutionService(
@@ -707,7 +709,9 @@ class Server {
       this.externalClaudeSessionService, // rev12: adopt-vs-fork gate
       this.stopOnPcService, // rev12 D63: stop-on-send (interactive send ends the terminal session)
       this.sourceControlService, // portable.dev#17: chat:create worktree validation
-      this.codexService
+      this.codexService,
+      undefined, // default Codex cwd validator
+      powerAssertionService
     );
 
     // Wire up circular dependency: ClaudeService needs ChatExecutionService for create_chat tool
@@ -727,7 +731,8 @@ class Server {
       this.processTrackerService,
       dbAdapter, // Pass dbAdapter for realtime support
       this.sopService, // SOPService for Standard Operating Procedure worksheets
-      this.pushNotificationService // Pass push notification service for offline notifications
+      this.pushNotificationService, // Pass push notification service for offline notifications
+      powerAssertionService
     );
 
     // Inject SocketIOService into ClaudeService (after both are created to avoid circular dependency)
@@ -764,6 +769,7 @@ class Server {
     this.hostMetricsService = new HostMetricsService({
       emit: (metrics) => this.socketIOService.broadcastSandboxMetrics(metrics),
       workspaceDir: WORKSPACE_DIR,
+      isActive: () => this.socketIOService?.getConnectionCount() > 0,
     });
     this.hostMetricsService.start();
 

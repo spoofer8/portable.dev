@@ -84,6 +84,7 @@ describe('PortableSDK - Real User Scenarios', () => {
   let connectionsService: ConnectionsService;
   let dbAdapter: DbAdapter;
   let emitter: TestEmitter;
+  let acquirePower: ReturnType<typeof mock>;
 
   let testUserId: string;
   let authToken: string;
@@ -134,6 +135,7 @@ describe('PortableSDK - Real User Scenarios', () => {
     ]);
     connectionsService = new ConnectionsService(dbAdapter);
     emitter = new TestEmitter();
+    acquirePower = mock(() => mock(() => {}));
 
     // Create ChatExecutionService
     chatExecutionService = new ChatExecutionService(
@@ -147,7 +149,14 @@ describe('PortableSDK - Real User Scenarios', () => {
       undefined, // pushNotificationService
       undefined, // sopService
       undefined, // claudeCodeSessions
-      undefined // reposCacheService
+      undefined, // reposCacheService
+      undefined, // handshakeVerificationGate
+      undefined, // externalClaudeSessionService
+      undefined, // stopOnPcService
+      undefined, // sourceControlService
+      undefined, // codexService
+      undefined, // default Codex cwd validator
+      { acquire: acquirePower } as any
     );
 
     // Setup test data
@@ -325,6 +334,7 @@ describe('PortableSDK - Real User Scenarios', () => {
     expect(dbWorker.id).toBeDefined();
     expect(dbWorker.title).toBe('Database Analysis Worker');
     expect(dbWorker.parent_chat_id).toBe(MAIN_CHAT_ID);
+    expect(acquirePower).toHaveBeenCalledTimes(3);
 
     // Verify in database
     const allChats = await chatService.getChats(testUserId, authToken);

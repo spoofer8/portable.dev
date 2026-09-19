@@ -57,6 +57,7 @@ import {
   type NativeSocket,
 } from '../src/features/socket';
 import { configureE2eSessions, __resetE2eSessions } from '../src/features/api/e2eSessionManager';
+import { useSandboxHealthStore } from '../src/features/health/healthStore';
 import type { AppStateLike, NetInfoLike, AppStateStatus } from '../src/features/socket';
 import { createMockSocket, type MockSocketController, type MockSocketIoModule } from '../src/test';
 
@@ -167,6 +168,7 @@ describe('RN socket provider on the shared core', () => {
     act(() => {
       useSocketStore.getState().reset();
       useChatChromeStore.getState().reset();
+      useSandboxHealthStore.getState().reset();
     });
     controller.reset();
     __resetE2eSessions();
@@ -1053,6 +1055,17 @@ describe('RN socket provider on the shared core', () => {
       render(<ReconnectingBanner />);
       expect(screen.getByTestId('reconnecting-banner-text').props.children).toBe('Reconnecting…');
       expect(screen.queryByTestId('connection-failed-banner')).toBeNull();
+    });
+
+    it('shows wake progress while the Mac health check is recovering', () => {
+      act(() => {
+        useSocketStore.getState().markConnected('sock-1');
+        useSandboxHealthStore.getState().markWaking();
+      });
+      render(<ReconnectingBanner />);
+      expect(screen.getByTestId('reconnecting-banner-text').props.children).toBe(
+        'Waking your Mac…'
+      );
     });
 
     it('renders the persistent terminal variant on the failed state — even before a first connect', () => {

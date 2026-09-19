@@ -73,4 +73,12 @@ export interface QrLinkPayload {
    * DOES see the JWT) can never read or forge E2E traffic (portable.dev#13).
    */
   e2eKey: string;
+  /**
+   * Optional full HTTPS endpoint for the user's private wake relay. When paired
+   * with `wakeToken`, the mobile client may POST here after the first failed
+   * online health probe so a sleeping Mac can receive Wake-on-LAN.
+   */
+  wakeUrl?: string;
+  /** Opaque bearer for `wakeUrl`. This is a secret and must only live in secure storage. */
+  wakeToken?: string;
 }

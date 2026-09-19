@@ -247,11 +247,123 @@ describe('startupHealthCheck core', () => {
     await flush();
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
+
+  it('requests wake after the first failed probe and uses the extended wake budget', async () => {
+    const fetchImpl = makeFetch([false]);
+    const timer = makeControlledDelay();
+    const onFirstFailure = jest.fn().mockResolvedValue(true);
+
+    const result = startupHealthCheck({
+      sandboxUrl: SANDBOX_URL,
+      fetchImpl,
+      delay: timer.delay,
+      timeoutSignal: () => undefined,
+      onFirstFailure,
+    });
+    const drain = (async () => {
+      for (let i = 0; i < 50; i++) {
+        await flush();
+        timer.releaseAll();
+      }
+    })();
+
+    await expect(result).rejects.toBeInstanceOf(StartupHealthCheckError);
+    await drain;
+
+    expect(onFirstFailure).toHaveBeenCalledTimes(1);
+    expect(fetchImpl.mock.calls.length).toBeGreaterThan(STARTUP_MAX_ATTEMPTS);
+    expect(timer.ms.reduce((total, delayMs) => total + delayMs, 0)).toBeGreaterThanOrEqual(80_000);
+    expect(timer.ms.reduce((total, delayMs) => total + delayMs, 0)).toBeLessThanOrEqual(90_000);
+  });
+
+  it('keeps the short startup budget when no wake capability is available', async () => {
+    const fetchImpl = makeFetch([false]);
+    const timer = makeControlledDelay();
+    const onFirstFailure = jest.fn().mockResolvedValue(false);
+
+    const result = startupHealthCheck({
+      sandboxUrl: SANDBOX_URL,
+      fetchImpl,
+      delay: timer.delay,
+      timeoutSignal: () => undefined,
+      onFirstFailure,
+    });
+    const drain = (async () => {
+      for (let i = 0; i < 14; i++) {
+        await flush();
+        timer.releaseAll();
+      }
+    })();
+
+    await expect(result).rejects.toBeInstanceOf(StartupHealthCheckError);
+    await drain;
+    expect(onFirstFailure).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).toHaveBeenCalledTimes(STARTUP_MAX_ATTEMPTS);
+  });
+
+  it('caps wake retries at the 90-second wall-clock deadline', async () => {
+    let now = 0;
+    const timeoutMs: number[] = [];
+    const fetchImpl = makeFetch([false]);
+
+    await expect(
+      startupHealthCheck({
+        sandboxUrl: SANDBOX_URL,
+        fetchImpl,
+        now: () => now,
+        delay: async (ms) => {
+          now += ms;
+        },
+        timeoutSignal: (ms) => {
+          timeoutMs.push(ms);
+          return undefined;
+        },
+        onFirstFailure: async () => true,
+      })
+    ).rejects.toBeInstanceOf(StartupHealthCheckError);
+
+    expect(now).toBeLessThanOrEqual(90_000);
+    expect(timeoutMs.every((ms) => ms <= 15_000)).toBe(true);
+  });
 });
 
 // ───────────────────── Layer 2: StartupHealthGate (RNTL) ─────────────────────
 
 describe('StartupHealthGate', () => {
+  it('shows wake progress while the Mac is starting', async () => {
+    let finishCheck: (() => void) | undefined;
+    const runCheck = jest.fn(async (deps: Parameters<typeof startupHealthCheck>[0]) => {
+      await deps.onFirstFailure?.();
+      await new Promise<void>((resolve) => {
+        finishCheck = resolve;
+      });
+    });
+
+    const view = render(
+      <StartupHealthGate
+        deps={{
+          getRelayUrl: async () => SANDBOX_URL,
+          runCheck,
+          isOnline: async () => true,
+          wakeOnFirstFailure: async (onRequest) => {
+            onRequest();
+            return true;
+          },
+        }}
+      >
+        <Text testID="app-children">app</Text>
+      </StartupHealthGate>
+    );
+
+    await waitFor(() => expect(screen.getByTestId('startup-health-waking')).toBeTruthy());
+    expect(screen.getByTestId('startup-health-waking-text').props.children).toContain(
+      'Waking your Mac'
+    );
+
+    await act(async () => finishCheck?.());
+    view.unmount();
+  });
+
   it('shows a loading state (not an error) throughout boot, then renders children when healthy', async () => {
     const fetchImpl = makeFetch([false, false, true]); // warm up on the 3rd probe
     const timer = makeControlledDelay();
@@ -262,6 +374,7 @@ describe('StartupHealthGate', () => {
           getRelayUrl: async () => SANDBOX_URL,
           fetchImpl,
           delay: timer.delay,
+          isOnline: async () => true,
         }}
       >
         <Text testID="app-children">app</Text>
@@ -302,6 +415,7 @@ describe('StartupHealthGate', () => {
           getRelayUrl: async () => SANDBOX_URL,
           fetchImpl,
           delay: timer.delay,
+          isOnline: async () => true,
         }}
       >
         <Text testID="app-children">app</Text>

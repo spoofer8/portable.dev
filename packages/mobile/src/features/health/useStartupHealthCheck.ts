@@ -28,6 +28,26 @@ import {
   type StartupHealthCheckDeps,
 } from './startupHealthCheck';
 import { useStartupHealthStore, type StartupHealthPhase } from './startupHealthStore';
+import {
+  requestConnectedPcWakeOnce,
+  resetConnectedPcWakeOutage,
+  wakeRequestExtendsRetry,
+} from './wakeOnDemand';
+
+/** Read current connectivity without keeping a second NetInfo subscription alive. */
+async function isDeviceOnline(): Promise<boolean> {
+  try {
+    const NetInfo = require('@react-native-community/netinfo').default as {
+      fetch: () => Promise<{ isConnected: boolean | null }>;
+    };
+    const state = await NetInfo.fetch();
+    return state.isConnected !== false;
+  } catch {
+    // Unknown connectivity mirrors the health monitor's optimistic policy. The
+    // wake POST itself remains a safe, bounded probe.
+    return true;
+  }
+}
 
 export interface UseStartupHealthCheckDeps {
   /** Resolve the mutable sandbox base URL (default: SecureStore). */
@@ -45,6 +65,10 @@ export interface UseStartupHealthCheckDeps {
    * the static failed screen. An ABORT never fires it.
    */
   onUnhealthy?: () => void;
+  /** Current network status seam. An explicit false suppresses wake. */
+  isOnline?: () => boolean | Promise<boolean>;
+  /** Once-per-outage wake seam. Resolve true to select the ~90 second budget. */
+  wakeOnFirstFailure?: (onRequest: () => void) => Promise<boolean>;
 }
 
 export interface UseStartupHealthCheckHandle {
@@ -80,8 +104,22 @@ export function useStartupHealthCheck(
           signal: controller.signal,
           delay: deps.delay,
           onAttempt: (attempt) => useStartupHealthStore.getState().setAttempt(attempt),
+          onFirstFailure: async () => {
+            const online = await (deps.isOnline ?? isDeviceOnline)();
+            if (!online || controller.signal.aborted) return false;
+            if (deps.wakeOnFirstFailure) {
+              return deps.wakeOnFirstFailure(() => useStartupHealthStore.getState().markWaking());
+            }
+            const result = await requestConnectedPcWakeOnce({
+              onRequest: () => useStartupHealthStore.getState().markWaking(),
+            });
+            return wakeRequestExtendsRetry(result);
+          },
         });
-        if (!controller.signal.aborted) useStartupHealthStore.getState().markReady();
+        if (!controller.signal.aborted) {
+          resetConnectedPcWakeOutage();
+          useStartupHealthStore.getState().markReady();
+        }
       } catch (err) {
         // Abort = teardown/cleanup; never flip the UI into a failed state.
         if (isStartupAbort(err) || controller.signal.aborted) return;

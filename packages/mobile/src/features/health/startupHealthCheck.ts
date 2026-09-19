@@ -11,12 +11,10 @@
  * state (never an error) until the PC answers `200 { status: 'ok' }` or the budget
  * is exhausted.
  *
- * **This is NOT a remote "sandbox cold start"** — there is no container warming up
- * in local-first, so the budget is deliberately SHORT (~11.5s), not the old ~92s
- * container-boot wait. If the PC isn't answering within a rotation window it is
- * genuinely down (launcher stopped / tunnel gone / pcId unregistered → relay 404)
- * and waiting longer won't help: exhaustion hands off to the ConnectionFailed UX,
- * which now offers a **"Connect PC"** re-scan exit.
+ * A pairing without wake-on-demand keeps the deliberately short ~11.5 second
+ * tunnel-rotation budget. A wake-capable pairing calls `onFirstFailure` once and
+ * expands to an ~85 second delay budget so a sleeping Mac has time to boot. Final
+ * exhaustion hands off to the ConnectionFailed UX.
  *
  *   - Backoff (seconds BEFORE each retry): `[0.5, 1, 2, 3, 5]` (capped 15s,
  *     `STARTUP_BACKOFF_CAP_SECONDS`). Front-loaded so a missed first probe (a relay
@@ -68,6 +66,20 @@ export const STARTUP_MAX_ATTEMPTS = 6;
  * is slow to answer while booting (mirrors `HEALTH_CHECK_TIMEOUT_MS`).
  */
 export const STARTUP_HEALTH_TIMEOUT_MS = 15_000;
+
+/**
+ * Wake-capable startup retries: 18 gaps totalling 85 seconds. Together with
+ * health request time, this gives a sleeping Mac roughly 90 seconds to wake.
+ */
+export const WAKE_STARTUP_BACKOFF_SECONDS: readonly number[] = [
+  2, 3, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+];
+
+/** Nineteen probes around the 85-second wake backoff window. */
+export const WAKE_STARTUP_MAX_ATTEMPTS = WAKE_STARTUP_BACKOFF_SECONDS.length + 1;
+
+/** Hard wall-clock cap for health retries after the wake attempt begins. */
+export const WAKE_STARTUP_RETRY_WINDOW_MS = 90_000;
 
 /** Thrown when the sandbox never became healthy within the attempt budget. */
 export class StartupHealthCheckError extends Error {
@@ -175,6 +187,14 @@ export interface StartupHealthCheckDeps {
   timeoutSignal?: (ms: number) => AbortSignal | undefined;
   /** Called with the 1-based attempt number before each probe (for loading UX). */
   onAttempt?: (attempt: number) => void;
+  /**
+   * Runs once after the first failed probe. Resolve true when a wake capability
+   * was attempted, selecting the longer wake retry budget; false keeps the
+   * legacy short startup behavior.
+   */
+  onFirstFailure?: () => boolean | Promise<boolean>;
+  /** Monotonic-enough clock for enforcing the wake retry deadline. */
+  now?: () => number;
 }
 
 /**
@@ -227,24 +247,52 @@ export async function startupHealthCheck(deps: StartupHealthCheckDeps): Promise<
     healthTimeoutMs = STARTUP_HEALTH_TIMEOUT_MS,
     timeoutSignal = defaultTimeoutSignal,
     onAttempt,
+    onFirstFailure,
+    now = Date.now,
   } = deps;
 
   const healthUrl = `${sandboxUrl.replace(/\/+$/, '')}/api/health`;
   throwIfAborted(signal);
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  let attemptBudget = maxAttempts;
+  let activeBackoff = backoffSeconds;
+  let wakeDeadline: number | null = null;
+  let attemptsMade = 0;
+
+  for (let attempt = 1; attempt <= attemptBudget; attempt++) {
     throwIfAborted(signal);
+    if (wakeDeadline !== null && now() >= wakeDeadline) break;
+    attemptsMade = attempt;
     onAttempt?.(attempt);
 
-    if (await probeOnce(healthUrl, fetchImpl, signal, healthTimeoutMs, timeoutSignal)) {
+    const remainingWakeMs = wakeDeadline === null ? Infinity : wakeDeadline - now();
+    const probeTimeoutMs = Math.max(1, Math.min(healthTimeoutMs, remainingWakeMs));
+    if (await probeOnce(healthUrl, fetchImpl, signal, probeTimeoutMs, timeoutSignal)) {
       return; // sandbox is up — boot complete.
     }
 
+    if (attempt === 1 && onFirstFailure) {
+      const wakeStartedAt = now();
+      const wakeAttempted = await onFirstFailure();
+      throwIfAborted(signal);
+      if (wakeAttempted) {
+        wakeDeadline = wakeStartedAt + WAKE_STARTUP_RETRY_WINDOW_MS;
+        attemptBudget = Math.max(attemptBudget, WAKE_STARTUP_MAX_ATTEMPTS);
+        activeBackoff = WAKE_STARTUP_BACKOFF_SECONDS;
+      }
+    }
+
     throwIfAborted(signal);
-    if (attempt < maxAttempts) {
-      await delay(startupBackoffDelayMs(attempt - 1, { backoffSeconds, capSeconds }), signal);
+    if (attempt < attemptBudget) {
+      const scheduledDelay = startupBackoffDelayMs(attempt - 1, {
+        backoffSeconds: activeBackoff,
+        capSeconds,
+      });
+      const remainingMs = wakeDeadline === null ? Infinity : wakeDeadline - now();
+      if (remainingMs <= 0) break;
+      await delay(Math.min(scheduledDelay, remainingMs), signal);
     }
   }
 
-  throw new StartupHealthCheckError(maxAttempts);
+  throw new StartupHealthCheckError(attemptsMade);
 }

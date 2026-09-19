@@ -22,7 +22,7 @@
 import { decodeAuthToken } from '@vgit2/shared/jwt';
 import { LocalSecretStore, resolveDataDir } from '@vgit2/shared/secrets';
 
-import { resolveRelayBaseUrl } from './config.js';
+import { resolveRelayBaseUrl, resolveWakeCapability } from './config.js';
 import {
   ensureE2ePsk,
   ensureJwtSecret,
@@ -58,6 +58,8 @@ export interface FreshPairingContext {
   pcId: string;
   /** The relay base — `gatewayBase` in the payload. */
   gatewayBase: string;
+  /** Optional out-of-band wake endpoint and bearer. */
+  wakeCapability?: { wakeUrl: string; wakeToken: string };
 }
 
 /** A freshly-minted pairing session (superset of {@link DashboardPairingView}). */
@@ -94,6 +96,7 @@ export function resolveFreshPairingContext(
       dataDir: manifest.dataDir,
       pcId: manifest.pcId,
       gatewayBase: manifest.relayBaseUrl,
+      wakeCapability: resolveWakeCapability(options.env ?? process.env, options.store),
     };
   }
   const env = options.env ?? process.env;
@@ -102,7 +105,12 @@ export function resolveFreshPairingContext(
   // Lazy import avoidance: resolvePcId lives in TunnelRegistrationAgent — read the
   // same way ensureJwtSecret does. Prefer the env override, else the stored id.
   const pcId = env.PORTABLE_PC_ID?.trim() || store.get('tunnel:pc-id')?.trim() || '';
-  return { dataDir, pcId, gatewayBase: resolveRelayBaseUrl(env) };
+  return {
+    dataDir,
+    pcId,
+    gatewayBase: resolveRelayBaseUrl(env),
+    wakeCapability: resolveWakeCapability(env, store),
+  };
 }
 
 export interface PairingSessionFactoryDeps {
@@ -148,6 +156,7 @@ export class PairingSessionFactory implements DashboardPairingSession {
       pcId: this.context.pcId,
       token,
       e2eKey: e2ePsk,
+      ...this.context.wakeCapability,
     });
   }
 

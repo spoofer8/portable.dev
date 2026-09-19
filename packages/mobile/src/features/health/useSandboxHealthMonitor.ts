@@ -42,6 +42,7 @@ import {
   type NetInfoLike,
 } from '../socket/lifecycle';
 import { useSandboxHealthStore } from './healthStore';
+import { requestConnectedPcWakeOnce, resetConnectedPcWakeOutage } from './wakeOnDemand';
 
 export interface SandboxHealthMonitorDeps {
   /** Resolve the mutable PC relay base URL (default: SecureStore). Polling waits until non-null. */
@@ -56,13 +57,21 @@ export interface SandboxHealthMonitorDeps {
    * Provide a pre-built monitor (tests inject deterministic clock/timer seams).
    * When omitted, one is constructed wired to {@link fetchImpl} + the health store.
    */
-  createMonitor?: () => SandboxHealthMonitor;
+  createMonitor?: (events: SandboxHealthMonitorEvents) => SandboxHealthMonitor;
   /**
    * Fired on a CONFIRMED death — 90s of continuous, network-connected health-poll
    * failure. Default: trip ConnectionFailed on the monitor (→ store `failed`); the
    * app-shell wires it to the session-boundary death handler (epoch remount).
    */
   onSandboxDead?: () => void;
+  /** Once-per-outage wake seam. Called only while network connectivity is not explicitly false. */
+  requestWake?: (onRequest: () => void) => Promise<unknown>;
+}
+
+/** Event wiring supplied to an injected monitor so tests exercise production behavior. */
+export interface SandboxHealthMonitorEvents {
+  onStatusChange: (status: 'reconnecting' | 'connected') => void;
+  onConnectionFailed: () => void;
 }
 
 export interface SandboxHealthMonitorHandle {
@@ -84,25 +93,39 @@ export function useSandboxHealthMonitor(
   // Latest deps for the once-built closures below (the useNativeSocket pattern).
   const depsRef = useRef(deps);
   depsRef.current = deps;
+  const networkConnectedRef = useRef(true);
 
   // Build the monitor exactly once. Status/failure signals fold into the store;
   // a confirmed failure (90s trip) is also the death signal in local-first.
   const monitorRef = useRef<SandboxHealthMonitor | null>(null);
   if (monitorRef.current === null) {
+    const events: SandboxHealthMonitorEvents = {
+      onStatusChange: (status) => {
+        const store = useSandboxHealthStore.getState();
+        if (status === 'connected') {
+          resetConnectedPcWakeOutage();
+          store.markHealthy();
+        } else {
+          store.markReconnecting();
+          if (networkConnectedRef.current) {
+            const requestWake =
+              depsRef.current.requestWake ??
+              ((onRequest: () => void) => requestConnectedPcWakeOnce({ onRequest }));
+            void requestWake(() => useSandboxHealthStore.getState().markWaking());
+          }
+        }
+      },
+      onConnectionFailed: () => {
+        useSandboxHealthStore.getState().markFailed();
+        // 90s of continuous failure = the PC is unreachable → hand off to recovery.
+        (depsRef.current.onSandboxDead ?? (() => {}))();
+      },
+    };
     monitorRef.current =
-      deps.createMonitor?.() ??
+      deps.createMonitor?.(events) ??
       new SandboxHealthMonitor({
         fetchImpl: deps.fetchImpl,
-        onStatusChange: (status) => {
-          const store = useSandboxHealthStore.getState();
-          if (status === 'connected') store.markHealthy();
-          else store.markReconnecting();
-        },
-        onConnectionFailed: () => {
-          useSandboxHealthStore.getState().markFailed();
-          // 90s of continuous failure = the PC is unreachable → hand off to recovery.
-          (depsRef.current.onSandboxDead ?? (() => {}))();
-        },
+        ...events,
       });
   }
   const monitor = monitorRef.current;
@@ -133,7 +156,8 @@ export function useSandboxHealthMonitor(
     const unsub = netInfo.addEventListener((state) => {
       // `isConnected` may be `null` (unknown) early on — treat only an explicit
       // `false` as offline so we never freeze on an indeterminate state.
-      monitor.setNetworkConnected(state.isConnected !== false);
+      networkConnectedRef.current = state.isConnected !== false;
+      monitor.setNetworkConnected(networkConnectedRef.current);
     });
     return unsub;
     // deps.netInfo is read once on mount (parity with the socket provider).

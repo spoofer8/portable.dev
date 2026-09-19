@@ -9,7 +9,7 @@
  * — the key-set assertion below pins the reshaped local-first SandboxMetrics shape.
  */
 
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, mock } from 'bun:test';
 
 import {
   HostMetricsService,
@@ -147,6 +147,28 @@ describe('HostMetricsService', () => {
     h.svc.start(); // no-op (already running)
     h.svc.stop();
     expect(h.hasTimer()).toBe(false);
+  });
+
+  it('does not sample or walk the workspace while no client consumes metrics', async () => {
+    let active = false;
+    const workspaceSize = mock(async () => 3 * GB);
+    const h = harness({ isActive: () => active, workspaceSize });
+
+    h.svc.start();
+    h.runTick();
+    await flush();
+    expect(h.emitted).toEqual([]);
+    expect(workspaceSize).not.toHaveBeenCalled();
+
+    active = true;
+    h.runTick();
+    await flush();
+    expect(workspaceSize).toHaveBeenCalledTimes(1);
+    expect(h.emitted).toEqual([]);
+
+    h.setCpus(cpus(100, 100));
+    h.runTick();
+    expect(h.emitted).toHaveLength(1);
   });
 
   it('a throwing emit never crashes the tick loop', () => {

@@ -11,10 +11,10 @@
  *                  exit is the `ConnectionFailedScreen` the app-shell routes to via
  *                  `onUnhealthy` (this static screen only flashes before that).
  *
- * The budget is SHORT (~11.5s — it only rides out a cloudflared tunnel rotation,
- * NOT a remote container cold boot, which no longer exists). Mount this ABOVE the
- * screens that need the PC. The check is aborted on unmount (navigate away / sign
- * out) by the hook's cleanup.
+ * A legacy pairing keeps the short ~11.5 second tunnel-rotation budget. A pairing
+ * with a wake capability sends one wake request after its first online failure and
+ * waits roughly 90 seconds for the Mac to return. Mount this ABOVE the screens that
+ * need the PC. The check is aborted on unmount by the hook's cleanup.
  */
 
 import type { ReactNode } from 'react';
@@ -57,6 +57,16 @@ export function StartupHealthGate({ children, deps, onUnhealthy }: StartupHealth
           We&apos;ll get you reconnected.
         </Text>
       </View>
+    );
+  }
+
+  if (phase === 'waking') {
+    return (
+      <LoadingSplash
+        testID="startup-health-waking"
+        message="Waking your Mac… This can take up to 90 seconds."
+        messageTestID="startup-health-waking-text"
+      />
     );
   }
 

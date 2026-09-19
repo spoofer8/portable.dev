@@ -36,6 +36,66 @@ export const DEFAULT_RELAY_BASE_URL = 'https://app.portable.dev';
  */
 export const DEV_RELAY_BASE_URL = 'https://app.portable-dev.com';
 
+export interface WakeCapabilityConfig {
+  wakeUrl: string;
+  wakeToken: string;
+}
+
+export const WAKE_CAPABILITY_SECRET_KEY = 'wake:capability';
+
+export interface WakeCapabilityReader {
+  get(name: string): string | undefined;
+}
+
+/**
+ * Resolve the optional out-of-band wake capability included in pairing QR codes.
+ * Both values are required together; the token is never logged or persisted in
+ * the service manifest.
+ */
+export function resolveWakeCapability(
+  env: NodeJS.ProcessEnv = process.env,
+  store?: WakeCapabilityReader
+): WakeCapabilityConfig | undefined {
+  let wakeUrl = env.PORTABLE_WAKE_URL?.trim();
+  let wakeToken = env.PORTABLE_WAKE_TOKEN?.trim();
+  if (!wakeUrl && !wakeToken && store) {
+    try {
+      const stored = store.get(WAKE_CAPABILITY_SECRET_KEY);
+      if (stored) {
+        const parsed = JSON.parse(stored) as Partial<WakeCapabilityConfig>;
+        wakeUrl = parsed.wakeUrl?.trim();
+        wakeToken = parsed.wakeToken?.trim();
+      }
+    } catch {
+      return undefined;
+    }
+  }
+  if (!wakeUrl && !wakeToken) return undefined;
+  if (!wakeUrl || !wakeToken) {
+    throw new Error('PORTABLE_WAKE_URL and PORTABLE_WAKE_TOKEN must be configured together');
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(wakeUrl);
+  } catch {
+    throw new Error('PORTABLE_WAKE_URL must be an absolute HTTPS URL');
+  }
+  if (
+    parsed.protocol !== 'https:' ||
+    !parsed.hostname ||
+    parsed.username ||
+    parsed.password ||
+    parsed.hash ||
+    !parsed.pathname.endsWith('/v1/wake')
+  ) {
+    throw new Error('PORTABLE_WAKE_URL must be an HTTPS URL ending in /v1/wake');
+  }
+  if (!/^[0-9a-f]{64}$/i.test(wakeToken)) {
+    throw new Error('PORTABLE_WAKE_TOKEN must contain exactly 64 hexadecimal characters');
+  }
+  return { wakeUrl: parsed.toString(), wakeToken };
+}
+
 /**
  * Resolve the hosted-relay base URL the registration agent talks to
  * (`/tunnel/register` + `/tunnel/heartbeat`). Reads `PORTABLE_RELAY_URL` at CALL
@@ -323,6 +383,9 @@ export function buildApiChildEnv(
   overrides: ApiChildEnvOverrides = {}
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
+  // The wake bearer only mints local pairing QR codes. Never expose it to the
+  // API or to agent subprocesses spawned below that boundary.
+  delete env.PORTABLE_WAKE_TOKEN;
   // Shell aliases are not executable under child_process.spawn. Preset names are
   // carried by CODEX_PRESETS_JSON and must never occupy the executable slot.
   if (env.CODEX_BIN === 'supersol' || env.CODEX_BIN === 'superastra') {

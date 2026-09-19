@@ -59,6 +59,7 @@ import {
   useSandboxHealthMonitor,
   useSandboxHealthStore,
   type SandboxHealthMonitorDeps,
+  type SandboxHealthMonitorEvents,
 } from '../src/features/health';
 import type { AppStateLike, NetInfoLike, AppStateStatus } from '../src/features/socket';
 
@@ -399,5 +400,78 @@ describe('useSandboxHealthMonitor (RN lifecycle)', () => {
     // …and the 90s poll of the fresh window trips.
     await sched.advance(HEALTH_POLL_INTERVAL_MS);
     expect(onConnectionFailed).toHaveBeenCalledTimes(1);
+  });
+
+  it('requests wake on the first online reconnecting transition and surfaces wake status', async () => {
+    let events: SandboxHealthMonitorEvents | undefined;
+    const requestWake = jest.fn(async (onRequest: () => void) => {
+      onRequest();
+    });
+    const monitor = {
+      startHealthPolling: jest.fn(),
+      stopHealthPolling: jest.fn(),
+      reset: jest.fn(),
+      setNetworkConnected: jest.fn(),
+    } as unknown as SandboxHealthMonitor;
+
+    function Harness() {
+      useSandboxHealthMonitor({
+        getRelayUrl: async () => SANDBOX_URL,
+        appState: createAppStateController().appState,
+        netInfo: createNetInfoController().netInfo,
+        requestWake,
+        createMonitor: (wiredEvents) => {
+          events = wiredEvents;
+          return monitor;
+        },
+      });
+      return null;
+    }
+
+    const view = render(<Harness />);
+    act(() => events?.onStatusChange('reconnecting'));
+    await act(async () => flushMicrotasks());
+
+    expect(requestWake).toHaveBeenCalledTimes(1);
+    expect(useSandboxHealthStore.getState().status).toBe('waking');
+
+    act(() => events?.onStatusChange('connected'));
+    expect(useSandboxHealthStore.getState().status).toBe('healthy');
+    view.unmount();
+  });
+
+  it('does not request wake while the phone is explicitly offline', async () => {
+    let events: SandboxHealthMonitorEvents | undefined;
+    const requestWake = jest.fn();
+    const netCtl = createNetInfoController();
+    const monitor = {
+      startHealthPolling: jest.fn(),
+      stopHealthPolling: jest.fn(),
+      reset: jest.fn(),
+      setNetworkConnected: jest.fn(),
+    } as unknown as SandboxHealthMonitor;
+
+    function Harness() {
+      useSandboxHealthMonitor({
+        getRelayUrl: async () => SANDBOX_URL,
+        appState: createAppStateController().appState,
+        netInfo: netCtl.netInfo,
+        requestWake,
+        createMonitor: (wiredEvents) => {
+          events = wiredEvents;
+          return monitor;
+        },
+      });
+      return null;
+    }
+
+    const view = render(<Harness />);
+    act(() => netCtl.emit(false));
+    act(() => events?.onStatusChange('reconnecting'));
+    await act(async () => flushMicrotasks());
+
+    expect(requestWake).not.toHaveBeenCalled();
+    expect(useSandboxHealthStore.getState().status).toBe('reconnecting');
+    view.unmount();
   });
 });

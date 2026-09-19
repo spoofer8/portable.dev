@@ -444,6 +444,10 @@ client id, scopes `repo read:org`). The token is stored locally, never on a serv
 > `bunx expo start`, EAS builds). See [`packages/mobile/CLAUDE.md`](packages/mobile/CLAUDE.md).
 > For first-time Sentry, Expo, and CI credentials, run `./scripts/setup-mobile-delivery.sh` from
 > the repository root. The wizard keeps tokens out of chat and shell history.
+>
+> For an always-on macOS runtime, run `bun packages/launcher/src/cli.ts service install`. Optional
+> wake-on-demand through a same-LAN Linux server is documented in
+> [`docs/wake-relay.md`](docs/wake-relay.md).
 
 ---
 

@@ -122,10 +122,10 @@ function makeDeps(trace: Trace) {
   let lastPayload = '';
   let lastUiOpts: Record<string, unknown> | undefined;
   let watchCb:
-    | ((state: { firstConnectedAt?: string; lastConnectedAt?: string }) => void)
-    | undefined;
+    ((state: { firstConnectedAt?: string; lastConnectedAt?: string }) => void) | undefined;
   let presenceCb: ((devices: unknown[]) => void) | undefined;
   let chatsCb: ((chats: unknown[]) => void) | undefined;
+  let chatsWatchStarts = 0;
   let healthOpts: Record<string, unknown> | undefined;
 
   const deps: LauncherDeps = {
@@ -177,6 +177,7 @@ function makeDeps(trace: Trace) {
       return { stop: () => trace.order.push('presence.stop') };
     }) as LauncherDeps['startPresenceWatch'],
     startChatsWatch: ((_load, onChats) => {
+      chatsWatchStarts += 1;
       chatsCb = onChats as typeof chatsCb;
       return {
         refresh: () => trace.order.push('chats.refresh'),
@@ -208,6 +209,7 @@ function makeDeps(trace: Trace) {
     getConnectedStates: () => connectedStates,
     getDeviceUpdates: () => deviceUpdates,
     getChatUpdates: () => chatUpdates,
+    getChatsWatchStarts: () => chatsWatchStarts,
     fireConnected: (state: { firstConnectedAt?: string; lastConnectedAt?: string }) =>
       watchCb?.(state),
     firePresence: (devices: unknown[]) => presenceCb?.(devices),
@@ -525,6 +527,31 @@ describe('Launcher.boot', () => {
     fireChats([{ id: 'c1', title: 'Fix the bug' }]);
     expect(getChatUpdates()).toHaveLength(1);
     expect(getChatUpdates()[0]).toHaveLength(1);
+  });
+
+  it('does not poll chats when the headless service has no chat UI', async () => {
+    const trace: Trace = { order: [] };
+    const { deps, getChatsWatchStarts } = makeDeps(trace);
+    deps.watchChats = false;
+    const launcher = new Launcher(deps);
+
+    await launcher.boot();
+
+    expect(getChatsWatchStarts()).toBe(0);
+  });
+
+  it('includes the optional wake capability in the pairing payload', async () => {
+    const trace: Trace = { order: [] };
+    const { deps, getPayload } = makeDeps(trace);
+    deps.wakeCapability = {
+      wakeUrl: 'https://server.example.ts.net:8445/v1/wake',
+      wakeToken: 'ab'.repeat(32),
+    };
+    const launcher = new Launcher(deps);
+
+    await launcher.boot();
+
+    expect(JSON.parse(getPayload())).toMatchObject(deps.wakeCapability);
   });
 
   it('does NOT watch when the PC has already connected (menu at boot)', async () => {

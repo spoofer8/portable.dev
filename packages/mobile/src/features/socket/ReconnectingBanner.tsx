@@ -15,12 +15,14 @@
 import { ActivityIndicator, StyleSheet, Text, View } from 'react-native';
 
 import { useSocketStore } from './socketStore';
+import { useSandboxHealthStore } from '../health/healthStore';
 import { useAppTheme } from '../../theme';
 
 export function ReconnectingBanner() {
   const connected = useSocketStore((s) => s.connected);
   const hasConnectedOnce = useSocketStore((s) => s.hasConnectedOnce);
   const connectionState = useSocketStore((s) => s.connectionState);
+  const healthStatus = useSandboxHealthStore((s) => s.status);
   const { theme, getBoldTextColor } = useAppTheme();
 
   // Terminal dead pairing: no spinner (nothing is retrying); recovery is the
@@ -41,7 +43,8 @@ export function ReconnectingBanner() {
   // Only surface after the first successful connection: a fresh mount that has
   // never connected is "connecting" (handled by provisioning UI), not
   // "reconnecting".
-  if (connected || !hasConnectedOnce) return null;
+  const waking = healthStatus === 'waking';
+  if (!waking && (connected || !hasConnectedOnce)) return null;
 
   // Use the accent for the reconnecting indicator; the text color stays
   // readable over it (bold-text luminance pick).
@@ -54,7 +57,7 @@ export function ReconnectingBanner() {
     >
       <ActivityIndicator size="small" color={fg} />
       <Text style={[styles.text, { color: fg }]} testID="reconnecting-banner-text">
-        Reconnecting…
+        {waking ? 'Waking your Mac…' : 'Reconnecting…'}
       </Text>
     </View>
   );

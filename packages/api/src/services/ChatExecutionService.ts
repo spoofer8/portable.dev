@@ -59,6 +59,7 @@ import type {
 } from './CodexService/index.js';
 import type { IOutputEmitter } from './emitters/IOutputEmitter.js';
 import type { GitLocalService } from './GitLocalService.js';
+import type { PowerAssertionService } from './PowerAssertionService.js';
 import type { TunnelService } from './TunnelService.js';
 import type { DbAdapter } from '../db/DbAdapter.js';
 import type { ExecutionContext } from './types/ExecutionContext.js';
@@ -121,6 +122,7 @@ export class ChatExecutionService {
   private executingChats: Set<string> = new Set();
 
   private codexExecutionContexts = new Map<string, ExecutionContext>();
+  private codexPowerReleases = new Map<string, () => void>();
 
   constructor(
     private chatService: ChatService,
@@ -144,7 +146,8 @@ export class ChatExecutionService {
     // repo's real worktree set (start a chat INSIDE a worktree).
     private sourceControlService?: import('./SourceControlService.js').SourceControlService,
     private codexService?: CodexService,
-    private readonly codexCwdValidator: CodexCwdValidator = validateCodexCwd
+    private readonly codexCwdValidator: CodexCwdValidator = validateCodexCwd,
+    private readonly powerAssertionService?: PowerAssertionService
   ) {
     console.log('[ChatExecutionService] Initialized');
   }
@@ -1274,6 +1277,7 @@ export class ChatExecutionService {
     // the identity (user/auth/emitter) is stable across a fork.
     const { userId, username, authToken, emitter } = context;
     let chatId = context.chatId;
+    const releaseAgentPower = this.powerAssertionService?.acquire(`agent:execution:${chatId}`);
 
     try {
       // ===== FORK-ON-FIRST-WRITE GUARD (durability — single execution chokepoint) =====
@@ -1465,6 +1469,8 @@ export class ChatExecutionService {
 
       // Re-throw error so callers can handle it (important for testing)
       throw error;
+    } finally {
+      releaseAgentPower?.();
     }
   }
 
@@ -1528,6 +1534,7 @@ export class ChatExecutionService {
 
     this.executingChats.add(chatId);
     this.codexExecutionContexts.set(chatId, context);
+    let turnStarted = false;
     try {
       const chat = await this.chatService.getChat(chatId, userId, authToken);
       if (!chat) throw new Error(`Chat ${chatId} not found in database`);
@@ -1577,8 +1584,11 @@ export class ChatExecutionService {
         effort: options.effort || preset.effort,
         approvalPolicy: this.codexApprovalPolicy(effectivePermissions),
       };
+      this.ensureCodexPowerLease(chatId);
       await this.codexService.addMessageToSession(chatId, message.content, turnOptions);
+      turnStarted = true;
     } finally {
+      if (!turnStarted) this.releaseCodexPowerLease(chatId);
       this.executingChats.delete(chatId);
     }
   }
@@ -1626,6 +1636,7 @@ export class ChatExecutionService {
     context.emitter.broadcastRuntimeStateToUser?.(context.userId);
 
     if (event.state === 'idle' || event.state === 'stopped' || event.state === 'error') {
+      this.releaseCodexPowerLease(event.chatId);
       const preview = this.extractNotificationPreview(event.chatId);
       await this.saveAccumulatedMessage(event.chatId, context.userId, context.authToken);
       if (event.state === 'error') {
@@ -1644,6 +1655,21 @@ export class ChatExecutionService {
         );
       }
     }
+  }
+
+  private ensureCodexPowerLease(chatId: string): void {
+    if (!this.powerAssertionService || this.codexPowerReleases.has(chatId)) return;
+    this.codexPowerReleases.set(
+      chatId,
+      this.powerAssertionService.acquire(`agent:codex:${chatId}`)
+    );
+  }
+
+  private releaseCodexPowerLease(chatId: string): void {
+    const release = this.codexPowerReleases.get(chatId);
+    if (!release) return;
+    this.codexPowerReleases.delete(chatId);
+    release();
   }
 
   async handleCodexApproval(request: CodexApprovalRequest): Promise<void> {

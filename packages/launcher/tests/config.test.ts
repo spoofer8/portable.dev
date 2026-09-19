@@ -4,8 +4,10 @@ import path from 'path';
 import { describe, expect, it } from 'bun:test';
 
 import {
+  buildApiChildEnv,
   loadOperatorEnv,
   resolveCliVersion,
+  resolveWakeCapability,
   resolveTunnelProvider,
   resolveUseNgrok,
 } from '../src/config.js';
@@ -120,5 +122,68 @@ describe('resolveUseNgrok — the --ngrok flag layered on PORTABLE_TUNNEL_PROVID
 
   it('PORTABLE_TUNNEL_PROVIDER=ngrok enables ngrok without the flag', () => {
     expect(resolveUseNgrok({ PORTABLE_TUNNEL_PROVIDER: 'ngrok' }, false)).toBe(true);
+  });
+});
+
+describe('resolveWakeCapability', () => {
+  it('returns undefined when wake-on-demand is not configured', () => {
+    expect(resolveWakeCapability({})).toBeUndefined();
+  });
+
+  it('returns a validated HTTPS endpoint and opaque token', () => {
+    const token = 'ab'.repeat(32);
+    expect(
+      resolveWakeCapability({
+        PORTABLE_WAKE_URL: 'https://server.example.ts.net:8445/v1/wake',
+        PORTABLE_WAKE_TOKEN: token,
+      })
+    ).toEqual({
+      wakeUrl: 'https://server.example.ts.net:8445/v1/wake',
+      wakeToken: token,
+    });
+  });
+
+  it('reads a stored capability when environment variables are absent', () => {
+    const token = 'cd'.repeat(32);
+    const store = {
+      get: (name: string) =>
+        name === 'wake:capability'
+          ? JSON.stringify({ wakeUrl: 'https://server.example.ts.net/v1/wake', wakeToken: token })
+          : undefined,
+    };
+    expect(resolveWakeCapability({}, store)).toEqual({
+      wakeUrl: 'https://server.example.ts.net/v1/wake',
+      wakeToken: token,
+    });
+  });
+
+  it('rejects partial, insecure, or malformed wake capabilities', () => {
+    expect(() => resolveWakeCapability({ PORTABLE_WAKE_URL: 'https://server/v1/wake' })).toThrow(
+      /configured together/
+    );
+    expect(() =>
+      resolveWakeCapability({
+        PORTABLE_WAKE_URL: 'http://server/v1/wake',
+        PORTABLE_WAKE_TOKEN: 'ab'.repeat(32),
+      })
+    ).toThrow(/HTTPS URL/);
+    expect(() =>
+      resolveWakeCapability({
+        PORTABLE_WAKE_URL: 'https://server/v1/wake',
+        PORTABLE_WAKE_TOKEN: 'short',
+      })
+    ).toThrow(/64 hexadecimal/);
+  });
+});
+
+describe('buildApiChildEnv wake capability boundary', () => {
+  it('never forwards the wake bearer to the API child', () => {
+    const child = buildApiChildEnv({
+      PORTABLE_WAKE_URL: 'https://server.example.ts.net/v1/wake',
+      PORTABLE_WAKE_TOKEN: 'ab'.repeat(32),
+    });
+
+    expect(child.PORTABLE_WAKE_URL).toBe('https://server.example.ts.net/v1/wake');
+    expect(child.PORTABLE_WAKE_TOKEN).toBeUndefined();
   });
 });

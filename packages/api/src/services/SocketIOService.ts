@@ -13,6 +13,7 @@ import type { ChatService } from './ChatService.js';
 import type { ClaudeService } from './ClaudeService.js';
 import type { E2eSessionService } from './E2eSessionService.js';
 import type { GitLocalService } from './GitLocalService.js';
+import type { PowerAssertionService } from './PowerAssertionService.js';
 import type { TunnelService } from './TunnelService.js';
 import type { DbAdapter } from '../db/DbAdapter.js';
 import type { ExecutionContext } from './types/ExecutionContext.js';
@@ -72,7 +73,8 @@ export class SocketIOService {
     private processTrackerService?: any,
     private dbAdapter?: DbAdapter,
     private sopService?: any,
-    private pushNotificationService?: any // PushNotificationService (avoid circular import)
+    private pushNotificationService?: any, // PushNotificationService (avoid circular import)
+    private powerAssertionService?: PowerAssertionService
   ) {
     console.log('[SocketIO] Initializing Socket.IO server...');
 
@@ -223,6 +225,7 @@ export class SocketIOService {
   private setupEventHandlers() {
     this.io.on('connection', async (socket: Socket) => {
       const { userEmail } = socket.data;
+      const releaseConnectionPower = this.powerAssertionService?.acquire(`socket:${socket.id}`);
 
       // E2E encryption (portable.dev#13): install the per-frame seal/open FIRST,
       // before any handler binds or any emit fires, so every frame on this socket
@@ -286,6 +289,8 @@ export class SocketIOService {
       // Handle disconnect
       socket.on('disconnect', (reason) => {
         console.log(`[SocketIO] User disconnected: ${userEmail} (${socket.id}) - ${reason}`);
+
+        releaseConnectionPower?.();
 
         // Clean up activity tracking
         this.socketActivity.delete(socket.id);
@@ -1041,6 +1046,9 @@ export class SocketIOService {
 
     // Clear activity tracking
     this.socketActivity.clear();
+
+    // Release the host power assertion before closing the server.
+    this.powerAssertionService?.shutdown();
 
     // Close all connections
     this.io.close();

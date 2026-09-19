@@ -14,7 +14,7 @@
 import { create } from 'zustand';
 
 /** Coarse sandbox health phase. */
-export type SandboxHealthPhase = 'healthy' | 'reconnecting' | 'failed';
+export type SandboxHealthPhase = 'healthy' | 'reconnecting' | 'waking' | 'failed';
 
 export interface SandboxHealthState {
   /** Current health phase. Starts `healthy` (optimistic until a failure run). */
@@ -24,6 +24,8 @@ export interface SandboxHealthState {
   markHealthy: () => void;
   /** Health checks are failing but the 90s threshold has not tripped yet. */
   markReconnecting: () => void;
+  /** The health failure triggered this outage's one wake request. */
+  markWaking: () => void;
   /** 90s of continuous network-connected failure — sandbox declared down. */
   markFailed: () => void;
   /** Reset to the optimistic initial phase (foreground `active` / new sandbox). */
@@ -36,6 +38,7 @@ export const useSandboxHealthStore = create<SandboxHealthState>()((set) => ({
   status: initialStatus,
   markHealthy: () => set({ status: 'healthy' }),
   markReconnecting: () => set({ status: 'reconnecting' }),
+  markWaking: () => set({ status: 'waking' }),
   markFailed: () => set({ status: 'failed' }),
   reset: () => set({ status: initialStatus }),
 }));

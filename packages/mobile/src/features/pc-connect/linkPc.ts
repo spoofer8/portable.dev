@@ -18,7 +18,13 @@
  */
 
 import { clearPcPairing } from './disconnectPc';
-import { saveDeviceToken, saveE2eKey } from './deviceTokenStore';
+import {
+  clearWakeCapability,
+  saveDeviceToken,
+  saveE2eKey,
+  saveWakeCapability,
+  type WakeCapability,
+} from './deviceTokenStore';
 
 /** Everything the QR carries to link a (device, PC) pair. */
 export interface LinkPcInput {
@@ -36,6 +42,10 @@ export interface LinkPcInput {
    * keyless-reviewer shape; a missing value just skips the key save.
    */
   e2eKey?: string;
+  /** Optional HTTPS wake relay endpoint. Validated as a pair with `wakeToken`. */
+  wakeUrl?: string;
+  /** Optional opaque bearer for the wake relay. */
+  wakeToken?: string;
   /** Human-readable label for THIS device (optional; not sent anywhere). */
   deviceLabel?: string;
 }
@@ -45,6 +55,8 @@ export interface LinkPcDeps {
   saveToken?: (pcId: string, token: string) => Promise<void>;
   /** Seam: persist the QR's E2E key. Defaults to {@link saveE2eKey}. */
   saveE2eKey?: (pcId: string, e2eKey: string) => Promise<void>;
+  /** Replace the per-PC wake capability; `null` clears a stale prior capability. */
+  replaceWakeCapability?: (pcId: string, capability: WakeCapability | null) => Promise<void>;
 }
 
 /** What {@link linkPc} resolves with: the linked PC. */
@@ -58,12 +70,19 @@ export interface LinkPcResult {
  * `connectToPc(pcId)` reuses it without re-scanning. No gateway round-trip.
  */
 export async function linkPc(input: LinkPcInput, deps: LinkPcDeps = {}): Promise<LinkPcResult> {
-  const { pcId, token, e2eKey } = input;
+  const { pcId, token, e2eKey, wakeUrl, wakeToken } = input;
   const saveToken = deps.saveToken ?? saveDeviceToken;
   const saveKey = deps.saveE2eKey ?? saveE2eKey;
+  const replaceWake =
+    deps.replaceWakeCapability ??
+    (async (id: string, capability: WakeCapability | null) => {
+      if (capability) await saveWakeCapability(id, capability);
+      else await clearWakeCapability(id);
+    });
 
   await saveToken(pcId, token);
   if (e2eKey) await saveKey(pcId, e2eKey);
+  await replaceWake(pcId, wakeUrl && wakeToken ? { wakeUrl, wakeToken } : null);
 
   return { pcId };
 }

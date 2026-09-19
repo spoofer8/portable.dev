@@ -109,6 +109,48 @@ describe('parseQrPayload', () => {
   it('rejects empty input', () => {
     expect(parseQrPayload('')).toBeNull();
   });
+
+  it('accepts an optional HTTPS wake capability without exposing it separately', () => {
+    expect(
+      parseQrPayload(
+        JSON.stringify({
+          gatewayBase: 'https://app.portable.dev',
+          pcId: 'pc_charlie',
+          token: 'pc-minted-jwt',
+          e2eKey: 'psk-base64',
+          wakeUrl: 'https://wake.example.net/v1/wake',
+          wakeToken: 'ab'.repeat(32),
+        })
+      )
+    ).toEqual({
+      gatewayBase: 'https://app.portable.dev',
+      pcId: 'pc_charlie',
+      token: 'pc-minted-jwt',
+      e2eKey: 'psk-base64',
+      wakeUrl: 'https://wake.example.net/v1/wake',
+      wakeToken: 'ab'.repeat(32),
+    });
+  });
+
+  it.each([
+    { wakeUrl: 'https://wake.example.net/v1/wake' },
+    { wakeToken: 'opaque-wake-token' },
+    { wakeUrl: 'http://wake.example.net/v1/wake', wakeToken: 'opaque-wake-token' },
+    { wakeUrl: '/v1/wake', wakeToken: 'opaque-wake-token' },
+    { wakeUrl: 'https://wake.example.net/not-wake', wakeToken: 'opaque-wake-token' },
+  ])('rejects an incomplete or non-HTTPS wake capability: %p', (wake) => {
+    expect(
+      parseQrPayload(
+        JSON.stringify({
+          gatewayBase: 'https://app.portable.dev',
+          pcId: 'pc_charlie',
+          token: 'pc-minted-jwt',
+          e2eKey: 'psk-base64',
+          ...wake,
+        })
+      )
+    ).toBeNull();
+  });
 });
 
 describe('QRScannerGate', () => {

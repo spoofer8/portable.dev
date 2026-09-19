@@ -42,6 +42,8 @@ function makeHarness(
   const resolvePermissionRequest = mock(() => true);
   const resolveUserInputRequest = mock(() => true);
   const getSession = mock(() => undefined);
+  const releasePower = mock(() => {});
+  const acquirePower = mock(() => releasePower);
   const codexService = {
     getSession,
     startCodexSession,
@@ -81,7 +83,8 @@ function makeHarness(
     undefined,
     undefined,
     codexService,
-    codexCwdValidator
+    codexCwdValidator,
+    { acquire: acquirePower } as any
   );
   return {
     service,
@@ -97,6 +100,8 @@ function makeHarness(
     resolvePermissionRequest,
     resolveUserInputRequest,
     getSession,
+    acquirePower,
+    releasePower,
   };
 }
 
@@ -118,6 +123,37 @@ afterEach(() => {
 });
 
 describe('ChatExecutionService Codex routing', () => {
+  it('holds power around direct executeMessage calls used by PortableSDK', async () => {
+    const harness = makeHarness();
+
+    await harness.service.executeMessage(harness.context, { content: 'Run the tests' }, {});
+
+    expect(harness.acquirePower).toHaveBeenCalledWith('agent:execution:chat-1');
+    expect(harness.acquirePower).toHaveBeenCalledWith('agent:codex:chat-1');
+    expect(harness.releasePower).toHaveBeenCalledTimes(1);
+
+    await harness.service.handleCodexStatus({
+      chatId: 'chat-1',
+      userId: 'alice@example.com',
+      threadId: 'thread-1',
+      state: 'idle',
+    });
+
+    expect(harness.releasePower).toHaveBeenCalledTimes(2);
+  });
+
+  it('releases direct-call power when execution fails', async () => {
+    const harness = makeHarness({}, async () => {
+      throw new Error('invalid working directory');
+    });
+
+    await expect(
+      harness.service.executeMessage(harness.context, { content: 'Run the tests' }, {})
+    ).rejects.toThrow('invalid working directory');
+
+    expect(harness.releasePower).toHaveBeenCalledTimes(1);
+  });
+
   it('starts a Codex thread with the selected preset and persists its thread id', async () => {
     const harness = makeHarness();
 

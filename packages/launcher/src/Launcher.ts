@@ -28,6 +28,7 @@ import {
   resolveRelayBaseUrl,
   resolveReviewerPublish,
   resolveUseNgrok,
+  resolveWakeCapability,
 } from './config.js';
 import { startConnectionWatch, type ConnectionWatcherHandle } from './ConnectionWatcher.js';
 import {
@@ -139,6 +140,8 @@ export interface LauncherDeps {
   label: string;
   /** The hosted relay base (`gatewayBase` in the QR payload). */
   gatewayBase: string;
+  /** Optional out-of-band wake endpoint and bearer, shared only through the pairing QR. */
+  wakeCapability?: { wakeUrl: string; wakeToken: string };
   /** Optional connected GitHub login (preferred JWT username). */
   githubLogin?: string;
   /**
@@ -189,6 +192,8 @@ export interface LauncherDeps {
     load: () => Promise<ChatSummary[]>,
     onChats: (chats: ChatSummary[]) => void
   ) => ChatsWatcherHandle;
+  /** Disable chat polling for a headless daemon whose UI cannot display it. */
+  watchChats?: boolean;
   /**
    * rev12 D61: data provider for the connected menu's "[3] MCP Server" status
    * sub-view (hooks/sidecar install results + the live terminal-session
@@ -340,6 +345,7 @@ export class Launcher {
       pcId: this.deps.pcId,
       token,
       e2eKey: this.deps.e2ePsk,
+      ...this.deps.wakeCapability,
     });
   }
 
@@ -569,14 +575,16 @@ export class Launcher {
 
     // Live recent chats: poll the api (loopback) and feed the connected menu's chats
     // column. The list reflects archives within a refresh tick.
-    const startChats = this.deps.startChatsWatch ?? startChatsWatch;
-    this.chatsWatch = startChats(
-      () => (chatsClient ? chatsClient.listRecent() : Promise.resolve([])),
-      (chats) => {
-        if (this.shuttingDown) return;
-        this.ui?.setChats(chats);
-      }
-    );
+    if (this.deps.watchChats !== false) {
+      const startChats = this.deps.startChatsWatch ?? startChatsWatch;
+      this.chatsWatch = startChats(
+        () => (chatsClient ? chatsClient.listRecent() : Promise.resolve([])),
+        (chats) => {
+          if (this.shuttingDown) return;
+          this.ui?.setChats(chats);
+        }
+      );
+    }
 
     // Tunnel self-heal: continuously verify the PUBLIC relay path the phone uses is
     // reachable (gateway → tunnel → api), and cycle cloudflared when it's broken
@@ -766,6 +774,7 @@ export async function createLauncher(options: CreateLauncherOptions = {}): Promi
   const pcId = resolvePcId(store, env);
   const label = resolvePcLabel(env);
   const gatewayBase = resolveRelayBaseUrl(env);
+  const wakeCapability = resolveWakeCapability(env, store);
   const endpoint = `${gatewayBase}/t/${pcId}`;
 
   const debug = options.debug ?? false;
@@ -973,6 +982,7 @@ export async function createLauncher(options: CreateLauncherOptions = {}): Promi
     endpoint,
     label,
     gatewayBase,
+    wakeCapability,
     githubLogin,
     mcpStatus,
     // portable.dev#12 (PRD §3.2): lazily build the interactive "[4] Services"
@@ -998,6 +1008,7 @@ export async function createLauncher(options: CreateLauncherOptions = {}): Promi
     // prepareCredentials persisted it) — the first-ever-boot fix.
     resolveGithubLogin: () => readStoredGitHubLogin(store),
     startUi,
+    watchChats: !service,
     // Route boot detail/warnings to the api LOG FILE so they never corrupt the
     // Ink-owned terminal (the live status box).
     apiLog,

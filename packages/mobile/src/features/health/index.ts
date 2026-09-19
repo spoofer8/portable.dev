@@ -17,6 +17,7 @@ export type { SandboxHealthPhase, SandboxHealthState } from './healthStore';
 export { useSandboxHealthMonitor } from './useSandboxHealthMonitor';
 export type {
   SandboxHealthMonitorDeps,
+  SandboxHealthMonitorEvents,
   SandboxHealthMonitorHandle,
 } from './useSandboxHealthMonitor';
 
@@ -38,6 +39,9 @@ export {
   STARTUP_BACKOFF_CAP_SECONDS,
   STARTUP_MAX_ATTEMPTS,
   STARTUP_HEALTH_TIMEOUT_MS,
+  WAKE_STARTUP_BACKOFF_SECONDS,
+  WAKE_STARTUP_MAX_ATTEMPTS,
+  WAKE_STARTUP_RETRY_WINDOW_MS,
 } from './startupHealthCheck';
 export type { StartupHealthCheckDeps } from './startupHealthCheck';
 export { useStartupHealthStore } from './startupHealthStore';
@@ -61,3 +65,10 @@ export { useConnectionFailedStore } from './connectionFailedStore';
 export type { ConnectionFailedReason, ConnectionFailedState } from './connectionFailedStore';
 export { ConnectionFailedScreen } from './ConnectionFailedScreen';
 export type { ConnectionFailedScreenProps } from './ConnectionFailedScreen';
+export {
+  requestConnectedPcWakeOnce,
+  resetConnectedPcWakeOutage,
+  wakeRequestExtendsRetry,
+  WAKE_REQUEST_TIMEOUT_MS,
+} from './wakeOnDemand';
+export type { RequestConnectedPcWakeDeps, WakeRequestResult } from './wakeOnDemand';

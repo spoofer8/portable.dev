@@ -6,6 +6,7 @@
  * (`StartupHealthGate`) reads `phase`:
  *
  *   - `checking` → the sandbox is warming up; show the LOADING state.
+ *   - `waking`   → a wake request was sent; keep the loading state visible.
  *   - `ready`    → the sandbox answered `200`; render the app.
  *   - `failed`   → the attempt budget was exhausted; hand off to the recovery /
  *                  ConnectionFailed UX. An ABORT (navigate away / sign out) does
@@ -19,7 +20,7 @@
 import { create } from 'zustand';
 
 /** Coarse cold-start boot phase. */
-export type StartupHealthPhase = 'checking' | 'ready' | 'failed';
+export type StartupHealthPhase = 'checking' | 'waking' | 'ready' | 'failed';
 
 export interface StartupHealthState {
   /** Current boot phase. Starts `checking` (optimistic loading on launch). */
@@ -29,6 +30,8 @@ export interface StartupHealthState {
 
   /** Begin a fresh cold-start check (loading). */
   markChecking: () => void;
+  /** A configured wake relay accepted an authenticated wake attempt. */
+  markWaking: () => void;
   /** Record the current probe attempt number. */
   setAttempt: (attempt: number) => void;
   /** Sandbox answered `200` — boot complete. */
@@ -45,6 +48,7 @@ export const useStartupHealthStore = create<StartupHealthState>()((set) => ({
   phase: initialPhase,
   attempt: 0,
   markChecking: () => set({ phase: 'checking', attempt: 0 }),
+  markWaking: () => set({ phase: 'waking' }),
   setAttempt: (attempt) => set({ attempt }),
   markReady: () => set({ phase: 'ready' }),
   markFailed: () => set({ phase: 'failed' }),

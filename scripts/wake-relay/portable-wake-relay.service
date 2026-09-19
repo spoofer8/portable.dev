@@ -1,0 +1,30 @@
+[Unit]
+Description=Portable Wake-on-LAN relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/portable-wake-relay/env
+ExecStart=/usr/bin/python3 %h/.local/share/portable-wake-relay/wake_relay.py
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_UNIX
+CapabilityBoundingSet=
+TasksMax=16
+MemoryMax=64M
+UMask=0077
+
+[Install]
+WantedBy=default.target

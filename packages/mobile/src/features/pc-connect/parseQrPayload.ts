@@ -46,7 +46,7 @@ export function parseQrPayload(raw: string): QrLinkPayload | null {
   if (typeof parsed !== 'object' || parsed === null) return null;
   const candidate = parsed as Record<string, unknown>;
 
-  const { gatewayBase, pcId, token, e2eKey } = candidate;
+  const { gatewayBase, pcId, token, e2eKey, wakeUrl, wakeToken } = candidate;
   if (
     !isNonEmptyString(gatewayBase) ||
     !isNonEmptyString(pcId) ||
@@ -58,10 +58,43 @@ export function parseQrPayload(raw: string): QrLinkPayload | null {
 
   if (!/^https?:\/\//i.test(gatewayBase.trim())) return null;
 
+  // Wake-on-demand is an optional capability, but its URL and bearer are one
+  // indivisible credential. Reject partial capabilities instead of silently
+  // persisting a configuration that can never authenticate.
+  const hasWakeUrl = wakeUrl !== undefined;
+  const hasWakeToken = wakeToken !== undefined;
+  if (hasWakeUrl !== hasWakeToken) return null;
+
+  let normalizedWakeUrl: string | undefined;
+  let normalizedWakeToken: string | undefined;
+  if (hasWakeUrl && hasWakeToken) {
+    if (!isNonEmptyString(wakeUrl) || !isNonEmptyString(wakeToken)) return null;
+    if (!/^[0-9a-f]{64}$/i.test(wakeToken.trim())) return null;
+    try {
+      const parsedWakeUrl = new URL(wakeUrl.trim());
+      if (
+        parsedWakeUrl.protocol !== 'https:' ||
+        !parsedWakeUrl.hostname ||
+        !parsedWakeUrl.pathname.endsWith('/v1/wake') ||
+        parsedWakeUrl.username ||
+        parsedWakeUrl.password
+      ) {
+        return null;
+      }
+      normalizedWakeUrl = parsedWakeUrl.toString();
+    } catch {
+      return null;
+    }
+    normalizedWakeToken = wakeToken.trim();
+  }
+
   return {
     gatewayBase: gatewayBase.trim(),
     pcId: pcId.trim(),
     token: token.trim(),
     e2eKey: e2eKey.trim(),
+    ...(normalizedWakeUrl && normalizedWakeToken
+      ? { wakeUrl: normalizedWakeUrl, wakeToken: normalizedWakeToken }
+      : {}),
   };
 }

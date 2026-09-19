@@ -20,6 +20,8 @@ export interface HostMetricsDeps {
   emit: (metrics: SandboxMetrics) => void;
   /** Workspace dir to size (best-effort, cached). Omitted → `workspaceSizeGB` stays 0. */
   workspaceDir?: string;
+  /** Whether a client currently consumes metrics. Defaults to true. */
+  isActive?: () => boolean;
   /** Sample/emit interval in ms (default 2000). */
   intervalMs?: number;
   // Injectable seams for deterministic unit tests (default to Node built-ins):
@@ -63,6 +65,7 @@ export class HostMetricsService {
   private readonly uptime: () => number;
   private readonly now: () => number;
   private readonly readWorkspaceSize: (dir: string) => Promise<number>;
+  private readonly isActive: () => boolean;
   private readonly setIntervalImpl: (fn: () => void, ms: number) => ReturnType<typeof setInterval>;
   private readonly clearIntervalImpl: (handle: ReturnType<typeof setInterval>) => void;
 
@@ -83,16 +86,14 @@ export class HostMetricsService {
     this.readWorkspaceSize =
       deps.workspaceSize ??
       ((dir) => dirSizeBytes(dir, this.now() + WORKSPACE_SIZE_DEADLINE_MS, this.now));
+    this.isActive = deps.isActive ?? (() => true);
     this.setIntervalImpl = deps.setIntervalImpl ?? ((fn, ms) => setInterval(fn, ms));
     this.clearIntervalImpl = deps.clearIntervalImpl ?? ((h) => clearInterval(h));
   }
 
   start(): void {
     if (this.timer) return;
-    // Seed the CPU baseline so the FIRST emitted tick already carries a real delta.
-    this.prevCpu = this.cpuSnapshot();
-    // Kick the first (async, best-effort) workspace-size computation.
-    void this.recomputeWorkspaceSize();
+    if (this.isActive()) this.beginSampling();
     this.timer = this.setIntervalImpl(() => this.tick(), this.intervalMs);
     // Don't keep the process alive just for metrics (Node Timeout / Bun Timer).
     (this.timer as { unref?: () => void } | null)?.unref?.();
@@ -106,6 +107,14 @@ export class HostMetricsService {
 
   /** One sample → emit. Public so unit tests can drive ticks without a real timer. */
   tick(): void {
+    if (!this.isActive()) {
+      this.prevCpu = null;
+      return;
+    }
+    if (!this.prevCpu) {
+      this.beginSampling();
+      return;
+    }
     const sample = this.sample();
     this.tickCount += 1;
     if (this.tickCount % WORKSPACE_RECOMPUTE_EVERY_TICKS === 0) {
@@ -116,6 +125,11 @@ export class HostMetricsService {
     } catch {
       // A broken emit must never crash the metrics loop.
     }
+  }
+
+  private beginSampling(): void {
+    this.prevCpu = this.cpuSnapshot();
+    void this.recomputeWorkspaceSize();
   }
 
   /** Compute one metrics sample (also advances the CPU delta baseline). */

@@ -23,7 +23,12 @@ export {
   saveE2eKey,
   DEVICE_TOKEN_KEY_PREFIX,
   E2E_KEY_PREFIX,
+  getWakeCapability,
+  saveWakeCapability,
+  clearWakeCapability,
+  WAKE_CAPABILITY_KEY_PREFIX,
 } from './deviceTokenStore';
+export type { WakeCapability } from './deviceTokenStore';
 export {
   relayBaseForPc,
   saveConnectedPcId,

@@ -25,6 +25,10 @@ const CONTEXT: FreshPairingContext = {
   dataDir: '/tmp/ignored',
   pcId: 'pc_abc',
   gatewayBase: 'https://relay.example',
+  wakeCapability: {
+    wakeUrl: 'https://server.example.ts.net:8445/v1/wake',
+    wakeToken: 'ab'.repeat(32),
+  },
 };
 
 const STORE_SEED = {
@@ -62,10 +66,14 @@ describe('PairingSessionFactory.refresh', () => {
       pcId: string;
       token: string;
       e2eKey: string;
+      wakeUrl: string;
+      wakeToken: string;
     };
     expect(payload.gatewayBase).toBe('https://relay.example');
     expect(payload.pcId).toBe('pc_abc');
     expect(payload.e2eKey).toBe('e2e-psk-base64==');
+    expect(payload.wakeUrl).toBe(CONTEXT.wakeCapability?.wakeUrl);
+    expect(payload.wakeToken).toBe(CONTEXT.wakeCapability?.wakeToken);
     expect(session.qr).toContain('QR[');
     expect(session.loopbackUrl).toBe('http://localhost:54321/');
     expect(counters.started).toBe(1);
@@ -140,10 +148,11 @@ describe('resolveFreshPairingContext', () => {
       tunnelProvider: 'ngrok',
       forwardedFlags: [],
     };
-    expect(resolveFreshPairingContext({ readManifest: () => manifest })).toEqual({
+    expect(resolveFreshPairingContext({ readManifest: () => manifest, env: {} })).toEqual({
       dataDir: '/Users/u/.portable',
       pcId: 'pc_from_manifest',
       gatewayBase: 'https://manifest.relay',
+      wakeCapability: undefined,
     });
   });
 

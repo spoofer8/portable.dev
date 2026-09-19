@@ -28,6 +28,17 @@ export const DEVICE_TOKEN_KEY_PREFIX = 'portable.deviceToken.';
 /** SecureStore key prefix for a per-PC E2E pre-shared key (base64, from the QR). */
 export const E2E_KEY_PREFIX = 'portable.e2eKey.';
 
+/** SecureStore key prefix for the optional wake-on-demand capability. */
+export const WAKE_CAPABILITY_KEY_PREFIX = 'portable.wakeCapability.';
+
+/** The private relay capability used to wake a sleeping Mac. */
+export interface WakeCapability {
+  /** Full HTTPS POST target, normally ending in `/v1/wake`. */
+  wakeUrl: string;
+  /** Opaque bearer. Never include this value in logs or telemetry. */
+  wakeToken: string;
+}
+
 /**
  * expo-secure-store keys must match `[A-Za-z0-9._-]+`, but a `pcId` is opaque
  * (`pc_<uuid>` today, but never assume) — sanitize any other char so an exotic
@@ -35,6 +46,10 @@ export const E2E_KEY_PREFIX = 'portable.e2eKey.';
  */
 function keyForPc(pcId: string): string {
   return `${DEVICE_TOKEN_KEY_PREFIX}${pcId.replace(/[^A-Za-z0-9._-]/g, '_')}`;
+}
+
+function wakeCapabilityKeyForPc(pcId: string): string {
+  return `${WAKE_CAPABILITY_KEY_PREFIX}${pcId.replace(/[^A-Za-z0-9._-]/g, '_')}`;
 }
 
 /** Persist the data-path JWT for `pcId` (written on a successful link/renewal). */
@@ -77,6 +92,11 @@ export async function clearDeviceToken(pcId: string): Promise<void> {
   } catch {
     /* best-effort — a stale E2E key is harmless without the pairing */
   }
+  try {
+    await clearWakeCapability(pcId);
+  } catch {
+    /* best-effort: a wake capability is inert without its pairing */
+  }
 }
 
 /**
@@ -110,4 +130,45 @@ export async function getE2eKey(pcId: string): Promise<string | null> {
  */
 export async function getE2eKeyStrict(pcId: string): Promise<string | null> {
   return SecureStore.getItemAsync(e2eKeyForPc(pcId));
+}
+
+/** Persist the optional wake endpoint and bearer as one keychain value. */
+export async function saveWakeCapability(pcId: string, capability: WakeCapability): Promise<void> {
+  await SecureStore.setItemAsync(wakeCapabilityKeyForPc(pcId), JSON.stringify(capability));
+}
+
+/** Read the wake capability, degrading corrupt or inaccessible values to unavailable. */
+export async function getWakeCapability(pcId: string): Promise<WakeCapability | null> {
+  try {
+    const value = await SecureStore.getItemAsync(wakeCapabilityKeyForPc(pcId));
+    if (!value) return null;
+    const parsed = JSON.parse(value) as Partial<WakeCapability>;
+    if (
+      typeof parsed.wakeUrl !== 'string' ||
+      !parsed.wakeUrl ||
+      typeof parsed.wakeToken !== 'string' ||
+      !/^[0-9a-f]{64}$/i.test(parsed.wakeToken)
+    ) {
+      return null;
+    }
+    const url = new URL(parsed.wakeUrl);
+    if (
+      url.protocol !== 'https:' ||
+      !url.hostname ||
+      url.username ||
+      url.password ||
+      url.hash ||
+      !url.pathname.endsWith('/v1/wake')
+    ) {
+      return null;
+    }
+    return { wakeUrl: url.toString(), wakeToken: parsed.wakeToken };
+  } catch {
+    return null;
+  }
+}
+
+/** Remove the wake capability when a pairing is replaced or forgotten. */
+export async function clearWakeCapability(pcId: string): Promise<void> {
+  await SecureStore.deleteItemAsync(wakeCapabilityKeyForPc(pcId));
 }

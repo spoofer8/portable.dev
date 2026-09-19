@@ -128,6 +128,43 @@ describe('linkPc (save-only — rev6)', () => {
 
     expect(saveE2eKey).not.toHaveBeenCalled();
   });
+
+  it('persists the optional wake capability as one secure value', async () => {
+    const replaceWakeCapability = jest.fn().mockResolvedValue(undefined);
+
+    await linkPc(
+      {
+        gatewayBase: GATEWAY,
+        pcId: 'pc_charlie',
+        token: 'pc-minted-jwt',
+        e2eKey: 'psk-base64',
+        wakeUrl: 'https://wake.example.net/v1/wake',
+        wakeToken: 'ab'.repeat(32),
+      },
+      { replaceWakeCapability }
+    );
+
+    expect(replaceWakeCapability).toHaveBeenCalledWith('pc_charlie', {
+      wakeUrl: 'https://wake.example.net/v1/wake',
+      wakeToken: 'ab'.repeat(32),
+    });
+  });
+
+  it('clears a stale wake capability when a backward-compatible QR omits it', async () => {
+    const replaceWakeCapability = jest.fn().mockResolvedValue(undefined);
+
+    await linkPc(
+      {
+        gatewayBase: GATEWAY,
+        pcId: 'pc_charlie',
+        token: 'pc-minted-jwt',
+        e2eKey: 'psk-base64',
+      },
+      { replaceWakeCapability }
+    );
+
+    expect(replaceWakeCapability).toHaveBeenCalledWith('pc_charlie', null);
+  });
 });
 
 describe('verifyTunnelAddress', () => {
