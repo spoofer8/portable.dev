@@ -294,17 +294,11 @@ fi
 
 stage "Store credentials"
 say "Writing secrets to protected GitHub environments and EAS. Values stay hidden."
-SIGNING_KEY_PATH="$MOBILE_DIR/.secrets/eas-updates/private-key.pem"
 FIREBASE_PLIST_PATH="$MOBILE_DIR/GoogleService-Info.plist"
-[[ -f "$SIGNING_KEY_PATH" ]] || {
-  warn "Missing $SIGNING_KEY_PATH. Restore the private key matching certs/certificate.pem."
-  exit 1
-}
 [[ -f "$FIREBASE_PLIST_PATH" ]] || {
   warn "Missing $FIREBASE_PLIST_PATH. Download it from the Firebase iOS app settings."
   exit 1
 }
-EAS_UPDATE_PRIVATE_KEY=$(<"$SIGNING_KEY_PATH")
 GOOGLE_SERVICE_INFO_PLIST_BASE64=$(base64 < "$FIREBASE_PLIST_PATH")
 
 ENV_FILE="$MOBILE_DIR/.env"
@@ -321,7 +315,6 @@ chmod 600 "$ENV_FILE"
 for deployment_environment in preview production; do
   set_environment_secret "$deployment_environment" EXPO_TOKEN "$EXPO_TOKEN"
   set_environment_secret "$deployment_environment" SENTRY_AUTH_TOKEN "$SENTRY_AUTH_TOKEN"
-  set_environment_secret "$deployment_environment" EAS_UPDATE_PRIVATE_KEY "$EAS_UPDATE_PRIVATE_KEY"
   set_environment_secret "$deployment_environment" GOOGLE_SERVICE_INFO_PLIST_BASE64 "$GOOGLE_SERVICE_INFO_PLIST_BASE64"
   set_environment_var "$deployment_environment" SENTRY_ORG "$SENTRY_ORG"
   set_environment_var "$deployment_environment" SENTRY_PROJECT "$SENTRY_PROJECT"

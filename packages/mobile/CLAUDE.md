@@ -843,10 +843,10 @@ web-only extras aren't wiped. **CSS `135deg` gradient ↔ RN `start={{0,0}} end=
 
 `@sentry/react-native@8.14.0` is pinned exactly because Expo's bundled `~7.11.0` lacks the SDK-56
 `expo/fetch` fix. The `@sentry/react-native/expo` config plugin in `app.json` injects native
-source-map upload build phases on `expo prebuild`. It reads `SENTRY_ORG`, `SENTRY_PROJECT`, and
-`SENTRY_AUTH_TOKEN` from the build environment. Keep the token out of `app.json` and every
-`EXPO_PUBLIC_*` variable. `metro.config.js` uses `getSentryExpoConfig` for Debug-ID source maps;
-never replace `config.serializer.customSerializer`.
+source-map upload build phases on `expo prebuild`. The owned organization/project slugs are public
+plugin configuration; `SENTRY_AUTH_TOKEN` comes only from the build environment. Keep the token out
+of `app.json` and every `EXPO_PUBLIC_*` variable. `metro.config.js` uses
+`getSentryExpoConfig` for Debug-ID source maps; never replace `config.serializer.customSerializer`.
 
 `initSentry()` runs at module scope in `app/_layout.tsx`, with `Sentry.wrap(RootLayout)` and an
 outermost `AppErrorBoundary`. It leaves `release` and `dist` unset so the SDK and uploader agree on
@@ -915,9 +915,9 @@ deferred until that flow has been exercised successfully.
 `ios.runtimeVersion.policy` is `fingerprint`. An OTA update is offered only to installed binaries
 with the same native fingerprint. Any native dependency or configuration change therefore needs a
 new EAS build before its JavaScript can reach that device. Keep the workflow's native-input list in
-sync when adding another source of native build changes. The native app pins
-`certs/certificate.pem`; CI signs OTA manifests with the matching private key from the
-`EAS_UPDATE_PRIVATE_KEY` GitHub secret.
+sync when adding another source of native build changes. Expo manifest signing is not enabled
+because EAS restricts it to the Enterprise plan; access to the Expo account and protected
+environment secrets is therefore the update trust boundary.
 
 Configure delivery credentials in both systems:
 
@@ -925,11 +925,9 @@ Run `./scripts/setup-mobile-delivery.sh` from the repository root for the guided
 the Expo access-token page, reads the authenticated Sentry CLI configuration, writes secrets
 directly to the protected GitHub and EAS environments, and can start the first preview build.
 
-- GitHub `preview` and `production` Environment Secrets: `EXPO_TOKEN`, `SENTRY_AUTH_TOKEN`,
-  `EAS_UPDATE_PRIVATE_KEY`, and `GOOGLE_SERVICE_INFO_PLIST_BASE64`. Keep deployment credentials
-  out of repository-level secrets so another workflow cannot bypass the environment branch gate.
-  Keep the local signing key under the ignored `packages/mobile/.secrets/eas-updates/` directory
-  and back it up securely.
+- GitHub `preview` and `production` Environment Secrets: `EXPO_TOKEN`, `SENTRY_AUTH_TOKEN`, and
+  `GOOGLE_SERVICE_INFO_PLIST_BASE64`. Keep deployment credentials out of repository-level secrets
+  so another workflow cannot bypass the environment branch gate.
 - GitHub Variables: `SENTRY_ORG`, `SENTRY_PROJECT`, `EXPO_PUBLIC_SENTRY_DSN`,
   `EXPO_PUBLIC_CLERK_PUBLISHABLE_KEY`, and `EXPO_PUBLIC_GATEWAY_URL`. Add the optional `_DEV`
   Clerk/gateway values and `EXPO_PUBLIC_GITHUB_APP_NAME[_DEV]` when those overrides are used.
