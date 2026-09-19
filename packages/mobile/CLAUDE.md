@@ -856,8 +856,8 @@ Structured socket logs use an allowlist and redact URLs, filesystem paths, beare
 responses, and connection identifiers before they reach Sentry.
 
 Native EAS builds upload their maps through the config plugin. OTA publication needs a separate
-upload after `eas update`: `.github/workflows/mobile-release.yml` runs
-`bunx sentry-expo-upload-sourcemaps dist` with the same Sentry organization, project, and token.
+upload after `eas update`: `.github/workflows/mobile-release.yml` runs the authenticated
+`sentry sourcemap upload dist --ext .hbc` flow with the same Sentry organization and project.
 Keep this explicit step beside the OTA command; publishing an update alone does not guarantee
 symbolicated OTA stacks.
 

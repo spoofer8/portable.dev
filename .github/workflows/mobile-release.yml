@@ -153,7 +153,7 @@ jobs:
         working-directory: packages/mobile
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
-        run: bunx sentry-expo-upload-sourcemaps dist
+        run: bunx sentry@0.45.0 sourcemap upload dist --ext .hbc
       - name: Build native app
         if: needs.classify.outputs.native == 'true'
         working-directory: packages/mobile
