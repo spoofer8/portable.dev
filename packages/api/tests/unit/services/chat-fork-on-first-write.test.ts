@@ -143,7 +143,7 @@ describe('fork-on-first-write — handleChatMessage', () => {
     expect(bufferCalls[0][1]).toBe(result.chatId); // (userId, chatId, type, …)
   });
 
-  it('always forks a discovered Codex rollout and keeps the provider and preset', async () => {
+  it('forks a discovered Codex rollout without a confirmed stop and keeps its provider', async () => {
     const { svc, context, saveChatCalls, emitted } = makeService({
       origin: 'discovered',
       provider: 'codex',
@@ -173,6 +173,80 @@ describe('fork-on-first-write — handleChatMessage', () => {
       oldChatId: 'codex:thread-source',
       newChatId: result.chatId,
     });
+  });
+
+  it('stops a live discovered Codex thread and adopts that thread in place after confirmation', async () => {
+    const stopCalls: Array<[string, string | undefined]> = [];
+    const { svc, context, saveChatCalls, emitted } = makeService(
+      {
+        origin: 'discovered',
+        provider: 'codex',
+        sourceSessionId: 'thread-source',
+        cwd: '/ws/codex-app',
+        repoPath: '/ws/codex-app',
+        repoFullName: 'me/codex-app',
+        title: 'Existing Codex thread',
+        lastUpdated: Date.now(),
+      },
+      undefined,
+      {
+        stop: async (sessionId, mode) => {
+          stopCalls.push([sessionId, mode]);
+          return { stopped: true, reason: 'stopped' };
+        },
+      }
+    );
+
+    const result = await svc.handleChatMessage(context, {
+      chatId: 'codex:thread-source',
+      content: 'continue on my phone',
+    });
+
+    expect(stopCalls).toEqual([['codex:thread-source', 'end']]);
+    expect(result.chatId).toBe('codex:thread-source');
+    expect(result.provider).toBe('codex');
+    expect(saveChatCalls).toHaveLength(1);
+    expect(saveChatCalls[0]).toMatchObject({
+      chatId: 'codex:thread-source',
+      provider: 'codex',
+      sessionId: 'thread-source',
+      model: 'supersol',
+    });
+    expect(saveChatCalls[0].forkSourceSessionId).toBeUndefined();
+    expect(emitted.map((event) => event.event)).not.toContain('chat:forked');
+  });
+
+  it('keeps the Codex fork fallback when writer shutdown cannot be confirmed', async () => {
+    const stopCalls: string[] = [];
+    const { svc, context, saveChatCalls, emitted } = makeService(
+      {
+        origin: 'discovered',
+        provider: 'codex',
+        sourceSessionId: 'thread-source',
+        cwd: '/ws/codex-app',
+        repoPath: '/ws/codex-app',
+        repoFullName: 'me/codex-app',
+        title: 'Existing Codex thread',
+        lastUpdated: Date.now(),
+      },
+      undefined,
+      {
+        stop: async (sessionId) => {
+          stopCalls.push(sessionId);
+          return { stopped: false, reason: 'not-confirmed' };
+        },
+      }
+    );
+
+    const result = await svc.handleChatMessage(context, {
+      chatId: 'codex:thread-source',
+      content: 'continue safely',
+    });
+
+    expect(stopCalls).toEqual(['codex:thread-source']);
+    expect(result.chatId).not.toBe('codex:thread-source');
+    expect(saveChatCalls[0].forkSourceSessionId).toBe('thread-source');
+    expect(emitted.map((event) => event.event)).toContain('chat:forked');
   });
 
   it('ADOPTS in place (rev12 D56): an ENDED registry row + cold transcript ⇒ same id, sessionId set, no fork emits', async () => {

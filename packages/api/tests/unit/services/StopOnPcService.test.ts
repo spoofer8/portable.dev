@@ -16,6 +16,11 @@ import { ExternalClaudeSessionService } from '../../../src/services/ExternalClau
 import { SidecarChannelService } from '../../../src/services/SidecarChannelService.js';
 import { StopOnPcService } from '../../../src/services/StopOnPcService.js';
 
+import type {
+  CodexThreadWriterOwnerProbe,
+  CodexThreadWriterSnapshot,
+} from '../../../src/db/CodexProjects/threadWriterProbe.js';
+
 let dir: string;
 
 const startWithConfirmedPid = (svc: ExternalClaudeSessionService, sessionId: string, pid: number) =>
@@ -34,6 +39,7 @@ const build = (opts: {
   onKill?: (pid: number, signal: string) => void;
   /** pid → comm for the N2 pid-reuse guard (default: 'claude'). */
   comm?: (pid: number) => string | null;
+  codexWriterProbe?: CodexThreadWriterOwnerProbe;
 }) => {
   const sessions = new ExternalClaudeSessionService(dir, {
     isAlive: (pid) => opts.alive.has(pid),
@@ -51,6 +57,7 @@ const build = (opts: {
     sleep: () => new Promise((r) => setTimeout(r, 1)),
     graceMs: 900,
     pollMs: 100,
+    codexWriterProbe: opts.codexWriterProbe,
   });
   return { sessions, stop };
 };
@@ -207,4 +214,188 @@ describe('StopOnPcService.stop', () => {
     expect(res.stopped).toBe(true);
     sessions.close();
   });
+
+  test('stops a codex:<thread> through its verified writer-lock owner and confirms lock disappearance', async () => {
+    const alive = new Set([700]);
+    const killed: Array<{ pid: number; signal: string }> = [];
+    let probes = 0;
+    const codexWriterProbe: CodexThreadWriterOwnerProbe = async () => {
+      probes += 1;
+      return probes <= 2 ? writerSnapshot('thread-1', 700) : emptyWriterSnapshot();
+    };
+    const { sessions, stop } = build({
+      alive,
+      killed,
+      comm: () => '/opt/homebrew/bin/codex',
+      onKill: (pid) => alive.delete(pid),
+      codexWriterProbe,
+    });
+
+    const res = await stop.stop('codex:thread-1', 'end');
+
+    expect(res).toEqual({ stopped: true, reason: 'stopped', via: 'direct-kill' });
+    expect(killed).toEqual([{ pid: 700, signal: 'SIGTERM' }]);
+    expect(probes).toBeGreaterThanOrEqual(3);
+    sessions.close();
+  });
+
+  test('refuses to signal a codex lock owner when its process identity is not codex', async () => {
+    const killed: Array<{ pid: number; signal: string }> = [];
+    const { sessions, stop } = build({
+      alive: new Set([700]),
+      killed,
+      comm: () => '/usr/bin/vim',
+      codexWriterProbe: async () => writerSnapshot('thread-1', 700),
+    });
+
+    const res = await stop.stop('codex:thread-1', 'end');
+
+    expect(res).toEqual({ stopped: false, reason: 'no-confirmed-pid' });
+    expect(killed).toHaveLength(0);
+    sessions.close();
+  });
+
+  test('refuses an ambiguous codex writer, including one pid that owns multiple locks', async () => {
+    const killed: Array<{ pid: number; signal: string }> = [];
+    const snapshot: CodexThreadWriterSnapshot = {
+      ok: true,
+      activeThreadIds: new Set(['thread-1']),
+      owners: new Map(),
+      ambiguousThreadIds: new Set(['thread-1']),
+    };
+    const { sessions, stop } = build({
+      alive: new Set([700]),
+      killed,
+      comm: () => 'codex',
+      codexWriterProbe: async () => snapshot,
+    });
+
+    const res = await stop.stop('codex:thread-1', 'end');
+
+    expect(res).toEqual({ stopped: false, reason: 'no-confirmed-pid' });
+    expect(killed).toHaveLength(0);
+    sessions.close();
+  });
+
+  test('fails closed when codex writer-lock inspection fails', async () => {
+    const killed: Array<{ pid: number; signal: string }> = [];
+    const { sessions, stop } = build({
+      alive: new Set([700]),
+      killed,
+      comm: () => 'codex',
+      codexWriterProbe: async () => ({
+        ok: false,
+        activeThreadIds: new Set(),
+        owners: new Map(),
+        ambiguousThreadIds: new Set(),
+      }),
+    });
+
+    const res = await stop.stop('codex:thread-1', 'end');
+
+    expect(res).toEqual({ stopped: false, reason: 'undeliverable' });
+    expect(killed).toHaveLength(0);
+    sessions.close();
+  });
+
+  test('does not signal when the codex writer owner changes during pre-signal verification', async () => {
+    const killed: Array<{ pid: number; signal: string }> = [];
+    let probes = 0;
+    const { sessions, stop } = build({
+      alive: new Set([700, 701]),
+      killed,
+      comm: () => 'codex',
+      codexWriterProbe: async () => {
+        probes += 1;
+        return writerSnapshot('thread-1', probes === 1 ? 700 : 701);
+      },
+    });
+
+    const res = await stop.stop('codex:thread-1', 'end');
+
+    expect(res).toEqual({ stopped: false, reason: 'no-confirmed-pid' });
+    expect(killed).toHaveLength(0);
+    expect(probes).toBe(2);
+    sessions.close();
+  });
+
+  test('does not report already ended from old-pid death when a replacement writer owns the lock', async () => {
+    const killed: Array<{ pid: number; signal: string }> = [];
+    let probes = 0;
+    const { sessions, stop } = build({
+      alive: new Set([701]),
+      killed,
+      comm: () => 'codex',
+      codexWriterProbe: async () => {
+        probes += 1;
+        return writerSnapshot('thread-1', probes === 1 ? 700 : 701);
+      },
+    });
+
+    const res = await stop.stop('codex:thread-1', 'end');
+
+    expect(res).toEqual({ stopped: false, reason: 'no-confirmed-pid' });
+    expect(killed).toHaveLength(0);
+    expect(probes).toBe(2);
+    sessions.close();
+  });
+
+  test('does not signal when the writer pid changes identity during pre-signal verification', async () => {
+    const killed: Array<{ pid: number; signal: string }> = [];
+    let commReads = 0;
+    const { sessions, stop } = build({
+      alive: new Set([700]),
+      killed,
+      comm: () => (++commReads === 1 ? 'codex' : '/usr/bin/vim'),
+      codexWriterProbe: async () => writerSnapshot('thread-1', 700),
+    });
+
+    const res = await stop.stop('codex:thread-1', 'end');
+
+    expect(res).toEqual({ stopped: false, reason: 'no-confirmed-pid' });
+    expect(killed).toHaveLength(0);
+    expect(commReads).toBe(2);
+    sessions.close();
+  });
+
+  test('does not confirm stop when the old pid dies but another writer still owns the lock', async () => {
+    const alive = new Set([700, 701]);
+    const killed: Array<{ pid: number; signal: string }> = [];
+    let probes = 0;
+    const { sessions, stop } = build({
+      alive,
+      killed,
+      comm: () => 'codex',
+      onKill: (pid) => alive.delete(pid),
+      codexWriterProbe: async () => {
+        probes += 1;
+        return writerSnapshot('thread-1', probes <= 2 ? 700 : 701);
+      },
+    });
+
+    const res = await stop.stop('codex:thread-1', 'end');
+
+    expect(res).toEqual({ stopped: false, reason: 'not-confirmed', via: 'direct-kill' });
+    expect(killed).toEqual([{ pid: 700, signal: 'SIGTERM' }]);
+    expect(probes).toBeGreaterThan(2);
+    sessions.close();
+  });
 });
+
+function writerSnapshot(threadId: string, pid: number): CodexThreadWriterSnapshot {
+  return {
+    ok: true,
+    activeThreadIds: new Set([threadId]),
+    owners: new Map([[threadId, pid]]),
+    ambiguousThreadIds: new Set(),
+  };
+}
+
+function emptyWriterSnapshot(): CodexThreadWriterSnapshot {
+  return {
+    ok: true,
+    activeThreadIds: new Set(),
+    owners: new Map(),
+    ambiguousThreadIds: new Set(),
+  };
+}

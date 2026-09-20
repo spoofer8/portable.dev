@@ -494,10 +494,9 @@ export class ChatExecutionService {
   }
 
   /**
-   * FORK-ON-FIRST-WRITE. If `chatId` is a Claude-Code-originated chat that Portable
-   * has never written to — a *discovered* terminal transcript with no real SQLite row — claim
-   * it into a brand-new Portable chat and return that new id; otherwise return `chatId`
-   * unchanged.
+   * If `chatId` is a discovered terminal transcript with no real SQLite row,
+   * claim it before the first write. The safe default is a new Portable fork;
+   * a confirmed stopped external writer permits in-place adoption.
    *
    * The claim creates a real row with `fork_source_session_id` set (and `session_id` null),
    * so the subsequent `startNewSession` runs the SDK with `{ resume: source, forkSession: true }`
@@ -530,11 +529,48 @@ export class ChatExecutionService {
       return chatId; // normal Portable chat (or unknown) — resume/create as before
     }
 
-    // A discovered Codex rollout is never adopted in place. Codex sessions may
-    // still be attached to another CLI or editor, and Portable has no lifecycle
-    // hook that can prove a single writer. Forking before the first write keeps
-    // the source rollout immutable and gives Portable its own thread.
+    // Codex has no lifecycle hooks, so writer-lock ownership is its single-
+    // writer gate. Interactive sends ask StopOnPcService to stop the verified
+    // exclusive writer and wait for the lock/pid to disappear. Only that
+    // confirmed result permits an in-place resume; every other outcome keeps
+    // the existing fork safety floor. Headless sends never stop a PC process.
     if (origin.provider === 'codex') {
+      let adoptable = false;
+      if (opts.stopOnPcFirst && this.stopOnPcService) {
+        try {
+          const result = await this.stopOnPcService.stop(`codex:${origin.sourceSessionId}`, 'end');
+          adoptable = result.stopped;
+          console.log(
+            `[ChatExecutionService] Codex stop-on-send for ${origin.sourceSessionId}: stopped=${result.stopped} (${result.reason}) → ${adoptable ? 'adopt' : 'fork'}`
+          );
+        } catch (error) {
+          console.error('[ChatExecutionService] Codex stop-on-send failed — forking:', error);
+        }
+      }
+
+      if (adoptable) {
+        await this.chatService.saveChat({
+          userId,
+          chatId,
+          provider: 'codex',
+          type: 'claude_code',
+          title: origin.title,
+          status: 'completed',
+          repoPath: origin.cwd,
+          repoFullName: origin.repoFullName,
+          sessionId: origin.sourceSessionId,
+          model: opts.model || DEFAULT_CODEX_PRESET,
+          permissions: opts.permissions || 'default',
+          agentSetupId: opts.agentSetupId || 'freestyle',
+          parentChatId: undefined,
+          authToken,
+        });
+        console.log(
+          `[ChatExecutionService] Adopt-on-first-write: adopted Codex thread ${origin.sourceSessionId} in place (chat ${chatId})`
+        );
+        return chatId;
+      }
+
       const newChatId = `chat-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
       await this.chatService.saveChat({
         userId,

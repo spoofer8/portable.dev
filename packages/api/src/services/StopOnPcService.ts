@@ -1,11 +1,11 @@
 /**
  * StopOnPcService — the "Stop on PC" orchestration (rev12, PRD D59/D60).
  *
- * The mobile app asks to stop a TERMINAL `claude` session that is live on the
- * PC (chatId == the Claude Code session id). This service:
- * 1. resolves the session's CONFIRMED pid from the presence registry (a bare/
- *    unconfirmed pid is refused — never signal a process we're not sure is the
- *    right `claude`);
+ * The mobile app asks to stop a terminal Claude or Codex session that is live
+ * on the PC. Claude resolves a confirmed pid from its presence registry. Codex
+ * resolves an exclusive writer-lock owner and verifies the process identity;
+ * ambiguous ownership is refused.
+ * 1. resolves a CONFIRMED pid (never signal a process we cannot identify);
  * 2. delivers the stop via the mcp-sidecar channel when one is live (the
  *    sidecar signals its own parent), else falls back to a DIRECT
  *    `process.kill` — the api runs on the same PC, so it can signal the pid
@@ -20,7 +20,13 @@
  * resumable transcript, so a confirmed `end` makes the D56 hand-off safe.
  */
 import { spawnSync } from 'child_process';
+import path from 'path';
 
+import { resolveCodexHome } from '../db/CodexProjects/codexPaths.js';
+import {
+  createCodexThreadWriterOwnerProbe,
+  type CodexThreadWriterOwnerProbe,
+} from '../db/CodexProjects/threadWriterProbe.js';
 import { isPidAlive } from './ExternalClaudeSessionService.js';
 
 import type { ExternalClaudeSessionService } from './ExternalClaudeSessionService.js';
@@ -56,6 +62,8 @@ export interface StopOnPcDeps {
   graceMs?: number;
   /** Poll cadence while waiting for evidence. */
   pollMs?: number;
+  /** Resolve external Codex thread writer-lock ownership. */
+  codexWriterProbe?: CodexThreadWriterOwnerProbe;
 }
 
 /** Bounded `ps` read of a pid's command name (POSIX). null on any failure. */
@@ -77,6 +85,11 @@ function readPidComm(pid: number): string | null {
 const DEFAULT_GRACE_MS = 6_000;
 const DEFAULT_POLL_MS = 300;
 
+function isCodexProcess(comm: string | null): boolean {
+  if (!comm) return false;
+  return path.basename(comm.trim()) === 'codex';
+}
+
 export class StopOnPcService {
   private readonly isAlive: (pid: number) => boolean;
   private readonly kill: (pid: number, signal: NodeJS.Signals) => void;
@@ -84,6 +97,7 @@ export class StopOnPcService {
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly graceMs: number;
   private readonly pollMs: number;
+  private readonly codexWriterProbe: CodexThreadWriterOwnerProbe;
 
   constructor(
     private externalSessions: ExternalClaudeSessionService,
@@ -96,9 +110,15 @@ export class StopOnPcService {
     this.sleep = deps.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.graceMs = deps.graceMs ?? DEFAULT_GRACE_MS;
     this.pollMs = deps.pollMs ?? DEFAULT_POLL_MS;
+    this.codexWriterProbe =
+      deps.codexWriterProbe ?? createCodexThreadWriterOwnerProbe(resolveCodexHome());
   }
 
   async stop(sessionId: string, mode: StopMode = 'end'): Promise<StopOnPcResult> {
+    if (sessionId.startsWith('codex:')) {
+      return this.stopCodex(sessionId.slice('codex:'.length), mode);
+    }
+
     const session = this.externalSessions.getSession(sessionId);
     if (!session) return { stopped: false, reason: 'unknown-session' };
     if (session.state === 'ended') return { stopped: true, reason: 'already-ended' };
@@ -161,5 +181,74 @@ export class StopOnPcService {
       }
     }
     return { stopped: false, reason: 'not-confirmed', via };
+  }
+
+  private async stopCodex(threadId: string, mode: StopMode): Promise<StopOnPcResult> {
+    const initial = await this.codexWriterProbe([threadId]);
+    if (!initial.ok) return { stopped: false, reason: 'undeliverable' };
+    if (!initial.activeThreadIds.has(threadId)) {
+      return { stopped: true, reason: 'already-ended' };
+    }
+
+    const pid = initial.owners.get(threadId);
+    if (!pid || initial.ambiguousThreadIds.has(threadId)) {
+      return { stopped: false, reason: 'no-confirmed-pid' };
+    }
+    if (!this.isAlive(pid)) {
+      // PID death alone is not end evidence: another process could acquire the
+      // same thread lock immediately after the first snapshot. Re-probe before
+      // authorizing in-place adoption.
+      const afterDeath = await this.codexWriterProbe([threadId]);
+      if (!afterDeath.ok) return { stopped: false, reason: 'undeliverable' };
+      return afterDeath.activeThreadIds.has(threadId)
+        ? { stopped: false, reason: 'no-confirmed-pid' }
+        : { stopped: true, reason: 'already-ended' };
+    }
+
+    // The lock proves that this pid is a writer, but it does not prove the
+    // executable is Codex. Require both facts before signalling so a stale or
+    // unexpectedly-open lock can never target an unrelated process.
+    if (!isCodexProcess(this.readComm(pid))) {
+      return { stopped: false, reason: 'no-confirmed-pid' };
+    }
+
+    // Close the inspection-to-signal race. The original owner may exit and a
+    // new Codex process may acquire this thread while `ps` is being checked.
+    // Only signal when a fresh lock snapshot still names the same exclusive
+    // owner pid.
+    const verified = await this.codexWriterProbe([threadId]);
+    if (!verified.ok) return { stopped: false, reason: 'undeliverable' };
+    if (!verified.activeThreadIds.has(threadId)) {
+      return { stopped: true, reason: 'already-ended' };
+    }
+    if (
+      verified.ambiguousThreadIds.has(threadId) ||
+      verified.owners.get(threadId) !== pid ||
+      !this.isAlive(pid) ||
+      !isCodexProcess(this.readComm(pid))
+    ) {
+      return { stopped: false, reason: 'no-confirmed-pid' };
+    }
+
+    const signal: NodeJS.Signals = mode === 'end' ? 'SIGTERM' : 'SIGINT';
+    try {
+      this.kill(pid, signal);
+    } catch {
+      return { stopped: false, reason: 'undeliverable' };
+    }
+
+    let waited = 0;
+    while (waited < this.graceMs) {
+      await this.sleep(this.pollMs);
+      waited += this.pollMs;
+      const current = await this.codexWriterProbe([threadId]);
+      const lockReleased = current.ok && !current.activeThreadIds.has(threadId);
+      const processEnded = !this.isAlive(pid);
+      if (lockReleased && (mode === 'interrupt' || processEnded)) {
+        return { stopped: true, reason: 'stopped', via: 'direct-kill' };
+      }
+    }
+
+    return { stopped: false, reason: 'not-confirmed', via: 'direct-kill' };
   }
 }
