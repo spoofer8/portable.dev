@@ -527,6 +527,22 @@ export class ChatService {
     await this.dbAdapter.updateChatSession(chatId, userId, sessionId, systemPrompt, authToken);
   }
 
+  async updateCodexForkSession(
+    chatId: string,
+    userId: string,
+    sessionId: string,
+    forkSourceSessionId: string,
+    authToken?: string
+  ): Promise<void> {
+    await this.dbAdapter.updateCodexForkSession(
+      chatId,
+      userId,
+      sessionId,
+      forkSourceSessionId,
+      authToken
+    );
+  }
+
   /**
    * Update Playwright device mode for a chat
    * @param authToken - Optional JWT auth token (unused by the local SQLite adapter)

@@ -12,6 +12,7 @@ describe('Codex thread writer probe', () => {
     const calls: Array<{ command: string; args: readonly string[] }> = [];
     const active = await createCodexThreadWriterProbe(codexHome, {
       platform: 'darwin',
+      readDirImpl: async () => ['thread-live.lock'],
       execFileImpl: async (command, args) => {
         calls.push({ command, args });
         return {
@@ -29,6 +30,46 @@ describe('Codex thread writer probe', () => {
       '--',
       path.join(codexHome, 'thread-writer-locks', 'thread-live.lock'),
     ]);
+  });
+
+  it('ignores missing historical lock paths without hiding an extant active writer', async () => {
+    const codexHome = '/Users/test/.codex';
+    const liveLock = path.join(codexHome, 'thread-writer-locks', 'thread-live.lock');
+    const calls: readonly string[][] = [];
+    const active = await createCodexThreadWriterProbe(codexHome, {
+      platform: 'darwin',
+      readDirImpl: async () => ['thread-live.lock'],
+      execFileImpl: async (_command, args) => {
+        (calls as string[][]).push([...args]);
+        if (args.some((arg) => arg.endsWith('thread-historical.lock'))) {
+          return {
+            exitCode: 1,
+            stderr: 'lsof: status error on thread-historical.lock: No such file or directory',
+            stdout: `p4321\nf12\nn${liveLock}\n`,
+          };
+        }
+        return { exitCode: 0, stdout: `p4321\nf12\nn${liveLock}\n` };
+      },
+    })(['thread-live', 'thread-historical']);
+
+    expect(active).toEqual(new Set(['thread-live']));
+    expect(calls).toEqual([['-Fn', '--', liveLock]]);
+  });
+
+  it('retains valid presence output when another lock disappears during lsof', async () => {
+    const codexHome = '/Users/test/.codex';
+    const liveLock = path.join(codexHome, 'thread-writer-locks', 'thread-live.lock');
+    const active = await createCodexThreadWriterProbe(codexHome, {
+      platform: 'darwin',
+      readDirImpl: async () => ['thread-live.lock', 'thread-raced.lock'],
+      execFileImpl: async () => ({
+        exitCode: 1,
+        stderr: 'lsof: status error on thread-raced.lock: No such file or directory',
+        stdout: `p4321\nf12\nn${liveLock}\n`,
+      }),
+    })(['thread-live', 'thread-raced']);
+
+    expect(active).toEqual(new Set(['thread-live']));
   });
 
   it('does not invoke lsof outside macOS', async () => {
@@ -169,5 +210,23 @@ describe('Codex thread writer probe', () => {
     })(['thread-live']);
 
     expect(snapshot.ok).toBe(false);
+  });
+
+  it('keeps owner resolution fail-closed when lsof returns partial output', async () => {
+    const codexHome = '/Users/test/.codex';
+    const lock = path.join(codexHome, 'thread-writer-locks', 'thread-live.lock');
+    const snapshot = await createCodexThreadWriterOwnerProbe(codexHome, {
+      platform: 'darwin',
+      readDirImpl: async () => ['thread-live.lock', 'thread-raced.lock'],
+      execFileImpl: async () => ({
+        exitCode: 1,
+        stderr: 'lsof: status error on thread-raced.lock: No such file or directory',
+        stdout: `p4321\nf12\nn${lock}\n`,
+      }),
+    })(['thread-live']);
+
+    expect(snapshot.ok).toBe(false);
+    expect(snapshot.activeThreadIds.size).toBe(0);
+    expect(snapshot.owners.size).toBe(0);
   });
 });

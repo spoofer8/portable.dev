@@ -42,6 +42,7 @@ function harness(gateBlocks: boolean) {
       effectiveModel: 'sonnet',
       effectivePermissions: 'default',
       effectiveAgentSetupId: 'setup-1',
+      codexHandoffConfirmed: true,
     };
   });
   const executeMessage = mock(async () => {});
@@ -54,7 +55,7 @@ function harness(gateBlocks: boolean) {
   } as any;
 
   const emit = mock(() => {});
-  const io = { to: () => ({ emit }) } as any;
+  const io = { sockets: { sockets: new Map() } } as any;
 
   // Prototype instance: real methods, no constructor (no io server, no intervals).
   const service: any = Object.create(SocketIOService.prototype);
@@ -79,6 +80,7 @@ function harness(gateBlocks: boolean) {
     id: 'sock-1',
     data: { userEmail: 'alice@example.com', username: 'alice' },
     rooms,
+    emit,
     join: mock((room: string) => {
       order.push('join');
       joined.push(room);
@@ -88,6 +90,7 @@ function harness(gateBlocks: boolean) {
       registrations[event] = handler;
     },
   };
+  io.sockets.sockets.set(socket.id, socket);
 
   service.setupChatHandlers(socket);
   const chatMessage = registrations['chat:message'];
@@ -97,7 +100,13 @@ function harness(gateBlocks: boolean) {
     chatMessage,
     joined,
     order,
-    spies: { shouldBlockOutdatedClient, emitOutdatedClientNotice, handleChatMessage, emit },
+    spies: {
+      shouldBlockOutdatedClient,
+      emitOutdatedClientNotice,
+      handleChatMessage,
+      executeMessage,
+      emit,
+    },
   };
 }
 
@@ -129,6 +138,12 @@ describe('SocketIOService chat:message — kill-switch guard', () => {
     expect(h.spies.emitOutdatedClientNotice).not.toHaveBeenCalled();
     expect(h.spies.handleChatMessage).toHaveBeenCalledTimes(1);
     expect(callback).toHaveBeenCalledWith({ success: true });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(h.spies.executeMessage).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.any(Object),
+      expect.objectContaining({ codexHandoffConfirmed: true })
+    );
   });
 });
 

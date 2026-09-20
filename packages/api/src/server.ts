@@ -335,6 +335,7 @@ class Server {
                 revision: this.directoryRevision,
                 providers,
               });
+              this.socketIOService?.broadcastRuntimeStateToAllUsers();
             },
           };
     const dbAdapter: DbAdapter = new SqliteDbAdapter(undefined, undefined, chatMessageSource);

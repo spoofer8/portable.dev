@@ -314,6 +314,19 @@ export class JsonDbAdapter implements DbAdapter {
     }));
   }
 
+  async updateCodexForkSession(
+    chatId: string,
+    userId: string,
+    sessionId: string,
+    forkSourceSessionId: string,
+    _authToken?: string
+  ): Promise<boolean> {
+    return this.store.patchChat(chatId, userId, () => ({
+      session_id: sessionId,
+      fork_source_session_id: forkSourceSessionId,
+    }));
+  }
+
   async updatePlaywrightDevice(
     chatId: string,
     userId: string,

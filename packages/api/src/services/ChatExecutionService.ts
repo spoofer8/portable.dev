@@ -23,6 +23,7 @@ import { getUserWorkspaceDir, getWorkspaceTmpDir } from '@vgit2/shared/constants
 import { DEFAULT_CODEX_PRESET, DEFAULT_MODEL_MODE } from '@vgit2/shared/models';
 
 import { buildAiCredentialErrorBlock } from './aiCredentialErrorClassifier.js';
+import { CodexRpcError } from './CodexService/index.js';
 import { isPidAlive } from './ExternalClaudeSessionService.js';
 import { HandshakeVerificationGate } from './HandshakeVerificationGate.js';
 
@@ -74,6 +75,11 @@ interface CodexPresetConfig {
   config?: Record<string, unknown>;
 }
 
+interface ChatTargetResolution {
+  chatId: string;
+  codexHandoffConfirmed: boolean;
+}
+
 type CodexCwdValidator = (cwd: string, userId: string) => Promise<string>;
 
 async function validateCodexCwd(cwd: string, userId: string): Promise<string> {
@@ -104,6 +110,8 @@ export interface ExecuteMessageOptions {
   agentSetupId?: string;
   uploadedFiles?: any[];
   isCodeProject?: boolean;
+  /** Set only by the socket path after Stop-on-PC confirmed an external Codex handoff. */
+  codexHandoffConfirmed?: boolean;
 }
 
 /**
@@ -120,6 +128,9 @@ export class ChatExecutionService {
 
   // Per-chat execution lock to prevent concurrent executeMessage() calls for the same chat
   private executingChats: Set<string> = new Set();
+
+  // Serializes external Codex handoff with any execution targeting that chat.
+  private codexHandoffLocks = new Map<string, Promise<void>>();
 
   private codexExecutionContexts = new Map<string, ExecutionContext>();
   private codexPowerReleases = new Map<string, () => void>();
@@ -419,6 +430,8 @@ export class ChatExecutionService {
     effectiveAgentSetupId?: string;
     effectiveEffort?: string;
     provider?: AgentProvider;
+    /** Enables one narrow active-writer recovery attempt in the interactive execution step. */
+    codexHandoffConfirmed?: boolean;
   }> {
     const { content, pageContext, model, permissions, agentSetupId, effort, files } = data;
     const { userId, authToken } = context;
@@ -435,15 +448,17 @@ export class ChatExecutionService {
       // chat and run the rest of the pipeline against that new id. The original CC transcript
       // is never resumed/mutated — the actual fork happens in the SDK (startNewSession →
       // forkFromSessionId). Returns the same id for every normal chat.
-      const chatId = await this.forkDiscoveredChatIfNeeded(context, data.chatId, {
+      const target = await this.forkDiscoveredChatIfNeeded(context, data.chatId, {
         model,
         permissions,
         agentSetupId,
+        effort,
         // D63: an INTERACTIVE send to a terminal-live chat means "continue
         // HERE" — try an evidence-confirmed stop-on-PC before the adopt-vs-fork
         // decision. The headless executeMessage chokepoint never does this.
         stopOnPcFirst: true,
       });
+      const { chatId } = target;
 
       // Fetch chat to get defaults
       const chat = await this.chatService.getChat(chatId, userId, authToken);
@@ -486,6 +501,7 @@ export class ChatExecutionService {
         effectiveAgentSetupId,
         effectiveEffort,
         provider,
+        codexHandoffConfirmed: target.codexHandoffConfirmed || undefined,
       };
     } catch (error: any) {
       console.error(`[ChatExecutionService] Error preparing message for ${data.chatId}:`, error);
@@ -513,6 +529,7 @@ export class ChatExecutionService {
       model?: string;
       permissions?: string;
       agentSetupId?: string;
+      effort?: string;
       /**
        * rev12 D63 (stop-on-send): when the session is terminal-LIVE, attempt an
        * evidence-confirmed Stop-on-PC BEFORE deciding adopt-vs-fork, so the send
@@ -521,12 +538,84 @@ export class ChatExecutionService {
        */
       stopOnPcFirst?: boolean;
     }
-  ): Promise<string> {
+  ): Promise<ChatTargetResolution> {
     const { userId, authToken, emitter } = context;
 
     const origin = await this.chatService.getChatOrigin(chatId, userId, authToken);
     if (origin.origin !== 'discovered') {
-      return chatId; // normal Portable chat (or unknown) — resume/create as before
+      if (origin.origin !== 'sqlite' || origin.provider !== 'codex' || !opts.stopOnPcFirst) {
+        return { chatId, codexHandoffConfirmed: false };
+      }
+
+      const chat = await this.chatService.getChat(chatId, userId, authToken);
+      const threadId = chat?.session_id;
+      const codexService = this.codexService;
+      const isAdoptedExternalThread =
+        !!chat &&
+        typeof threadId === 'string' &&
+        chatId === `codex:${threadId}` &&
+        !!codexService &&
+        !codexService.getSession(chatId);
+      if (!chat || !codexService || !isAdoptedExternalThread) {
+        return { chatId, codexHandoffConfirmed: false };
+      }
+      if (this.codexHandoffLocks.has(chatId)) {
+        throw new Error('This Codex chat is already being handed off');
+      }
+
+      const releaseHandoff = await this.acquireCodexHandoffLock(chatId);
+      try {
+        // Re-check after claiming the handoff slot. executeMessage waits for
+        // this slot, so a Portable-owned writer cannot appear while stop runs.
+        if (this.executingChats.has(chatId)) {
+          throw new Error('This Codex chat is already starting a turn');
+        }
+        if (codexService.getSession(chatId)) {
+          return { chatId, codexHandoffConfirmed: false };
+        }
+        let stopped = false;
+        if (this.stopOnPcService) {
+          try {
+            stopped = (await this.stopOnPcService.stop(chatId, 'end')).stopped;
+          } catch (error) {
+            console.error('[ChatExecutionService] Adopted Codex handoff failed, forking:', error);
+          }
+        }
+        if (stopped) return { chatId, codexHandoffConfirmed: true };
+
+        const newChatId = `chat-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+        await this.chatService.saveChat({
+          userId,
+          chatId: newChatId,
+          provider: 'codex',
+          type: 'claude_code',
+          title: chat.title,
+          status: 'completed',
+          repoPath: chat.repo_path ?? undefined,
+          repoFullName: chat.repo_full_name ?? chat.repoFullName ?? undefined,
+          forkSourceSessionId: threadId,
+          model: opts.model || chat.model || DEFAULT_CODEX_PRESET,
+          permissions: opts.permissions || chat.permissions || 'default',
+          agentSetupId: opts.agentSetupId || chat.agent_setup_id || 'freestyle',
+          parentChatId: undefined,
+          authToken,
+        });
+        const effort = opts.effort || chat.effort || undefined;
+        if (effort) {
+          await this.chatService.updateChatSettings(newChatId, userId, { effort }, authToken);
+        }
+
+        if (emitter.emitToUser && emitter.joinUserToRoom) {
+          const newChat = await this.chatService.getChat(newChatId, userId, authToken);
+          emitter.emitToUser(userId, 'chat:created', { chat: newChat });
+          emitter.joinUserToRoom(userId, newChatId);
+          emitter.emitToUser(userId, 'chat:forked', { oldChatId: chatId, newChatId });
+        }
+        if (this.reposCacheService && userId) this.reposCacheService.invalidateUser(userId);
+        return { chatId: newChatId, codexHandoffConfirmed: false };
+      } finally {
+        releaseHandoff();
+      }
     }
 
     // Codex has no lifecycle hooks, so writer-lock ownership is its single-
@@ -568,7 +657,7 @@ export class ChatExecutionService {
         console.log(
           `[ChatExecutionService] Adopt-on-first-write: adopted Codex thread ${origin.sourceSessionId} in place (chat ${chatId})`
         );
-        return chatId;
+        return { chatId, codexHandoffConfirmed: true };
       }
 
       const newChatId = `chat-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
@@ -597,7 +686,7 @@ export class ChatExecutionService {
       }
 
       if (this.reposCacheService && userId) this.reposCacheService.invalidateUser(userId);
-      return newChatId;
+      return { chatId: newChatId, codexHandoffConfirmed: false };
     }
 
     // ===== ADOPT-ON-FIRST-WRITE (rev12 D56) =====
@@ -651,7 +740,7 @@ export class ChatExecutionService {
       console.log(
         `[ChatExecutionService] Adopt-on-first-write: adopted terminal session ${origin.sourceSessionId} in place (chat ${chatId})`
       );
-      return chatId;
+      return { chatId, codexHandoffConfirmed: false };
     }
 
     const newChatId = `chat-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
@@ -691,7 +780,7 @@ export class ChatExecutionService {
       this.reposCacheService.invalidateUser(userId);
     }
 
-    return newChatId;
+    return { chatId: newChatId, codexHandoffConfirmed: false };
   }
 
   /**
@@ -1314,6 +1403,9 @@ export class ChatExecutionService {
     const { userId, username, authToken, emitter } = context;
     let chatId = context.chatId;
     const releaseAgentPower = this.powerAssertionService?.acquire(`agent:execution:${chatId}`);
+    const releaseCodexHandoff = chatId.startsWith('codex:')
+      ? await this.acquireCodexHandoffLock(chatId)
+      : undefined;
 
     try {
       // ===== FORK-ON-FIRST-WRITE GUARD (durability — single execution chokepoint) =====
@@ -1324,11 +1416,13 @@ export class ChatExecutionService {
       // it into a new Portable chat first. IDEMPOTENT: a no-op the moment the chat has a
       // real SQLite row, so the socket path (already forked in handleChatMessage, which
       // passes the new id here) is never double-forked.
-      const forkedChatId = await this.forkDiscoveredChatIfNeeded(context, chatId, {
+      const target = await this.forkDiscoveredChatIfNeeded(context, chatId, {
         model: options.model,
         permissions: options.permissions,
         agentSetupId: options.agentSetupId,
+        effort: options.effort,
       });
+      const forkedChatId = target.chatId;
       if (forkedChatId !== chatId) {
         chatId = forkedChatId;
         context = { ...context, chatId };
@@ -1506,6 +1600,7 @@ export class ChatExecutionService {
       // Re-throw error so callers can handle it (important for testing)
       throw error;
     } finally {
+      releaseCodexHandoff?.();
       releaseAgentPower?.();
     }
   }
@@ -1554,6 +1649,36 @@ export class ChatExecutionService {
     return preset.sandbox === 'read-only' ? 'read-only' : 'workspace-write';
   }
 
+  private isCodexActiveWriterError(error: unknown): error is CodexRpcError {
+    return (
+      error instanceof CodexRpcError &&
+      error.code === -32600 &&
+      error.message.includes('already has an active writer')
+    );
+  }
+
+  private async acquireCodexHandoffLock(chatId: string): Promise<() => void> {
+    for (;;) {
+      const pending = this.codexHandoffLocks.get(chatId);
+      if (pending) {
+        await pending;
+        continue;
+      }
+
+      let release!: () => void;
+      const lock = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      this.codexHandoffLocks.set(chatId, lock);
+      return () => {
+        if (this.codexHandoffLocks.get(chatId) === lock) {
+          this.codexHandoffLocks.delete(chatId);
+        }
+        release();
+      };
+    }
+  }
+
   private async executeCodexMessage(
     context: ExecutionContext,
     message: { content: string; uploadedFiles?: any[]; context?: PageContext },
@@ -1593,14 +1718,62 @@ export class ChatExecutionService {
       };
 
       let session = this.codexService.getSession(chatId);
+      let sessionReferencePersisted = false;
       if (!session) {
         if (chat.session_id) {
-          session = await this.codexService.resumeCodexSession(
-            chatId,
-            chat.session_id,
-            threadOptions,
-            userId
-          );
+          try {
+            session = await this.codexService.resumeCodexSession(
+              chatId,
+              chat.session_id,
+              threadOptions,
+              userId
+            );
+          } catch (error) {
+            if (!this.isCodexActiveWriterError(error)) throw error;
+
+            if (options.codexHandoffConfirmed && this.stopOnPcService) {
+              let stopped = false;
+              try {
+                stopped = (await this.stopOnPcService.stop(`codex:${chat.session_id}`, 'end'))
+                  .stopped;
+              } catch (stopError) {
+                console.error(
+                  '[ChatExecutionService] Codex active-writer retry stop failed, forking:',
+                  stopError
+                );
+              }
+              if (stopped) {
+                try {
+                  session = await this.codexService.resumeCodexSession(
+                    chatId,
+                    chat.session_id,
+                    threadOptions,
+                    userId
+                  );
+                } catch (retryError) {
+                  if (!this.isCodexActiveWriterError(retryError)) throw retryError;
+                }
+              }
+            }
+
+            if (!session) {
+              const sourceThreadId = chat.session_id;
+              session = await this.codexService.forkCodexSession(
+                chatId,
+                sourceThreadId,
+                threadOptions,
+                userId
+              );
+              await this.chatService.updateCodexForkSession(
+                chatId,
+                userId,
+                session.threadId,
+                sourceThreadId,
+                authToken
+              );
+              sessionReferencePersisted = true;
+            }
+          }
         } else if (chat.fork_source_session_id) {
           session = await this.codexService.forkCodexSession(
             chatId,
@@ -1611,7 +1784,9 @@ export class ChatExecutionService {
         } else {
           session = await this.codexService.startCodexSession(chatId, threadOptions, userId);
         }
-        await this.dbAdapter?.updateChatSession(chatId, userId, session.threadId, '', authToken);
+        if (!sessionReferencePersisted) {
+          await this.dbAdapter?.updateChatSession(chatId, userId, session.threadId, '', authToken);
+        }
       }
 
       const turnOptions: TurnStartOptions = {

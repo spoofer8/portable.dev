@@ -36,10 +36,16 @@ const endedRow = (over: Record<string, unknown> = {}) => ({
 function makeService(
   origin: ChatOrigin,
   externalRegistry?: { isLive: (id: string) => boolean; getSession?: (id: string) => any },
-  stopOnPc?: { stop: (sessionId: string, mode?: string) => Promise<any> }
+  stopOnPc?: { stop: (sessionId: string, mode?: string) => Promise<any> },
+  runtime?: {
+    chat?: Record<string, unknown>;
+    codexSession?: unknown;
+    codexServiceAvailable?: boolean;
+  }
 ) {
   const saveChatCalls: any[] = [];
   const bufferCalls: any[] = [];
+  const updateSettingsCalls: any[] = [];
   const fakeChatService: any = {
     getChatOrigin: async () => origin,
     saveChat: async (opts: any) => {
@@ -51,12 +57,14 @@ function makeService(
       const saved = saveChatCalls.find((chat) => chat.chatId === chatId);
       return {
         id: chatId,
-        provider: saved?.provider,
-        model: saved?.model ?? 'opus',
-        permissions: 'default',
-        agent_setup_id: 'freestyle',
+        provider: saved?.provider ?? runtime?.chat?.provider,
+        model: saved?.model ?? runtime?.chat?.model ?? 'opus',
+        permissions: saved?.permissions ?? runtime?.chat?.permissions ?? 'default',
+        agent_setup_id: saved?.agentSetupId ?? runtime?.chat?.agent_setup_id ?? 'freestyle',
+        ...runtime?.chat,
       };
     },
+    updateChatSettings: async (...args: any[]) => updateSettingsCalls.push(args),
     bufferMessage: async (...args: any[]) => {
       bufferCalls.push(args);
     },
@@ -84,7 +92,11 @@ function makeService(
     undefined, // reposCacheService
     undefined, // handshakeVerificationGate
     externalRegistry as any, // rev12: adopt-vs-fork gate (absent ⇒ always fork)
-    stopOnPc as any // rev12 D63: stop-on-send (absent ⇒ fork exactly as before)
+    stopOnPc as any, // rev12 D63: stop-on-send (absent ⇒ fork exactly as before)
+    undefined,
+    (runtime?.codexServiceAvailable === false
+      ? undefined
+      : { getSession: () => runtime?.codexSession }) as any
   );
 
   const context = {
@@ -95,7 +107,15 @@ function makeService(
     emitter,
   } as unknown as ExecutionContext;
 
-  return { svc, context, saveChatCalls, bufferCalls, emitted, joinedRooms };
+  return {
+    svc,
+    context,
+    saveChatCalls,
+    bufferCalls,
+    updateSettingsCalls,
+    emitted,
+    joinedRooms,
+  };
 }
 
 describe('fork-on-first-write — handleChatMessage', () => {
@@ -552,6 +572,255 @@ describe('fork-on-first-write — handleChatMessage', () => {
     expect(saveChatCalls).toHaveLength(0); // no claim
     expect(emitted.map((e) => e.event)).not.toContain('chat:forked');
     expect(bufferCalls[0][1]).toBe('chat-existing');
+  });
+
+  it('reconfirms handoff before an interactive send to an adopted external Codex row', async () => {
+    const stopCalls: string[] = [];
+    const { svc, context, saveChatCalls, bufferCalls, emitted } = makeService(
+      { origin: 'sqlite', provider: 'codex' },
+      undefined,
+      {
+        stop: async (sessionId) => {
+          stopCalls.push(sessionId);
+          return { stopped: true, reason: 'stopped' };
+        },
+      },
+      {
+        chat: {
+          provider: 'codex',
+          session_id: 'thread-source',
+          title: 'Adopted Codex thread',
+          repo_path: '/ws/codex-app',
+          repo_full_name: 'me/codex-app',
+          model: 'superastra',
+          permissions: 'bypass_permissions',
+          agent_setup_id: 'reviewer',
+          effort: 'high',
+        },
+      }
+    );
+
+    const result = await svc.handleChatMessage(context, {
+      chatId: 'codex:thread-source',
+      content: 'continue here',
+    });
+
+    expect(stopCalls).toEqual(['codex:thread-source']);
+    expect(result).toMatchObject({
+      success: true,
+      chatId: 'codex:thread-source',
+      provider: 'codex',
+      effectiveModel: 'superastra',
+      effectivePermissions: 'bypass_permissions',
+      effectiveAgentSetupId: 'reviewer',
+      effectiveEffort: 'high',
+      codexHandoffConfirmed: true,
+    });
+    expect(saveChatCalls).toHaveLength(0);
+    expect(bufferCalls[0][1]).toBe('codex:thread-source');
+    expect(emitted.map((event) => event.event)).not.toContain('chat:forked');
+  });
+
+  it('forks an adopted external Codex row before buffering when handoff is unconfirmed', async () => {
+    const { svc, context, saveChatCalls, bufferCalls, updateSettingsCalls, emitted } = makeService(
+      { origin: 'sqlite', provider: 'codex' },
+      undefined,
+      { stop: async () => ({ stopped: false, reason: 'not-confirmed' }) },
+      {
+        chat: {
+          provider: 'codex',
+          session_id: 'thread-source',
+          title: 'Adopted Codex thread',
+          repo_path: '/ws/codex-app',
+          repo_full_name: 'me/codex-app',
+          model: 'superastra',
+          permissions: 'bypass_permissions',
+          agent_setup_id: 'reviewer',
+          effort: 'high',
+        },
+      }
+    );
+
+    const result = await svc.handleChatMessage(context, {
+      chatId: 'codex:thread-source',
+      content: 'continue safely',
+    });
+
+    expect(result.chatId).not.toBe('codex:thread-source');
+    expect(saveChatCalls[0]).toMatchObject({
+      chatId: result.chatId,
+      provider: 'codex',
+      forkSourceSessionId: 'thread-source',
+      model: 'superastra',
+      permissions: 'bypass_permissions',
+      agentSetupId: 'reviewer',
+    });
+    expect(updateSettingsCalls[0]).toEqual([result.chatId, 'user-1', { effort: 'high' }, 'tok']);
+    expect(bufferCalls[0][1]).toBe(result.chatId);
+    expect(emitted.find((event) => event.event === 'chat:forked')?.payload).toEqual({
+      oldChatId: 'codex:thread-source',
+      newChatId: result.chatId,
+    });
+  });
+
+  it('forks an adopted external Codex row when stop-on-PC is unavailable', async () => {
+    const { svc, context, saveChatCalls, bufferCalls } = makeService(
+      { origin: 'sqlite', provider: 'codex' },
+      undefined,
+      undefined,
+      {
+        chat: {
+          provider: 'codex',
+          session_id: 'thread-source',
+          title: 'Adopted Codex thread',
+          repo_path: '/ws/codex-app',
+          model: 'supersol',
+          permissions: 'ask_each_time',
+          agent_setup_id: 'freestyle',
+        },
+      }
+    );
+
+    const result = await svc.handleChatMessage(context, {
+      chatId: 'codex:thread-source',
+      content: 'continue safely',
+    });
+
+    expect(result.chatId).not.toBe('codex:thread-source');
+    expect(saveChatCalls[0].forkSourceSessionId).toBe('thread-source');
+    expect(bufferCalls[0][1]).toBe(result.chatId);
+  });
+
+  it('does not stop or fork a Portable-owned in-memory Codex session', async () => {
+    const stopCalls: string[] = [];
+    const { svc, context, saveChatCalls, bufferCalls } = makeService(
+      { origin: 'sqlite', provider: 'codex' },
+      undefined,
+      {
+        stop: async (sessionId) => {
+          stopCalls.push(sessionId);
+          return { stopped: true, reason: 'stopped' };
+        },
+      },
+      {
+        chat: { provider: 'codex', session_id: 'thread-source', model: 'supersol' },
+        codexSession: { chatId: 'codex:thread-source', threadId: 'thread-source', state: 'idle' },
+      }
+    );
+
+    const result = await svc.handleChatMessage(context, {
+      chatId: 'codex:thread-source',
+      content: 'continue portable session',
+    });
+
+    expect(result.chatId).toBe('codex:thread-source');
+    expect(stopCalls).toHaveLength(0);
+    expect(saveChatCalls).toHaveLength(0);
+    expect(bufferCalls[0][1]).toBe('codex:thread-source');
+  });
+
+  it('does not stop a normal Portable Codex row whose chat id is not its thread id', async () => {
+    const stopCalls: string[] = [];
+    const { svc, context, saveChatCalls, bufferCalls } = makeService(
+      { origin: 'sqlite', provider: 'codex' },
+      undefined,
+      {
+        stop: async (sessionId) => {
+          stopCalls.push(sessionId);
+          return { stopped: true, reason: 'stopped' };
+        },
+      },
+      {
+        chat: { provider: 'codex', session_id: 'thread-source', model: 'supersol' },
+      }
+    );
+
+    const result = await svc.handleChatMessage(context, {
+      chatId: 'chat-portable',
+      content: 'continue portable session',
+    });
+
+    expect(result.chatId).toBe('chat-portable');
+    expect(stopCalls).toHaveLength(0);
+    expect(saveChatCalls).toHaveLength(0);
+    expect(bufferCalls[0][1]).toBe('chat-portable');
+  });
+
+  it('does not stop an external Codex process when Codex is unavailable locally', async () => {
+    const stopCalls: string[] = [];
+    const { svc, context } = makeService(
+      { origin: 'sqlite', provider: 'codex' },
+      undefined,
+      {
+        stop: async (sessionId) => {
+          stopCalls.push(sessionId);
+          return { stopped: true, reason: 'stopped' };
+        },
+      },
+      {
+        codexServiceAvailable: false,
+        chat: { provider: 'codex', session_id: 'thread-source', model: 'supersol' },
+      }
+    );
+
+    const result = await svc.handleChatMessage(context, {
+      chatId: 'codex:thread-source',
+      content: 'continue portable session',
+    });
+
+    expect(result.chatId).toBe('codex:thread-source');
+    expect(stopCalls).toHaveLength(0);
+  });
+
+  it('rejects a second interactive send before buffering while Codex handoff is in progress', async () => {
+    let markStopStarted!: () => void;
+    const stopStarted = new Promise<void>((resolve) => {
+      markStopStarted = resolve;
+    });
+    let releaseStop!: () => void;
+    const stopReleased = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    const { svc, context, bufferCalls } = makeService(
+      { origin: 'sqlite', provider: 'codex' },
+      undefined,
+      {
+        stop: async () => {
+          markStopStarted();
+          await stopReleased;
+          return { stopped: true, reason: 'stopped' };
+        },
+      },
+      {
+        chat: {
+          provider: 'codex',
+          session_id: 'thread-source',
+          title: 'Adopted Codex thread',
+          model: 'supersol',
+        },
+      }
+    );
+
+    const first = svc.handleChatMessage(context, {
+      chatId: 'codex:thread-source',
+      content: 'first message',
+    });
+    await stopStarted;
+
+    const second = await svc.handleChatMessage(context, {
+      chatId: 'codex:thread-source',
+      content: 'second message',
+    });
+
+    expect(second).toEqual({
+      success: false,
+      error: 'This Codex chat is already being handed off',
+    });
+    expect(bufferCalls).toHaveLength(0);
+
+    releaseStop();
+    expect((await first).success).toBe(true);
+    expect(bufferCalls).toHaveLength(1);
   });
 });
 

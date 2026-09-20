@@ -40,6 +40,7 @@ function catalogKey(catalog: SessionCatalog): string {
       chat.title,
       chat.archived,
       chat.pinned,
+      chat.status,
     ]),
   ];
   return JSON.stringify(rows.sort((a, b) => String(a[1]).localeCompare(String(b[1]))));

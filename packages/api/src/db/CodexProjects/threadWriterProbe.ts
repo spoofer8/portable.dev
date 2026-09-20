@@ -142,9 +142,6 @@ async function inspectLockPaths(
   for (let offset = 0; offset < lockPaths.length; offset += LSOF_BATCH_SIZE) {
     const batch = lockPaths.slice(offset, offset + LSOF_BATCH_SIZE);
     const result = await run('lsof', ['-Fn', '--', ...batch]);
-    if (result.failed || result.stderr?.trim() || result.exitCode < 0 || result.exitCode > 1) {
-      return { ok: false, parsed };
-    }
 
     let pid: number | undefined;
     for (const line of result.stdout.split(/\r?\n/)) {
@@ -159,6 +156,9 @@ async function inspectLockPaths(
       addToSetMap(parsed.threadToPids, threadId, pid);
       addToSetMap(parsed.pidToThreads, pid, threadId);
     }
+    if (result.failed || result.stderr?.trim() || result.exitCode < 0 || result.exitCode > 1) {
+      return { ok: false, parsed };
+    }
   }
   return { ok: true, parsed };
 }
@@ -170,13 +170,24 @@ export function createCodexThreadWriterProbe(
 ): CodexThreadWriterProbe {
   const platform = options.platform ?? process.platform;
   const run = options.execFileImpl ?? realExecFile;
+  const readDir = options.readDirImpl ?? realReadDir;
   return async (threadIds) => {
     if (platform !== 'darwin') return new Set();
+    const lockDirectory = path.join(codexHome, 'thread-writer-locks');
+    let extantLocks: Set<string>;
+    try {
+      extantLocks = new Set(await readDir(lockDirectory));
+    } catch {
+      return new Set();
+    }
     const lockToThread = new Map<string, string>();
     for (const threadId of threadIds) {
       if (!SAFE_THREAD_ID.test(threadId)) continue;
-      lockToThread.set(path.join(codexHome, 'thread-writer-locks', `${threadId}.lock`), threadId);
+      const lockName = `${threadId}.lock`;
+      if (!extantLocks.has(lockName)) continue;
+      lockToThread.set(path.join(lockDirectory, lockName), threadId);
     }
+    if (lockToThread.size === 0) return new Set();
     const { parsed } = await inspectLockPaths(lockToThread, run);
     return new Set(parsed.threadToPids.keys());
   };

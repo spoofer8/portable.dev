@@ -146,6 +146,49 @@ describe('SqliteDbAdapter - chat/message persistence on SQLite', () => {
     expect((await adapter.getChat('codex-chat', USER))?.provider).toBe('codex');
   });
 
+  it('atomically records a Codex conflict fork without resetting unrelated metadata', async () => {
+    await adapter.saveChat({
+      userId: USER,
+      chatId: 'codex:source-thread',
+      provider: 'codex',
+      type: 'claude_code',
+      title: 'Pinned thread',
+      sessionId: 'source-thread',
+      systemPrompt: 'keep this prompt',
+      workflowRunId: 'workflow-1',
+      model: 'superastra',
+      permissions: 'bypass_permissions',
+      agentSetupId: 'reviewer',
+    });
+    await adapter.setChatSaved('codex:source-thread', USER, true);
+    await adapter.setChatPinned('codex:source-thread', USER, true);
+
+    expect(
+      await adapter.updateCodexForkSession(
+        'codex:source-thread',
+        USER,
+        'child-thread',
+        'source-thread'
+      )
+    ).toBe(true);
+
+    expect(await adapter.getChat('codex:source-thread', USER)).toMatchObject({
+      provider: 'codex',
+      title: 'Pinned thread',
+      session_id: 'child-thread',
+      fork_source_session_id: 'source-thread',
+      system_prompt: 'keep this prompt',
+      workflow_run_id: 'workflow-1',
+      model: 'superastra',
+      permissions: 'bypass_permissions',
+      agent_setup_id: 'reviewer',
+      saved: 1,
+      pinned: 1,
+      archived: 0,
+      hidden: 0,
+    });
+  });
+
   it('does not leak chats across users', async () => {
     await adapter.saveChat({ userId: USER, chatId: 'mine', type: 'claude_code', title: 'Mine' });
     await adapter.saveChat({

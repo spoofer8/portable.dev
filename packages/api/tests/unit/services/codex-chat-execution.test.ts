@@ -1,17 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
 
 import { ChatExecutionService } from '../../../src/services/ChatExecutionService.js';
+import { CodexRpcError } from '../../../src/services/CodexService/index.js';
 
 const ORIGINAL_PRESETS = process.env.CODEX_PRESETS_JSON;
 
 function makeHarness(
   chatOverrides: Record<string, unknown> = {},
-  codexCwdValidator: (cwd: string, userId: string) => Promise<string> = async (cwd) => cwd
+  codexCwdValidator: (cwd: string, userId: string) => Promise<string> = async (cwd) => cwd,
+  stopOnPc = mock(async () => ({ stopped: true, reason: 'stopped' }))
 ) {
   const bufferMessage = mock(async () => {});
   const chat = {
     id: 'chat-1',
     provider: 'codex',
+    type: 'claude_code',
+    title: 'Codex chat',
+    status: 'completed',
     model: 'supersol',
     permissions: 'ask_each_time',
     agent_setup_id: 'freestyle',
@@ -20,13 +25,16 @@ function makeHarness(
     fork_source_session_id: null,
     ...chatOverrides,
   };
+  const updateCodexForkSession = mock(async () => true);
   const chatService = {
     getChatOrigin: async () => ({ origin: 'sqlite', provider: 'codex' }),
     getChat: async () => chat,
     bufferMessage,
+    saveChat: mock(async () => true),
+    updateCodexForkSession,
   } as any;
   const updateChatSession = mock(async () => true);
-  const dbAdapter = { updateChatSession } as any;
+  const dbAdapter = { updateChatSession, updateCodexForkSession } as any;
   const startCodexSession = mock(async () => ({
     chatId: 'chat-1',
     userId: 'alice@example.com',
@@ -80,7 +88,7 @@ function makeHarness(
     undefined,
     undefined,
     undefined,
-    undefined,
+    { stop: stopOnPc } as any,
     undefined,
     codexService,
     codexCwdValidator,
@@ -92,6 +100,7 @@ function makeHarness(
     emitted,
     bufferMessage,
     updateChatSession,
+    updateCodexForkSession,
     startCodexSession,
     resumeCodexSession,
     forkCodexSession,
@@ -102,6 +111,8 @@ function makeHarness(
     getSession,
     acquirePower,
     releasePower,
+    stopOnPc,
+    saveChat: chatService.saveChat,
   };
 }
 
@@ -235,6 +246,119 @@ describe('ChatExecutionService Codex routing', () => {
       'thread-source',
       expect.any(Object),
       'alice@example.com'
+    );
+  });
+
+  it('re-stops and retries once when a confirmed interactive handoff races an active writer', async () => {
+    const harness = makeHarness({ session_id: 'thread-existing' });
+    harness.resumeCodexSession
+      .mockRejectedValueOnce(
+        new CodexRpcError('thread thread-existing already has an active writer', -32600)
+      )
+      .mockResolvedValueOnce({
+        chatId: 'chat-1',
+        userId: 'alice@example.com',
+        threadId: 'thread-existing',
+        cwd: '/repo',
+        state: 'idle',
+        updatedAt: Date.now(),
+      });
+
+    await harness.service.executeMessage(
+      harness.context,
+      { content: 'Resume after handoff' },
+      { codexHandoffConfirmed: true }
+    );
+
+    expect(harness.stopOnPc).toHaveBeenCalledTimes(1);
+    expect(harness.stopOnPc).toHaveBeenCalledWith('codex:thread-existing', 'end');
+    expect(harness.resumeCodexSession).toHaveBeenCalledTimes(2);
+    expect(harness.addMessageToSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('forks without stopping when headless execution finds an active external writer', async () => {
+    const harness = makeHarness({ session_id: 'thread-existing' });
+    harness.resumeCodexSession.mockRejectedValue(
+      new CodexRpcError('thread thread-existing already has an active writer', -32600)
+    );
+
+    await harness.service.executeMessage(harness.context, { content: 'Headless resume' }, {});
+
+    expect(harness.stopOnPc).not.toHaveBeenCalled();
+    expect(harness.resumeCodexSession).toHaveBeenCalledTimes(1);
+    expect(harness.forkCodexSession).toHaveBeenCalledWith(
+      'chat-1',
+      'thread-existing',
+      expect.any(Object),
+      'alice@example.com'
+    );
+    expect(harness.updateCodexForkSession).toHaveBeenCalledWith(
+      'chat-1',
+      'alice@example.com',
+      'thread-1',
+      'thread-existing',
+      'token'
+    );
+    expect(harness.saveChat).not.toHaveBeenCalled();
+    expect(harness.updateChatSession).not.toHaveBeenCalled();
+    expect(harness.addMessageToSession).toHaveBeenCalledWith(
+      'chat-1',
+      'Headless resume',
+      expect.any(Object)
+    );
+  });
+
+  it('does not retry unrelated Codex RPC failures after interactive handoff', async () => {
+    const harness = makeHarness({ session_id: 'thread-existing' });
+    harness.resumeCodexSession.mockRejectedValue(new CodexRpcError('invalid params', -32600));
+
+    await expect(
+      harness.service.executeMessage(
+        harness.context,
+        { content: 'Resume after handoff' },
+        { codexHandoffConfirmed: true }
+      )
+    ).rejects.toThrow('invalid params');
+
+    expect(harness.stopOnPc).not.toHaveBeenCalled();
+    expect(harness.resumeCodexSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('forks under the same chat id when the post-handoff retry still finds an active writer', async () => {
+    const harness = makeHarness({ session_id: 'thread-existing' });
+    const conflict = new CodexRpcError(
+      'thread thread-existing already has an active writer',
+      -32600
+    );
+    harness.resumeCodexSession.mockRejectedValueOnce(conflict).mockRejectedValueOnce(conflict);
+
+    await harness.service.executeMessage(
+      harness.context,
+      { content: 'First attempt' },
+      { codexHandoffConfirmed: true }
+    );
+
+    expect(harness.resumeCodexSession).toHaveBeenCalledTimes(2);
+    expect(harness.stopOnPc).toHaveBeenCalledTimes(1);
+    expect(harness.forkCodexSession).toHaveBeenCalledWith(
+      'chat-1',
+      'thread-existing',
+      expect.any(Object),
+      'alice@example.com'
+    );
+    expect(harness.updateCodexForkSession).toHaveBeenCalledWith(
+      'chat-1',
+      'alice@example.com',
+      'thread-1',
+      'thread-existing',
+      'token'
+    );
+    expect(harness.saveChat).not.toHaveBeenCalled();
+    expect(harness.updateChatSession).not.toHaveBeenCalled();
+    expect(harness.addMessageToSession).toHaveBeenCalledWith(
+      'chat-1',
+      'First attempt',
+      expect.any(Object)
     );
   });
 

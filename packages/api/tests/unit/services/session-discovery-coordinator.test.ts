@@ -75,6 +75,50 @@ describe('SessionDiscoveryCoordinator', () => {
     coordinator.stop();
   });
 
+  it('notifies when a Codex writer changes the discovered session status', async () => {
+    let status: 'completed' | 'running' = 'completed';
+    const notifications: string[] = [];
+    const coordinator = new SessionDiscoveryCoordinator({
+      reposProvider: async () => [],
+      scanClaude: async () => [],
+      scanCodex: async () => [
+        {
+          id: 'codex:thread-1',
+          threadId: 'thread-1',
+          repoPath: '/tmp/repo',
+          cwd: '/tmp/repo',
+          repoFullName: 'me/repo',
+          rolloutPath: '/tmp/thread-1.jsonl',
+          title: 'Codex thread',
+          lastUpdated: 1,
+          createdAt: 1,
+          messageCount: 1,
+          firstMessageData: {},
+          lastMessageData: {},
+          archived: false,
+          pinned: false,
+          model: 'gpt-5',
+          source: 'cli',
+          status,
+        },
+      ],
+      reconcileIntervalMs: 0,
+      onCatalogChange: (catalog) => notifications.push(catalog.codex[0].status),
+    });
+
+    await coordinator.start();
+    expect(notifications).toEqual(['completed']);
+
+    status = 'running';
+    await coordinator.getCatalog();
+    expect(notifications).toEqual(['completed', 'running']);
+
+    status = 'completed';
+    await coordinator.getCatalog();
+    expect(notifications).toEqual(['completed', 'running', 'completed']);
+    coordinator.stop();
+  });
+
   it('watches an existing parent and upgrades when a missing discovery root appears', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'session-watch-'));
     const desired = path.join(root, 'missing', 'sessions');

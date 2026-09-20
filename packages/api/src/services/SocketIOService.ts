@@ -633,6 +633,7 @@ export class SocketIOService {
                   effort: prepared.effectiveEffort,
                   uploadedFiles: files,
                   isCodeProject: context?.isCodeProject,
+                  codexHandoffConfirmed: prepared.codexHandoffConfirmed,
                 }
               );
 

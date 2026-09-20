@@ -260,6 +260,15 @@ export interface DbAdapter {
     authToken?: string
   ): Promise<boolean>;
 
+  /** Atomically retarget a Codex chat to a fork while retaining the source thread id. */
+  updateCodexForkSession(
+    chatId: string,
+    userId: string,
+    sessionId: string,
+    forkSourceSessionId: string,
+    authToken?: string
+  ): Promise<boolean>;
+
   /**
    * Update Playwright device mode for a chat
    * @param authToken - Optional JWT auth token (unused by the local SQLite adapter)
