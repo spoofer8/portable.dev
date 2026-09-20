@@ -64,6 +64,12 @@ jest.mock('expo-notifications', () => {
     }),
     setNotificationHandler: jest.fn(),
     setNotificationChannelAsync: jest.fn(async () => null),
+    getPermissionsAsync: jest.fn(async () => ({ granted: true, status: 'granted' })),
+    requestPermissionsAsync: jest.fn(async () => ({ granted: true, status: 'granted' })),
+    getExpoPushTokenAsync: jest.fn(async () => ({
+      type: 'expo',
+      data: 'ExpoPushToken[fork-device-token]',
+    })),
     AndroidImportance: { MAX: 5 },
   };
 });
@@ -81,9 +87,11 @@ import { RelayApiClient } from '../src/features/api/relayClient';
 import { AUTH_TOKEN_KEY } from '../src/features/auth/secureAuthStore';
 import { RELAY_URL_KEY } from '../src/features/api/relayUrlStore';
 import { PushPermissionPrompt } from '../src/features/settings/sections/notifications/PushPermissionPrompt';
-import type {
-  PushAdapter,
-  PushPermissionState,
+import {
+  createExpoPushAdapter,
+  type PushRegistrationIdentity,
+  type PushAdapter,
+  type PushPermissionState,
 } from '../src/features/settings/sections/notifications/pushAdapter';
 import { usePushRegistrationStore } from '../src/features/settings/sections/notifications/pushRegistrationStore';
 import { PushSetupLayer } from '../src/features/settings/sections/notifications/PushSetupLayer';
@@ -99,6 +107,9 @@ interface ExpoNotificationsMock {
   addNotificationResponseReceivedListener: jest.Mock;
   setNotificationHandler: jest.Mock;
   setNotificationChannelAsync: jest.Mock;
+  getPermissionsAsync: jest.Mock;
+  requestPermissionsAsync: jest.Mock;
+  getExpoPushTokenAsync: jest.Mock;
 }
 function getNotifMock(): ExpoNotificationsMock {
   return jest.requireMock('expo-notifications') as ExpoNotificationsMock;
@@ -110,7 +121,10 @@ interface SecureStoreMock {
 const secureStore = jest.requireMock('expo-secure-store') as SecureStoreMock;
 
 const SANDBOX_BASE = 'https://sandbox.portable.test';
-const DEVICE_TOKEN = 'apns-token-push-test-456';
+const DEVICE_TOKEN = 'ExpoPushToken[fork-device-token]';
+const LEGACY_FCM_TOKEN = 'legacy-fcm-token-from-official-app';
+const PROJECT_ID = '114bef50-b96c-4db6-9c47-3c610bcdf321';
+const APP_ID = 'cloud.umair.portable';
 const netInfo: NetInfoLike = { addEventListener: () => () => {} };
 
 const SAFE_AREA_METRICS = {
@@ -128,6 +142,8 @@ interface FakeAdapterOpts {
   permission?: PushPermissionState;
   requestResult?: PushPermissionState;
   token?: string;
+  tokenError?: Error;
+  identity?: PushRegistrationIdentity;
 }
 
 /** Controllable fake PushAdapter — never touches expo-notifications. */
@@ -135,7 +151,13 @@ function createFakeAdapter(opts: FakeAdapterOpts = {}): PushAdapter {
   return {
     getPermissionState: jest.fn(async () => opts.permission ?? 'undetermined'),
     requestPermission: jest.fn(async () => opts.requestResult ?? opts.permission ?? 'granted'),
-    getDeviceToken: jest.fn(async () => opts.token ?? DEVICE_TOKEN),
+    getDeviceToken: jest.fn(async () => {
+      if (opts.tokenError) throw opts.tokenError;
+      return opts.token ?? DEVICE_TOKEN;
+    }),
+    getRegistrationIdentity: jest.fn(
+      () => opts.identity ?? { provider: 'expo', projectId: PROJECT_ID, appId: APP_ID }
+    ),
   };
 }
 
@@ -209,6 +231,47 @@ describe('usePushDeepLink', () => {
 
 // ── PushPermissionPrompt ───────────────────────────────────────────────────────────
 
+describe('createExpoPushAdapter', () => {
+  const originalOS = Platform.OS;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  afterEach(() => {
+    Object.defineProperty(Platform, 'OS', { configurable: true, value: originalOS });
+  });
+
+  it('requests an Expo push token scoped to the fork EAS project', async () => {
+    const adapter = createExpoPushAdapter({ projectId: PROJECT_ID, appId: APP_ID });
+
+    await expect(adapter.getDeviceToken()).resolves.toBe(DEVICE_TOKEN);
+    expect(getNotifMock().getExpoPushTokenAsync).toHaveBeenCalledWith({ projectId: PROJECT_ID });
+    expect(adapter.getRegistrationIdentity()).toEqual({
+      provider: 'expo',
+      projectId: PROJECT_ID,
+      appId: APP_ID,
+    });
+  });
+
+  it('keeps Android on its existing FCM registration path', async () => {
+    Object.defineProperty(Platform, 'OS', { configurable: true, value: 'android' });
+    const messaging = jest.requireMock('@react-native-firebase/messaging') as {
+      getToken: jest.Mock;
+    };
+    messaging.getToken.mockResolvedValue('android-fcm-token');
+    const adapter = createExpoPushAdapter();
+
+    await expect(adapter.getDeviceToken()).resolves.toBe('android-fcm-token');
+    expect(adapter.getRegistrationIdentity()).toEqual({
+      provider: 'fcm',
+      projectId: undefined,
+      appId: 'dev.portable.app',
+    });
+    expect(getNotifMock().getExpoPushTokenAsync).not.toHaveBeenCalled();
+  });
+});
+
 describe('PushPermissionPrompt', () => {
   let gateway: MockGateway;
   let activeQueryClient: QueryClient | undefined;
@@ -224,7 +287,14 @@ describe('PushPermissionPrompt', () => {
     secureStore.__store.set(RELAY_URL_KEY, SANDBOX_BASE);
     secureStore.__store.set(AUTH_TOKEN_KEY, 'good-token');
     act(() =>
-      usePushRegistrationStore.setState({ registeredEndpoint: null, permissionAsked: false })
+      usePushRegistrationStore.setState({
+        registeredEndpoint: null,
+        registeredProvider: null,
+        registeredProjectId: null,
+        registeredAppId: null,
+        registrationSyncStatus: 'idle',
+        permissionAsked: false,
+      })
     );
     gateway = createMockGateway();
     gateway.on('GET', `${SANDBOX_BASE}/api/push/settings`, () => ({
@@ -241,11 +311,11 @@ describe('PushPermissionPrompt', () => {
     onlineManager.setOnline(true);
   });
 
-  function renderPrompt(adapter: PushAdapter) {
+  function renderPrompt(adapter: PushAdapter, migrationRetryDelaysMs?: readonly number[]) {
     return render(
       <SafeAreaProvider initialMetrics={SAFE_AREA_METRICS}>
         <ApiProvider client={buildClient(gateway)} queryClient={newQueryClient()} netInfo={netInfo}>
-          <PushPermissionPrompt deps={{ adapter }} />
+          <PushPermissionPrompt deps={{ adapter, migrationRetryDelaysMs }} />
         </ApiProvider>
       </SafeAreaProvider>
     );
@@ -256,29 +326,227 @@ describe('PushPermissionPrompt', () => {
     renderPrompt(adapter);
 
     await waitFor(() => expect(findSubscribe(gateway)).toBeTruthy());
-    // The POST carries THIS device's APNs/FCM token + platform.
+    // The POST carries this fork's EAS-scoped Expo token and app identity.
     const body = findSubscribe(gateway)?.body as {
-      subscription: { endpoint: string; platform: string; fcmToken: string };
+      subscription: {
+        endpoint: string;
+        platform: string;
+        pushProvider: string;
+        projectId: string;
+        appId: string;
+        fcmToken?: string;
+      };
       deviceInfo: { platform: string };
     };
     expect(body.subscription.endpoint).toBe(DEVICE_TOKEN);
-    expect(body.subscription.fcmToken).toBe(DEVICE_TOKEN);
+    expect(body.subscription.fcmToken).toBeUndefined();
+    expect(body.subscription.pushProvider).toBe('expo');
+    expect(body.subscription.projectId).toBe(PROJECT_ID);
+    expect(body.subscription.appId).toBe(APP_ID);
     expect(typeof body.subscription.platform).toBe('string');
     expect(body.deviceInfo.platform).toBe(body.subscription.platform);
     expect(screen.queryByTestId('push-permission-enable')).toBeNull();
   });
 
-  it('permission granted + endpoint already registered → does nothing', async () => {
-    act(() => usePushRegistrationStore.setState({ registeredEndpoint: DEVICE_TOKEN }));
+  it('permission granted + current endpoint → refreshes registration idempotently', async () => {
+    act(() =>
+      usePushRegistrationStore.setState({
+        registeredEndpoint: DEVICE_TOKEN,
+        registeredProvider: 'expo',
+        registeredProjectId: PROJECT_ID,
+        registeredAppId: APP_ID,
+      })
+    );
     const adapter = createFakeAdapter({ permission: 'granted', token: DEVICE_TOKEN });
     renderPrompt(adapter);
 
-    await act(async () => {
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(findSubscribe(gateway)).toBeUndefined();
+    await waitFor(() => expect(findSubscribe(gateway)).toBeTruthy());
+    expect(usePushRegistrationStore.getState().registeredEndpoint).toBe(DEVICE_TOKEN);
     expect(screen.queryByTestId('push-permission-enable')).toBeNull();
+  });
+
+  it('replaces a rotated Expo token after the new subscription succeeds', async () => {
+    const previousToken = 'ExpoPushToken[previous-device-token]';
+    act(() =>
+      usePushRegistrationStore.setState({
+        registeredEndpoint: previousToken,
+        registeredProvider: 'expo',
+        registeredProjectId: PROJECT_ID,
+        registeredAppId: APP_ID,
+      })
+    );
+    const adapter = createFakeAdapter({ permission: 'granted', token: DEVICE_TOKEN });
+    renderPrompt(adapter);
+
+    await waitFor(() => expect(findSubscribe(gateway)).toBeTruthy());
+    await waitFor(() =>
+      expect(
+        gateway.requests.find(
+          (request) =>
+            request.method === 'POST' &&
+            request.url.endsWith('/api/push/unsubscribe') &&
+            (request.body as { endpoint: string }).endpoint === previousToken
+        )
+      ).toBeTruthy()
+    );
+    expect(usePushRegistrationStore.getState().registeredEndpoint).toBe(DEVICE_TOKEN);
+  });
+
+  it('permission granted + legacy FCM registration → replaces it with the fork Expo token', async () => {
+    act(() =>
+      usePushRegistrationStore.setState({
+        registeredEndpoint: LEGACY_FCM_TOKEN,
+        registeredProvider: null,
+        registeredProjectId: null,
+        registeredAppId: null,
+      })
+    );
+    const adapter = createFakeAdapter({ permission: 'granted', token: DEVICE_TOKEN });
+    renderPrompt(adapter);
+
+    await waitFor(() => expect(findSubscribe(gateway)).toBeTruthy());
+    expect(usePushRegistrationStore.getState()).toEqual(
+      expect.objectContaining({
+        registeredEndpoint: DEVICE_TOKEN,
+        registeredProvider: 'expo',
+        registeredProjectId: PROJECT_ID,
+        registeredAppId: APP_ID,
+      })
+    );
+  });
+
+  it('keeps the legacy registration when automatic Expo migration fails', async () => {
+    act(() =>
+      usePushRegistrationStore.setState({
+        registeredEndpoint: LEGACY_FCM_TOKEN,
+        registeredProvider: null,
+        registeredProjectId: null,
+        registeredAppId: null,
+      })
+    );
+    const adapter = createFakeAdapter({
+      permission: 'granted',
+      tokenError: new Error('Expo token unavailable'),
+    });
+    renderPrompt(adapter, [0]);
+
+    await waitFor(() => expect(adapter.getDeviceToken).toHaveBeenCalledTimes(1));
+    expect(usePushRegistrationStore.getState().registeredEndpoint).toBe(LEGACY_FCM_TOKEN);
+    expect(usePushRegistrationStore.getState().registrationSyncStatus).toBe('failed');
+    expect(findSubscribe(gateway)).toBeUndefined();
+  });
+
+  it('retries a failed automatic migration on the same app launch', async () => {
+    jest.useFakeTimers();
+    act(() =>
+      usePushRegistrationStore.setState({
+        registeredEndpoint: LEGACY_FCM_TOKEN,
+        registeredProvider: null,
+        registeredProjectId: null,
+        registeredAppId: null,
+      })
+    );
+    const adapter = createFakeAdapter({ permission: 'granted', token: DEVICE_TOKEN });
+    (adapter.getDeviceToken as jest.Mock)
+      .mockRejectedValueOnce(new Error('temporary failure'))
+      .mockResolvedValue(DEVICE_TOKEN);
+    try {
+      renderPrompt(adapter, [0, 1_000, 5_000]);
+
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(adapter.getDeviceToken).toHaveBeenCalledTimes(1);
+      expect(usePushRegistrationStore.getState().registrationSyncStatus).toBe('failed');
+
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(1_000);
+      });
+      expect(findSubscribe(gateway)).toBeTruthy();
+      expect(adapter.getDeviceToken).toHaveBeenCalledTimes(2);
+      expect(usePushRegistrationStore.getState().registrationSyncStatus).toBe('current');
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('cancels pending migration retries when the setup layer unmounts', async () => {
+    jest.useFakeTimers();
+    act(() =>
+      usePushRegistrationStore.setState({
+        registeredEndpoint: LEGACY_FCM_TOKEN,
+        registeredProvider: null,
+        registeredProjectId: null,
+        registeredAppId: null,
+      })
+    );
+    const adapter = createFakeAdapter({
+      permission: 'granted',
+      tokenError: new Error('Expo token unavailable'),
+    });
+    try {
+      const view = renderPrompt(adapter, [0, 1_000, 5_000]);
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(adapter.getDeviceToken).toHaveBeenCalledTimes(1);
+
+      view.unmount();
+      jest.clearAllTimers();
+      await act(async () => {
+        await jest.runAllTimersAsync();
+      });
+      expect(adapter.getDeviceToken).toHaveBeenCalledTimes(1);
+      expect(usePushRegistrationStore.getState().registeredEndpoint).toBe(LEGACY_FCM_TOKEN);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('does not schedule a retry after unmount while registration is in flight', async () => {
+    jest.useFakeTimers();
+    let rejectToken: ((error: Error) => void) | undefined;
+    act(() =>
+      usePushRegistrationStore.setState({
+        registeredEndpoint: LEGACY_FCM_TOKEN,
+        registeredProvider: null,
+        registeredProjectId: null,
+        registeredAppId: null,
+      })
+    );
+    const adapter = createFakeAdapter({ permission: 'granted' });
+    (adapter.getDeviceToken as jest.Mock).mockImplementation(
+      () =>
+        new Promise<string>((_resolve, reject) => {
+          rejectToken = reject;
+        })
+    );
+    try {
+      const view = renderPrompt(adapter, [0, 1_000, 5_000]);
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(adapter.getDeviceToken).toHaveBeenCalledTimes(1);
+
+      view.unmount();
+      jest.clearAllTimers();
+      const timeoutSpy = jest.spyOn(global, 'setTimeout');
+      timeoutSpy.mockClear();
+      await act(async () => {
+        rejectToken?.(new Error('request completed after unmount'));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(timeoutSpy.mock.calls.some((call) => call[1] === 1_000)).toBe(false);
+      expect(adapter.getDeviceToken).toHaveBeenCalledTimes(1);
+      expect(usePushRegistrationStore.getState().registeredEndpoint).toBe(LEGACY_FCM_TOKEN);
+      timeoutSpy.mockRestore();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('undetermined + not asked → shows the modal, marks asked, Enable registers', async () => {
@@ -299,9 +567,10 @@ describe('PushPermissionPrompt', () => {
     });
     await waitFor(() => expect(findSubscribe(gateway)).toBeTruthy());
     const body = findSubscribe(gateway)?.body as {
-      subscription: { endpoint: string; platform: string; fcmToken: string };
+      subscription: { endpoint: string; platform: string; pushProvider: string };
     };
     expect(body.subscription.endpoint).toBe(DEVICE_TOKEN);
+    expect(body.subscription.pushProvider).toBe('expo');
     expect(typeof body.subscription.platform).toBe('string');
   });
 
@@ -370,7 +639,13 @@ describe('PushSetupLayer', () => {
     secureStore.__store.set(AUTH_TOKEN_KEY, 'good-token');
     // Granted + already registered → the prompt is a no-op (no modal / no POST noise).
     act(() =>
-      usePushRegistrationStore.setState({ registeredEndpoint: DEVICE_TOKEN, permissionAsked: true })
+      usePushRegistrationStore.setState({
+        registeredEndpoint: DEVICE_TOKEN,
+        registeredProvider: 'expo',
+        registeredProjectId: PROJECT_ID,
+        registeredAppId: APP_ID,
+        permissionAsked: true,
+      })
     );
     gateway = createMockGateway();
     gateway.on('GET', `${SANDBOX_BASE}/api/push/settings`, () => ({

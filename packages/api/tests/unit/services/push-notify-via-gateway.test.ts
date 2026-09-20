@@ -18,6 +18,12 @@
 import { describe, it, expect, mock, beforeEach, afterEach } from 'bun:test';
 
 import type { NotifyPayload, NotifyRequest, NotifyResponse } from '@vgit2/shared/types';
+import {
+  EXPO_PUSH_API_URL,
+  EXPO_PUSH_RECEIPTS_URL,
+  PORTABLE_EXPO_PROJECT_ID,
+  PORTABLE_IOS_APP_ID,
+} from '@vgit2/shared/pushConfig';
 
 import type { DbAdapter } from '../../../src/db/DbAdapter';
 import {
@@ -30,6 +36,10 @@ type Sub = {
   endpoint: string;
   keys: { p256dh: string; auth: string };
   fcmToken?: string;
+  platform?: 'web' | 'ios' | 'android';
+  pushProvider?: 'web' | 'fcm' | 'expo';
+  projectId?: string;
+  appId?: string;
   deviceInfo?: any;
 };
 
@@ -43,7 +53,26 @@ const PAYLOAD: NotifyPayload = {
 };
 
 function sub(endpoint: string, fcmToken?: string): Sub {
-  return { userId: 'user@example.com', endpoint, keys: { p256dh: '', auth: '' }, fcmToken };
+  return {
+    userId: 'user@example.com',
+    endpoint,
+    keys: { p256dh: '', auth: '' },
+    fcmToken,
+    platform: fcmToken ? 'android' : 'web',
+    pushProvider: fcmToken ? 'fcm' : 'web',
+  };
+}
+
+function expoSub(token: string): Sub {
+  return {
+    userId: 'user@example.com',
+    endpoint: token,
+    keys: { p256dh: '', auth: '' },
+    platform: 'ios',
+    pushProvider: 'expo',
+    projectId: PORTABLE_EXPO_PROJECT_ID,
+    appId: PORTABLE_IOS_APP_ID,
+  };
 }
 
 /** A Response-like value good enough for `notifyViaGateway`. */
@@ -55,14 +84,18 @@ function jsonResponse(body: unknown, init?: { ok?: boolean; status?: number }): 
   } as unknown as Response;
 }
 
-function makeService(opts: { subscriptions: Sub[]; fetchImpl: typeof fetch }) {
+function makeService(opts: {
+  subscriptions: Sub[];
+  fetchImpl: typeof fetch;
+  expoDelivery?: ConstructorParameters<typeof PushNotificationService>[2];
+}) {
   const getUserPushSubscriptions = mock(async () => opts.subscriptions);
   const removePushSubscription = mock(async () => true);
   const dbAdapter = {
     getUserPushSubscriptions,
     removePushSubscription,
   } as unknown as DbAdapter;
-  const service = new PushNotificationService(dbAdapter, opts.fetchImpl);
+  const service = new PushNotificationService(dbAdapter, opts.fetchImpl, opts.expoDelivery);
   return { service, getUserPushSubscriptions, removePushSubscription };
 }
 
@@ -112,6 +145,224 @@ describe('PushNotificationService.notifyViaGateway (rev10 D31/D33)', () => {
 
     // all tokens healthy → nothing pruned
     expect((removePushSubscription as any).mock.calls.length).toBe(0);
+  });
+
+  it('sends Expo tokens directly to the Expo Push API without a Firebase credential', async () => {
+    const expoToken = 'ExpoPushToken[fork-ios]';
+    const fetchImpl = mock(async (url: string | URL | Request) => {
+      if (String(url) === EXPO_PUSH_API_URL) {
+        return jsonResponse({ data: [{ status: 'ok', id: 'ticket-1' }] });
+      }
+      return jsonResponse({ results: [] });
+    }) as unknown as typeof fetch;
+    const { service } = makeService({ subscriptions: [expoSub(expoToken)], fetchImpl });
+
+    await service.notifyViaGateway('user@example.com', PAYLOAD);
+
+    expect((fetchImpl as any).mock.calls.length).toBe(1);
+    const [url, init] = (fetchImpl as any).mock.calls[0];
+    expect(url).toBe(EXPO_PUSH_API_URL);
+    expect(JSON.parse(init.body)).toEqual([
+      expect.objectContaining({
+        to: expoToken,
+        title: PAYLOAD.title,
+        body: PAYLOAD.body,
+        data: expect.objectContaining({ chatId: PAYLOAD.chatId }),
+      }),
+    ]);
+  });
+
+  it('prunes Expo tokens rejected as DeviceNotRegistered', async () => {
+    const expoToken = 'ExpoPushToken[dead-ios]';
+    const fetchImpl = mock(async () =>
+      jsonResponse({
+        data: [
+          {
+            status: 'error',
+            message: 'Device is not registered',
+            details: { error: 'DeviceNotRegistered' },
+          },
+        ],
+      })
+    ) as unknown as typeof fetch;
+    const { service, removePushSubscription } = makeService({
+      subscriptions: [expoSub(expoToken)],
+      fetchImpl,
+    });
+
+    await service.notifyViaGateway('user@example.com', PAYLOAD, 'jwt');
+
+    expect((removePushSubscription as any).mock.calls).toEqual([
+      ['user@example.com', expoToken, 'jwt'],
+    ]);
+  });
+
+  it('handles Expo single-ticket responses and prunes DeviceNotRegistered', async () => {
+    const expoToken = 'ExpoPushToken[single-dead-ios]';
+    const fetchImpl = mock(async () =>
+      jsonResponse({
+        data: {
+          status: 'error',
+          details: { error: 'DeviceNotRegistered' },
+        },
+      })
+    ) as unknown as typeof fetch;
+    const { service, removePushSubscription } = makeService({
+      subscriptions: [expoSub(expoToken)],
+      fetchImpl,
+    });
+
+    await service.notifyViaGateway('user@example.com', PAYLOAD);
+
+    expect((removePushSubscription as any).mock.calls[0][1]).toBe(expoToken);
+  });
+
+  it('retries Expo sends on 429 before succeeding', async () => {
+    let attempts = 0;
+    const fetchImpl = mock(async () => {
+      attempts += 1;
+      return attempts === 1
+        ? jsonResponse({}, { ok: false, status: 429 })
+        : jsonResponse({ data: [{ status: 'ok' }] });
+    }) as unknown as typeof fetch;
+    const sleep = mock(async () => undefined);
+    const { service } = makeService({
+      subscriptions: [expoSub('ExpoPushToken[retry-ios]')],
+      fetchImpl,
+      expoDelivery: { retryDelayMs: 1, sleep },
+    });
+
+    await service.notifyViaGateway('user@example.com', PAYLOAD);
+
+    expect(attempts).toBe(2);
+    expect((sleep as any).mock.calls.length).toBe(1);
+  });
+
+  it('times out stalled Expo sends and stops after the configured attempt bound', async () => {
+    const fetchImpl = mock(
+      async (_url: string | URL | Request, init?: RequestInit) =>
+        await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+        })
+    ) as unknown as typeof fetch;
+    const { service } = makeService({
+      subscriptions: [expoSub('ExpoPushToken[timeout-ios]')],
+      fetchImpl,
+      expoDelivery: {
+        requestTimeoutMs: 1,
+        sendAttempts: 2,
+        retryDelayMs: 1,
+        sleep: async () => undefined,
+      },
+    });
+
+    await service.notifyViaGateway('user@example.com', PAYLOAD);
+
+    expect((fetchImpl as any).mock.calls.length).toBe(2);
+  });
+
+  it('polls Expo receipts in the background and prunes a rejected device', async () => {
+    const token = 'ExpoPushToken[receipt-dead-ios]';
+    const scheduledTasks: Array<{ task: () => Promise<void>; delayMs: number }> = [];
+    const schedule = (task: () => Promise<void>, delayMs: number) => {
+      scheduledTasks.push({ task, delayMs });
+    };
+    let receiptCalls = 0;
+    const fetchImpl = mock(async (url: string | URL | Request) => {
+      if (String(url) === EXPO_PUSH_API_URL) {
+        return jsonResponse({ data: [{ status: 'ok', id: 'ticket-receipt' }] });
+      }
+      expect(String(url)).toBe(EXPO_PUSH_RECEIPTS_URL);
+      receiptCalls += 1;
+      return receiptCalls === 1
+        ? jsonResponse({ data: {} })
+        : jsonResponse({
+            data: {
+              'ticket-receipt': {
+                status: 'error',
+                details: { error: 'DeviceNotRegistered' },
+              },
+            },
+          });
+    }) as unknown as typeof fetch;
+    const { service, removePushSubscription } = makeService({
+      subscriptions: [expoSub(token)],
+      fetchImpl,
+      expoDelivery: { schedule },
+    });
+
+    await service.notifyViaGateway('user@example.com', PAYLOAD);
+    expect(scheduledTasks[0]?.delayMs).toBe(15 * 60_000);
+    expect(receiptCalls).toBe(0);
+    await scheduledTasks.shift()?.task();
+
+    expect(receiptCalls).toBe(1);
+    expect(scheduledTasks[0]?.delayMs).toBe(15 * 60_000);
+    expect((removePushSubscription as any).mock.calls.length).toBe(0);
+    await scheduledTasks.shift()?.task();
+
+    expect(receiptCalls).toBe(2);
+    expect((removePushSubscription as any).mock.calls).toContainEqual([
+      'user@example.com',
+      token,
+      undefined,
+    ]);
+  });
+
+  it('ignores stored Expo tokens whose project or app identity is not trusted', async () => {
+    const fetchImpl = mock(async () => jsonResponse({ data: [] })) as unknown as typeof fetch;
+    const { service } = makeService({
+      subscriptions: [
+        { ...expoSub('ExpoPushToken[wrong-project]'), projectId: 'upstream-project' },
+        { ...expoSub('ExpoPushToken[wrong-app]'), appId: 'dev.portable.app' },
+      ],
+      fetchImpl,
+    });
+
+    await service.notifyViaGateway('user@example.com', PAYLOAD);
+
+    expect((fetchImpl as any).mock.calls.length).toBe(0);
+  });
+
+  it('does not send a legacy iOS FCM token to the official gateway when Expo iOS exists', async () => {
+    const legacyIos = {
+      ...sub('legacy-ios-endpoint', 'legacy-official-fcm'),
+      platform: 'ios' as const,
+    };
+    const android = sub('android-endpoint', 'android-fcm');
+    const fetchImpl = mock(async (url: string | URL | Request) => {
+      if (String(url).includes('exp.host')) {
+        return jsonResponse({ data: [{ status: 'ok', id: 'ticket-1' }] });
+      }
+      return jsonResponse({ results: [{ token: 'android-fcm', ok: true }] });
+    }) as unknown as typeof fetch;
+    const { service } = makeService({
+      subscriptions: [legacyIos, expoSub('ExpoPushToken[fork-ios]'), android],
+      fetchImpl,
+    });
+
+    await service.notifyViaGateway('user@example.com', PAYLOAD);
+
+    const gatewayCall = (fetchImpl as any).mock.calls.find(([url]: [string]) =>
+      url.endsWith('/api/notify')
+    );
+    expect(JSON.parse(gatewayCall[1].body).tokens).toEqual(['android-fcm']);
+  });
+
+  it('sends Expo tokens even when the legacy relay environment is absent', async () => {
+    delete process.env.PORTABLE_RELAY_URL;
+    delete process.env.PORTABLE_PC_ID;
+    const fetchImpl = mock(async () =>
+      jsonResponse({ data: [{ status: 'ok', id: 'ticket-1' }] })
+    ) as unknown as typeof fetch;
+    const { service } = makeService({
+      subscriptions: [expoSub('ExpoPushToken[fork-ios]')],
+      fetchImpl,
+    });
+
+    await service.notifyViaGateway('user@example.com', PAYLOAD);
+
+    expect((fetchImpl as any).mock.calls[0][0]).toBe(EXPO_PUSH_API_URL);
   });
 
   it('strips a trailing slash on the relay base when building the URL', async () => {
@@ -245,6 +496,7 @@ describe('isUnregisteredPushError', () => {
       'messaging/invalid-argument',
       'NotRegistered',
       'Requested entity was not found (UNREGISTERED)',
+      'DeviceNotRegistered',
     ]) {
       expect(isUnregisteredPushError(e)).toBe(true);
     }

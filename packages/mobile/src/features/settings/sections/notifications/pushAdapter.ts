@@ -8,34 +8,28 @@
  *    (UNUserNotificationCenter authorization). The rest of the push UX —
  *    foreground display handler, notification-tap deep-linking, the Android
  *    channel — also stays on `expo-notifications` (see `PushSetupLayer`).
- *  - **Device token** (`getDeviceToken`) → **`@react-native-firebase/messaging`**
- *    `getToken()`, which returns a real **FCM registration token** on BOTH iOS and
- *    Android. The backend delivers to native devices
- *    EXCLUSIVELY via Firebase Cloud Messaging (`admin.messaging().send({ token })`),
- *    so it needs an FCM token — NOT the raw APNs device token. On iOS,
- *    `expo-notifications`' `getDevicePushTokenAsync()` returns the raw APNs token
- *    (a hex string), which FCM rejects with `messaging/invalid-argument`; the
- *    Firebase iOS SDK performs the APNs→FCM exchange and yields the FCM token.
- *    One token implementation for both platforms.
- *
- * Firebase is wired via the `@react-native-firebase/app` Expo config plugin +
- * `GoogleService-Info.plist` / `google-services.json` (same Firebase project
- * `portable-6ac02` / bundle `dev.portable.app`, so the project's already-uploaded
- * APNs key delivers iOS pushes). The native
- * modules resolve lazily via `require(...)` inside the methods; TYPES come from
- * `import type` (Babel-erased), so typecheck stays accurate without loading them.
+ *  - **Device token** (`getDeviceToken`) → iOS uses `expo-notifications`
+ *    `getExpoPushTokenAsync({ projectId })`, scoped to this fork's EAS project.
+ *    Android retains the existing Firebase token path.
  *
  * The token is POSTed to `/api/push/subscribe` with the body
- * `subscription: { endpoint, platform, fcmToken }`, which the backend
- * accepts as a native subscription (no VAPID keys required).
+ * `subscription: { endpoint, platform, pushProvider, projectId, appId }` (plus
+ * `fcmToken` on Android), which the backend accepts without VAPID keys.
  *
- * Device-only acceptance (a REAL FCM token from a physical device / dev-client
- * build + an actual APNs→FCM round-trip) is deferred to the established final
- * device pass — Jest and the simulator cannot mint real push tokens, and tests
+ * Device-only acceptance (a real Expo token from a physical iOS build plus an
+ * APNs delivery) is deferred to the established final device pass. Jest and the
+ * simulator cannot mint real push tokens, and tests
  * inject a fake {@link PushAdapter} so neither native module is ever loaded.
  */
 
 import { Platform } from 'react-native';
+import Constants from 'expo-constants';
+import {
+  PORTABLE_ANDROID_APP_ID,
+  PORTABLE_EXPO_PROJECT_ID,
+  PORTABLE_IOS_APP_ID,
+  isExpoPushToken,
+} from '@vgit2/shared/pushConfig';
 
 import type * as ExpoNotifications from 'expo-notifications';
 import type * as RNFirebaseMessaging from '@react-native-firebase/messaging';
@@ -43,11 +37,14 @@ import type * as RNFirebaseMessaging from '@react-native-firebase/messaging';
 /** Static surface of the `expo-notifications` module (type-only). */
 type NotificationsModule = typeof ExpoNotifications;
 
-/** Static surface of the `@react-native-firebase/messaging` module (type-only). */
-type MessagingModule = typeof RNFirebaseMessaging;
-
 /** Tri-state device notification permission. */
 export type PushPermissionState = 'granted' | 'denied' | 'undetermined';
+
+export interface PushRegistrationIdentity {
+  provider: 'expo' | 'fcm';
+  projectId?: string;
+  appId: string;
+}
 
 /** The seam the ViewModel consumes — fakeable in Jest with zero native code. */
 export interface PushAdapter {
@@ -55,8 +52,10 @@ export interface PushAdapter {
   getPermissionState(): Promise<PushPermissionState>;
   /** Prompt the OS permission dialog; resolves with the resulting state. */
   requestPermission(): Promise<PushPermissionState>;
-  /** The device's **FCM registration token** (both iOS and Android). */
+  /** EAS-scoped Expo token on iOS; Firebase token on Android. */
   getDeviceToken(): Promise<string>;
+  /** Stable identity persisted alongside the token for migration detection. */
+  getRegistrationIdentity(): PushRegistrationIdentity;
 }
 
 /**
@@ -68,14 +67,9 @@ function getNotifications(): NotificationsModule {
   return require('expo-notifications') as NotificationsModule;
 }
 
-/**
- * Lazily resolve `@react-native-firebase/messaging` (the FCM token source). Same
- * lazy-require rationale as {@link getNotifications}: tests inject a fake adapter
- * and never load it.
- */
-function getMessaging(): MessagingModule {
+function getMessaging(): typeof RNFirebaseMessaging {
   // eslint-disable-next-line @typescript-eslint/no-var-requires -- intentional lazy native require.
-  return require('@react-native-firebase/messaging') as MessagingModule;
+  return require('@react-native-firebase/messaging') as typeof RNFirebaseMessaging;
 }
 
 /**
@@ -89,8 +83,35 @@ function toPermissionState(response: { granted: boolean; status: string }): Push
   return 'undetermined';
 }
 
-/** The production adapter over `expo-notifications` + `@react-native-firebase/messaging`. */
-export function createExpoPushAdapter(): PushAdapter {
+interface ExpoPushAdapterOptions {
+  projectId?: string;
+  appId?: string;
+}
+
+function resolveProjectId(): string {
+  const projectId = Constants.easConfig?.projectId ?? Constants.expoConfig?.extra?.eas?.projectId;
+  return typeof projectId === 'string' && projectId.length > 0
+    ? projectId
+    : PORTABLE_EXPO_PROJECT_ID;
+}
+
+function resolveAppId(): string {
+  const appId =
+    Platform.OS === 'ios'
+      ? Constants.expoConfig?.ios?.bundleIdentifier
+      : Constants.expoConfig?.android?.package;
+  if (typeof appId === 'string' && appId.length > 0) return appId;
+  return Platform.OS === 'ios' ? PORTABLE_IOS_APP_ID : PORTABLE_ANDROID_APP_ID;
+}
+
+/** The production adapter over `expo-notifications`. */
+export function createExpoPushAdapter(options: ExpoPushAdapterOptions = {}): PushAdapter {
+  const identity: PushRegistrationIdentity = {
+    provider: Platform.OS === 'ios' ? 'expo' : 'fcm',
+    projectId: Platform.OS === 'ios' ? (options.projectId ?? resolveProjectId()) : undefined,
+    appId: options.appId ?? resolveAppId(),
+  };
+
   return {
     async getPermissionState() {
       return toPermissionState(await getNotifications().getPermissionsAsync());
@@ -99,24 +120,18 @@ export function createExpoPushAdapter(): PushAdapter {
       return toPermissionState(await getNotifications().requestPermissionsAsync());
     },
     async getDeviceToken() {
-      const messaging = getMessaging();
-      const instance = messaging.getMessaging();
-      // iOS: the Firebase SDK can only mint the FCM token once the APNs token has
-      // been set on the Messaging instance. `registerDeviceForRemoteMessages`
-      // resolves only AFTER that token arrives (its delegate sets the APNs token
-      // BEFORE resolving the promise), so ALWAYS await it on iOS — it is
-      // idempotent. Do NOT gate on the sync `isDeviceRegisteredForRemoteMessages`
-      // getter: it reflects `[UIApplication isRegisteredForRemoteNotifications]`,
-      // which flips true the moment registration is REQUESTED at launch (Firebase
-      // auto-init) — BEFORE the APNs token callback. Gating on it would skip the
-      // await in the cold-start race and let `getToken` run with a nil APNs token
-      // (→ a `messaging/invalid-argument`-class reject). No-op on Android.
-      if (Platform.OS === 'ios') {
-        await messaging.registerDeviceForRemoteMessages(instance);
+      if (identity.provider === 'expo') {
+        const token = await getNotifications().getExpoPushTokenAsync({
+          projectId: identity.projectId,
+        });
+        if (!isExpoPushToken(token.data)) {
+          throw new Error('Expo returned an invalid push token');
+        }
+        return token.data;
       }
-      // Real FCM registration token on both platforms — the value FCM
-      // (`admin.messaging().send({ token })`) actually accepts.
-      return await messaging.getToken(instance);
+      const messaging = getMessaging();
+      return await messaging.getToken(messaging.getMessaging());
     },
+    getRegistrationIdentity: () => identity,
   };
 }

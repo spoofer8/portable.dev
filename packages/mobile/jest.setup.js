@@ -101,6 +101,10 @@ jest.mock('expo-notifications', () => ({
     canAskAgain: false,
   })),
   getDevicePushTokenAsync: jest.fn(async () => ({ type: 'ios', data: 'mock-device-token' })),
+  getExpoPushTokenAsync: jest.fn(async () => ({
+    type: 'expo',
+    data: 'ExpoPushToken[mock-device-token]',
+  })),
   getLastNotificationResponseAsync: jest.fn(async () => null),
   addNotificationResponseReceivedListener: jest.fn(() => ({ remove: jest.fn() })),
   setNotificationHandler: jest.fn(),
@@ -134,8 +138,8 @@ jest.mock('react-native-keyboard-controller', () =>
 );
 
 // @react-native-firebase/messaging is a native module absent under jest-expo. It
-// is lazy-`require`d by `pushAdapter.getDeviceToken()` — the FCM token source for
-// BOTH platforms (the iOS APNs→FCM fix). Tests inject a fake `PushAdapter`, so the
+// is lazy-`require`d by `pushAdapter.getDeviceToken()` on Android. Tests inject a
+// fake `PushAdapter`, so the
 // real module is normally never reached, but a full-ladder render mounts
 // `PushSetupLayer` with the DEFAULT adapter, so keep an inert stub for robustness —
 // the expo-notifications / @sentry/react-native precedent. The modular API surface

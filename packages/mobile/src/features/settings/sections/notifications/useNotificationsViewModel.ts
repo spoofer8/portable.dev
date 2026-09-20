@@ -8,16 +8,14 @@
  * subscribe and cleared on unsubscribe. ⚠️ The `GET /api/push/settings`
  * `enabled` flag is USER-level (true when ANY subscription exists on the user's
  * account) and is deliberately NOT used for this device's status —
- * a fresh install must show "Disabled" until it registers its own APNs/FCM
+ * a fresh install must show "Disabled" until it registers its own native push
  * token, even for a user with another subscription active. There is no
  * `not-supported` status — native always supports push.
  *
  * Native flow:
- *  - enable  = requestPermission → `adapter.getDeviceToken()` (the **FCM
- *    registration token** via `@react-native-firebase/messaging` on BOTH
- *    platforms — see {@link createExpoPushAdapter}; the backend delivers native
- *    pushes only via FCM) → `POST /api/push/subscribe` with the
- *    body (`subscription: { endpoint, platform, fcmToken }` + `deviceInfo`).
+ *  - enable  = requestPermission → `adapter.getDeviceToken()` (an EAS-scoped
+ *    Expo token on iOS or an FCM token on Android) →
+ *    `POST /api/push/subscribe` with provider, project, and app identity.
  *  - disable = `POST /api/push/unsubscribe { endpoint: <token> }`.
  *  - notifyWhen = `PUT /api/push/settings { notifyWhen }` (local mutation with
  *    an optimistic update folded into the shared `pushSettings` query cache).
@@ -60,6 +58,8 @@ export interface NotificationsViewModel {
   isToggling: boolean;
   /** Enable (subscribe) or disable (unsubscribe) push for this device. */
   toggle: () => Promise<void>;
+  /** Register or refresh this device without treating an old token as a disable request. */
+  ensureRegistered: () => Promise<void>;
   notifyWhen: NotifyWhen;
   isUpdatingNotifyWhen: boolean;
   setNotifyWhen: (value: NotifyWhen) => void;
@@ -108,10 +108,20 @@ export function useNotificationsViewModel(
   // subscribe). Only counts while permission is granted — a registered token
   // whose permission was later revoked in the OS cannot deliver.
   const registeredEndpoint = usePushRegistrationStore((s) => s.registeredEndpoint);
-  const setRegisteredEndpoint = usePushRegistrationStore((s) => s.setRegisteredEndpoint);
+  const registeredProvider = usePushRegistrationStore((s) => s.registeredProvider);
+  const registeredProjectId = usePushRegistrationStore((s) => s.registeredProjectId);
+  const registeredAppId = usePushRegistrationStore((s) => s.registeredAppId);
+  const setRegistration = usePushRegistrationStore((s) => s.setRegistration);
   const clearRegisteredEndpoint = usePushRegistrationStore((s) => s.clearRegisteredEndpoint);
-  const subscribed =
-    permission === 'granted' && (subscribedOverride ?? registeredEndpoint !== null);
+  const markRegistrationSyncing = usePushRegistrationStore((s) => s.markRegistrationSyncing);
+  const markRegistrationFailed = usePushRegistrationStore((s) => s.markRegistrationFailed);
+  const identity = adapter.getRegistrationIdentity();
+  const registrationIsCurrent =
+    registeredEndpoint !== null &&
+    registeredProvider === identity.provider &&
+    registeredProjectId === (identity.projectId ?? null) &&
+    registeredAppId === identity.appId;
+  const subscribed = permission === 'granted' && (subscribedOverride ?? registrationIsCurrent);
 
   const status: NotificationStatus =
     permission === null
@@ -153,6 +163,57 @@ export function useNotificationsViewModel(
     [mutateNotifyWhen]
   );
 
+  const ensureRegistered = useCallback(async () => {
+    markRegistrationSyncing();
+    const previousEndpoint = registeredEndpoint;
+    let token: string;
+    let identity: ReturnType<PushAdapter['getRegistrationIdentity']>;
+    try {
+      identity = adapter.getRegistrationIdentity();
+      token = await adapter.getDeviceToken();
+      await api.post<{ success: boolean }>('/api/push/subscribe', {
+        subscription: {
+          endpoint: token,
+          platform,
+          pushProvider: identity.provider,
+          projectId: identity.projectId,
+          appId: identity.appId,
+          ...(identity.provider === 'fcm' ? { fcmToken: token } : {}),
+        },
+        deviceInfo: { platform, timestamp: now().toISOString() },
+      });
+      setRegistration({ endpoint: token, ...identity });
+      setSubscribedOverride(true);
+      queryClient.setQueryData<PushNotificationSettings>(queryKeys.pushSettings(), (prev) =>
+        prev ? { ...prev, enabled: true } : prev
+      );
+    } catch (error) {
+      markRegistrationFailed();
+      throw error;
+    }
+
+    if (previousEndpoint && previousEndpoint !== token) {
+      try {
+        await api.post<{ success: boolean }>('/api/push/unsubscribe', {
+          endpoint: previousEndpoint,
+        });
+      } catch {
+        // The new registration is already active. Server-side stale-token
+        // cleanup will remove the old endpoint if this best-effort cleanup fails.
+      }
+    }
+  }, [
+    adapter,
+    api,
+    markRegistrationFailed,
+    markRegistrationSyncing,
+    now,
+    platform,
+    queryClient,
+    registeredEndpoint,
+    setRegistration,
+  ]);
+
   const toggle = useCallback(async () => {
     if (isToggling) return;
     setIsToggling(true);
@@ -175,17 +236,7 @@ export function useNotificationsViewModel(
           setPermission(perm);
           if (perm !== 'granted') return; // denied/dismissed → status reflects it
         }
-        const token = await adapter.getDeviceToken();
-        await api.post<{ success: boolean }>('/api/push/subscribe', {
-          subscription: { endpoint: token, platform, fcmToken: token },
-          deviceInfo: { platform, timestamp: now().toISOString() },
-        });
-        // Persist THIS device's registration — the source of the status.
-        setRegisteredEndpoint(token);
-        setSubscribedOverride(true);
-        queryClient.setQueryData<PushNotificationSettings>(queryKeys.pushSettings(), (prev) =>
-          prev ? { ...prev, enabled: true } : prev
-        );
+        await ensureRegistered();
       }
     } catch {
       // Toggle errors are swallowed (logged there); state unchanged.
@@ -197,12 +248,10 @@ export function useNotificationsViewModel(
     api,
     clearRegisteredEndpoint,
     isToggling,
-    now,
+    ensureRegistered,
     permission,
-    platform,
     queryClient,
     registeredEndpoint,
-    setRegisteredEndpoint,
     status,
   ]);
 
@@ -219,6 +268,7 @@ export function useNotificationsViewModel(
     status,
     isToggling,
     toggle,
+    ensureRegistered,
     notifyWhen,
     isUpdatingNotifyWhen,
     setNotifyWhen,

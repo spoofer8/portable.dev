@@ -16,6 +16,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { promises as fs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { Database } from 'bun:sqlite';
 
 import {
   SqliteDbAdapter,
@@ -37,6 +38,14 @@ const DEVICE_B = {
   keys: { p256dh: 'p256dh-b', auth: 'auth-b' },
   platform: 'ios' as const,
   fcmToken: 'fcm-b',
+  deviceInfo: { model: 'iphone' },
+};
+const FORK_EXPO_DEVICE = {
+  endpoint: 'ExpoPushToken[fork-ios-device]',
+  platform: 'ios' as const,
+  pushProvider: 'expo' as const,
+  projectId: '114bef50-b96c-4db6-9c47-3c610bcdf321',
+  appId: 'cloud.umair.portable',
   deviceInfo: { model: 'iphone' },
 };
 
@@ -72,6 +81,11 @@ describe('SqliteDbAdapter - push-subscriptions domain on local SQLite', () => {
         userId: USER,
         endpoint: DEVICE_A.endpoint,
         keys: { p256dh: 'p256dh-a', auth: 'auth-a' },
+        fcmToken: undefined,
+        platform: 'web',
+        pushProvider: 'web',
+        projectId: undefined,
+        appId: undefined,
         deviceInfo: { browser: 'chrome' },
       },
     ]);
@@ -86,6 +100,63 @@ describe('SqliteDbAdapter - push-subscriptions domain on local SQLite', () => {
     expect(list.map((s) => s.endpoint).sort()).toEqual(
       [DEVICE_A.endpoint, DEVICE_B.endpoint].sort()
     );
+  });
+
+  it('replaces legacy iOS FCM rows when the fork registers an Expo token', async () => {
+    await adapter.savePushSubscription(USER, DEVICE_B);
+    await adapter.updateNotificationSettings(USER, {
+      notifyWhen: 'offline',
+      taskComplete: false,
+    });
+    await adapter.savePushSubscription(USER, FORK_EXPO_DEVICE);
+
+    expect(await adapter.getUserPushSubscriptions(USER)).toEqual([
+      expect.objectContaining({
+        endpoint: FORK_EXPO_DEVICE.endpoint,
+        platform: 'ios',
+        pushProvider: 'expo',
+        projectId: FORK_EXPO_DEVICE.projectId,
+        appId: FORK_EXPO_DEVICE.appId,
+      }),
+    ]);
+    expect(await adapter.getNotificationSettings(USER)).toEqual({
+      enabled: true,
+      taskComplete: false,
+      notifyWhen: 'offline',
+    });
+  });
+
+  it('preserves multiple Expo iOS devices and Android while pruning legacy iOS FCM', async () => {
+    await adapter.savePushSubscription(USER, DEVICE_B);
+    await adapter.savePushSubscription(USER, {
+      endpoint: 'android-fcm',
+      platform: 'android',
+      pushProvider: 'fcm',
+      fcmToken: 'android-fcm',
+    });
+    await adapter.savePushSubscription(USER, FORK_EXPO_DEVICE);
+    await adapter.savePushSubscription(USER, {
+      ...FORK_EXPO_DEVICE,
+      endpoint: 'ExpoPushToken[second-ios-device]',
+    });
+
+    const subscriptions = await adapter.getUserPushSubscriptions(USER);
+    expect(subscriptions.map((subscription) => subscription.endpoint).sort()).toEqual([
+      'ExpoPushToken[fork-ios-device]',
+      'ExpoPushToken[second-ios-device]',
+      'android-fcm',
+    ]);
+  });
+
+  it('does not prune legacy iOS rows for an untrusted Expo identity', async () => {
+    await adapter.savePushSubscription(USER, DEVICE_B);
+    await adapter.savePushSubscription(USER, {
+      ...FORK_EXPO_DEVICE,
+      endpoint: 'ExpoPushToken[wrong-project]',
+      projectId: 'upstream-project',
+    });
+
+    expect(await adapter.getUserPushSubscriptions(USER)).toHaveLength(2);
   });
 
   it('upserts the same device in place (no duplicate row on re-register)', async () => {
@@ -196,8 +267,62 @@ describe('SqlitePushStore - direct unit coverage', () => {
         // The native FCM token is surfaced so PushNotificationService.notifyViaGateway
         // can delegate the send to the gateway.
         fcmToken: 'fcm-x',
+        platform: 'android',
+        pushProvider: 'fcm',
+        projectId: undefined,
+        appId: undefined,
         deviceInfo: {},
       },
     ]);
+  });
+});
+
+describe('SqlitePushStore - schema migration', () => {
+  it('upgrades existing FCM rows and prunes the legacy iOS row after Expo registration', async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'sqlite-push-migration-'));
+    const dbPath = path.join(dataDir, SQLITE_PUSH_DB_FILE);
+    const legacyDb = new Database(dbPath, { create: true });
+    legacyDb.exec(`
+      CREATE TABLE push_subscriptions (
+        user_id TEXT NOT NULL,
+        endpoint TEXT NOT NULL,
+        p256dh TEXT,
+        auth TEXT,
+        platform TEXT NOT NULL DEFAULT 'web',
+        fcm_token TEXT,
+        device_info TEXT NOT NULL DEFAULT '{}',
+        notification_settings TEXT NOT NULL DEFAULT '{}',
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (user_id, endpoint)
+      );
+    `);
+    legacyDb
+      .prepare(
+        `INSERT INTO push_subscriptions
+           (user_id, endpoint, platform, fcm_token, updated_at)
+         VALUES (?, ?, 'ios', ?, ?)`
+      )
+      .run(USER, 'legacy-ios', 'official-app-fcm', new Date().toISOString());
+    legacyDb.close();
+
+    const migrated = new SqlitePushStore(dataDir);
+    try {
+      await migrated.initialize();
+      expect(await migrated.getUserPushSubscriptions(USER)).toEqual([
+        expect.objectContaining({
+          endpoint: 'legacy-ios',
+          platform: 'ios',
+          pushProvider: 'fcm',
+        }),
+      ]);
+
+      await migrated.savePushSubscription(USER, FORK_EXPO_DEVICE);
+      expect((await migrated.getUserPushSubscriptions(USER)).map((row) => row.endpoint)).toEqual([
+        FORK_EXPO_DEVICE.endpoint,
+      ]);
+    } finally {
+      migrated.close();
+      await fs.rm(dataDir, { recursive: true, force: true });
+    }
   });
 });

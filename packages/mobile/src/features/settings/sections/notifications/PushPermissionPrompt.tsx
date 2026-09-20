@@ -6,10 +6,9 @@
  * (mounted by {@link PushSetupLayer} inside `ApiProvider`, AFTER the gate ladder —
  * NOT tied to onboarding, so returning users are asked too). Behavior on mount:
  *
- *  - **Already granted** → never show the modal; silently register this device's
- *    token if it isn't registered yet (a returning user who granted on a prior
- *    install). Self-heals on every launch — NOT gated by
- *    `permissionAsked`.
+ *  - **Already granted** → never show the modal; silently refresh this device's
+ *    registration on every launch. This repairs token rotation, lost server
+ *    rows, and registrations created by older builds.
  *  - **Undetermined / denied** AND not asked before → show the modal after a
  *    short settle delay, marking `permissionAsked` so it never reappears.
  *      - "Enable Notifications" → `vm.toggle()` (request OS permission → register).
@@ -33,6 +32,8 @@ const PROMPT_DELAY_MS = 500;
 export interface PushPermissionPromptDeps {
   /** Override the PushAdapter (default: `createExpoPushAdapter()`). */
   adapter?: PushAdapter;
+  /** Retry schedule for automatic registration migration. */
+  migrationRetryDelaysMs?: readonly number[];
 }
 
 export interface PushPermissionPromptProps {
@@ -63,8 +64,27 @@ export function PushPermissionPrompt({ deps }: PushPermissionPromptProps) {
       const store = usePushRegistrationStore.getState();
 
       if (state === 'granted') {
-        // Already granted — silently register this device if it hasn't been.
-        if (store.registeredEndpoint === null) void vm.toggle();
+        // Keep the prior local registration until the replacement POST succeeds.
+        // A current token is refreshed too, so token rotation and lost server rows
+        // self-heal without making Settings briefly report Disabled.
+        const delays = deps?.migrationRetryDelaysMs ?? [0, 1_000, 5_000];
+        void (async () => {
+          for (const delayMs of delays) {
+            if (cancelled) return;
+            if (delayMs > 0) {
+              await new Promise<void>((resolve) => {
+                timer = setTimeout(resolve, delayMs);
+              });
+            }
+            if (cancelled) return;
+            try {
+              await vm.ensureRegistered();
+              return;
+            } catch {
+              // Retry on this mount; the ViewModel exposes `failed` in its store.
+            }
+          }
+        })();
         return;
       }
 

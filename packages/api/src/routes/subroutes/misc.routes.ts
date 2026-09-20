@@ -1,4 +1,5 @@
 import { shouldLog } from '@vgit2/shared/constants';
+import { isTrustedPortableExpoSubscription } from '@vgit2/shared/pushConfig';
 import { Router } from 'express';
 
 import { requireAuth } from '../../middleware/auth.js';
@@ -291,10 +292,11 @@ export function createMiscRoutes(
 
       // Support both formats: nested subscription object or flat
       const subscriptionData = req.body.subscription || req.body;
-      const { endpoint, keys, platform, fcmToken } = subscriptionData;
+      const { endpoint, keys, platform, fcmToken, pushProvider, projectId, appId } =
+        subscriptionData;
       const { deviceInfo } = req.body;
 
-      // Native subscriptions (ios/android) don't need VAPID keys, only fcmToken
+      // Native subscriptions use either an Expo token or the legacy FCM token.
       const isNative = platform === 'ios' || platform === 'android';
       if (!endpoint) {
         return res.status(400).json({ error: 'endpoint is required' });
@@ -304,6 +306,16 @@ export function createMiscRoutes(
           .status(400)
           .json({ error: 'Invalid subscription data: keys required for web push' });
       }
+      if (pushProvider && !['web', 'fcm', 'expo'].includes(pushProvider)) {
+        return res.status(400).json({ error: 'Invalid push provider' });
+      }
+      if (pushProvider === 'expo') {
+        if (!isNative || !isTrustedPortableExpoSubscription(subscriptionData)) {
+          return res.status(400).json({ error: 'Invalid Expo push subscription' });
+        }
+      } else if (isNative && !fcmToken) {
+        return res.status(400).json({ error: 'fcmToken is required for legacy native push' });
+      }
 
       if (!pushNotificationService) {
         return res.status(503).json({ error: 'Push notification service not available' });
@@ -311,7 +323,7 @@ export function createMiscRoutes(
 
       const success = await pushNotificationService.saveSubscription(
         userId,
-        { endpoint, keys, deviceInfo, platform, fcmToken },
+        { endpoint, keys, deviceInfo, platform, fcmToken, pushProvider, projectId, appId },
         authToken
       );
 

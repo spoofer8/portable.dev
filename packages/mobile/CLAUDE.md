@@ -776,28 +776,22 @@ every page MVVM ViewModel-as-hook over the shared `chrome/SettingsChrome.tsx` ki
   `legal` (ToS/Privacy markdown copied into TS constants). `/settings/sentry-test` is surfaced only
   in dev mode.
 
-## Push notifications + FCM (`src/features/settings/sections/notifications/`)
+## Push notifications (`src/features/settings/sections/notifications/`)
 
-The backend delivers native pushes EXCLUSIVELY via FCM, so it needs a real **FCM registration
-token**. `pushAdapter.getDeviceToken()` is `@react-native-firebase/messaging` `getToken()` on
-**BOTH** platforms — on iOS, `expo-notifications`' `getDevicePushTokenAsync()` returns the raw
-APNs token, which FCM rejects (`messaging/invalid-argument`); the Firebase iOS SDK mints a real FCM
-token (always `await registerDeviceForRemoteMessages()` first on iOS — do NOT re-add an
-`isDeviceRegisteredForRemoteMessages` guard). Permission/handlers/deep-linking stay on
-`expo-notifications`.
+iOS fork builds use `expo-notifications.getExpoPushTokenAsync({ projectId })`. The EAS project ID
+binds delivery to `cloud.umair.portable`; do not replace this with the upstream Firebase token
+path. Android retains its existing Firebase token path. Permission, foreground handling, and
+deep-linking use `expo-notifications` on both platforms.
 
 - **`PushSetupLayer`** (mounted by `AppShell` inside `ApiProvider`) sets the foreground handler,
   the Android `portable-notifications` channel, the deep-link handler (`usePushDeepLink`:
   `data.chatId` → `/(app)/(tabs)/chat/<id>`), and the one-time `PushPermissionPrompt`. Enable →
   permission → `getDeviceToken()` → `POST /api/push/subscribe` (`subscription: { endpoint,
-platform, fcmToken }`). This device's Enabled status comes from the MMKV `pushRegistrationStore`,
+platform, pushProvider, projectId, appId }`). This device's Enabled status comes from the MMKV `pushRegistrationStore`,
   NOT `GET /api/push/settings.enabled` (which is user-level and would lie on a fresh install).
-- **Config (committed, not secrets — restricted by package/bundle id):** `google-services.json`
-  (`android.googleServicesFile`) + `GoogleService-Info.plist` (`ios.googleServicesFile`), both
-  Firebase project `portable-6ac02`, bundle `dev.portable.app`. The iOS build needs
-  `use_modular_headers!` in the Podfile (the local `plugins/withModularHeaders.js` config plugin) —
-  Firebase iOS SDK 11's Swift pods can't import their ObjC deps without modules. **`useFrameworks`
-  is deliberately NOT used** (it risks the New-Arch C++ pods — mmkv/nitro, reanimated/worklets).
+- On launch, a granted installation whose persisted registration came from an older FCM build is
+  re-registered with Expo. The backend atomically removes legacy iOS FCM rows while preserving
+  Expo iOS devices, Android registrations, and web-push subscriptions.
 
 ## Other AppShell layers
 

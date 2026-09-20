@@ -4,6 +4,11 @@ import {
   VAPID_SUBJECT,
   debugLog,
 } from '@vgit2/shared/constants';
+import {
+  EXPO_PUSH_API_URL,
+  EXPO_PUSH_RECEIPTS_URL,
+  isTrustedPortableExpoSubscription,
+} from '@vgit2/shared/pushConfig';
 import webpush from 'web-push';
 
 import type { DbAdapter } from '../db/DbAdapter.js';
@@ -29,18 +34,51 @@ export function isUnregisteredPushError(error: string | undefined): boolean {
   );
 }
 
+type PushSubscription = {
+  userId: string;
+  endpoint: string;
+  keys: { p256dh: string; auth: string };
+  fcmToken?: string;
+  platform?: 'web' | 'ios' | 'android';
+  pushProvider?: 'web' | 'fcm' | 'expo';
+  projectId?: string;
+  appId?: string;
+  deviceInfo?: any;
+};
+
+export interface ExpoDeliveryOptions {
+  requestTimeoutMs?: number;
+  sendAttempts?: number;
+  receiptAttempts?: number;
+  retryDelayMs?: number;
+  receiptDelayMs?: number;
+  sleep?: (milliseconds: number) => Promise<void>;
+  schedule?: (task: () => Promise<void>, delayMs: number) => void;
+}
+
+type ResolvedExpoDeliveryOptions = Required<ExpoDeliveryOptions>;
+
+function defaultSleep(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function defaultSchedule(task: () => Promise<void>, delayMs: number): void {
+  const timer = setTimeout(() => void task().catch(() => undefined), delayMs);
+  if (typeof timer.unref === 'function') timer.unref();
+}
+
 /**
  * Push Notification Service
  *
  * Owns the PC's push subscriptions (SQLite) and delivers background
- * notifications when the app is closed. Two delivery paths:
+ * notifications when the app is closed. Three delivery paths:
  *
- * - **PRIMARY (live): native Expo/FCM via the gateway** — {@link notifyViaGateway}
- *   reads the user's stored `fcmToken`s and delegates the actual send to the public
- *   gateway (`POST /api/notify`), which fans out via firebase-admin. The mobile Expo
- *   RN app (the only client) subscribes with `{ endpoint, platform, fcmToken }` — a
- *   native subscription, NO VAPID keys — so this is the only path that fires in
- *   practice.
+ * - **PRIMARY (live): Expo Push API** — fork builds register EAS-scoped Expo
+ *   tokens and the PC sends them directly to Expo. This binds APNs delivery to
+ *   the fork's bundle ID without requiring a Firebase Admin secret.
+ * - **LEGACY NATIVE: FCM via the gateway** — retained for Android and older
+ *   registrations. Once an Expo iOS token exists, iOS FCM rows are ignored and
+ *   removed during registration.
  * - **DORMANT FALLBACK: Web Push / VAPID** — {@link sendNotification} (Web Push
  *   Protocol RFC 8030 + VAPID) is RETAINED but effectively dead: it self-disables
  *   when VAPID keys are unset (the local-first common case → early return), and the
@@ -55,6 +93,7 @@ export function isUnregisteredPushError(error: string | undefined): boolean {
  */
 export class PushNotificationService {
   private configured: boolean = false;
+  private readonly expoDelivery: ResolvedExpoDeliveryOptions;
 
   /**
    * @param dbAdapter - persistence for push subscriptions (the PC owns subscriptions).
@@ -63,8 +102,18 @@ export class PushNotificationService {
    */
   constructor(
     private dbAdapter: DbAdapter,
-    private fetchImpl: typeof fetch = fetch
+    private fetchImpl: typeof fetch = fetch,
+    expoDelivery: ExpoDeliveryOptions = {}
   ) {
+    this.expoDelivery = {
+      requestTimeoutMs: expoDelivery.requestTimeoutMs ?? 8_000,
+      sendAttempts: expoDelivery.sendAttempts ?? 3,
+      receiptAttempts: expoDelivery.receiptAttempts ?? 3,
+      retryDelayMs: expoDelivery.retryDelayMs ?? 500,
+      receiptDelayMs: expoDelivery.receiptDelayMs ?? 15 * 60_000,
+      sleep: expoDelivery.sleep ?? defaultSleep,
+      schedule: expoDelivery.schedule ?? defaultSchedule,
+    };
     console.log('[PushNotificationService] Initializing push notification service...');
 
     // Validate configuration
@@ -114,6 +163,9 @@ export class PushNotificationService {
       };
       platform?: 'web' | 'ios' | 'android';
       fcmToken?: string;
+      pushProvider?: 'web' | 'fcm' | 'expo';
+      projectId?: string;
+      appId?: string;
       deviceInfo?: any;
     },
     authToken?: string
@@ -131,21 +183,7 @@ export class PushNotificationService {
   /**
    * Get all push subscriptions for a user
    */
-  async getUserSubscriptions(
-    userId: string,
-    authToken?: string
-  ): Promise<
-    Array<{
-      userId: string;
-      endpoint: string;
-      keys: {
-        p256dh: string;
-        auth: string;
-      };
-      fcmToken?: string;
-      deviceInfo?: any;
-    }>
-  > {
+  async getUserSubscriptions(userId: string, authToken?: string): Promise<PushSubscription[]> {
     return await this.dbAdapter.getUserPushSubscriptions(userId, authToken);
   }
 
@@ -206,11 +244,14 @@ export class PushNotificationService {
       const notificationPayload = JSON.stringify(payload);
 
       // Send to all user's devices (multi-device support)
-      const sendPromises = subscriptions.map(async (subscription) => {
+      const webSubscriptions = subscriptions.filter(
+        (subscription) =>
+          subscription.pushProvider === 'web' ||
+          (!subscription.pushProvider && !subscription.fcmToken)
+      );
+      const sendPromises = webSubscriptions.map(async (subscription) => {
         try {
-          console.log(
-            `[PushNotificationService] Attempting to send to: ${subscription.endpoint.substring(0, 50)}...`
-          );
+          console.log('[PushNotificationService] Attempting web-push delivery');
 
           await webpush.sendNotification(
             {
@@ -220,27 +261,23 @@ export class PushNotificationService {
             notificationPayload
           );
 
-          console.log(
-            `[PushNotificationService] ✓ Successfully sent to device: ${subscription.endpoint.substring(0, 50)}...`
-          );
+          console.log('[PushNotificationService] ✓ Successfully sent web-push notification');
         } catch (error: any) {
           // Handle expired subscriptions
           if (error.statusCode === 410 || error.statusCode === 404) {
             console.log(
-              `[PushNotificationService] Subscription expired (${error.statusCode}), removing: ${subscription.endpoint.substring(0, 50)}...`
+              `[PushNotificationService] Subscription expired (${error.statusCode}), removing it`
             );
             try {
               await this.removeSubscription(userId, subscription.endpoint, authToken);
             } catch (removeError) {
               console.error('[PushNotificationService] Failed to remove expired subscription:', {
-                endpoint: subscription.endpoint.substring(0, 50) + '...',
                 error: removeError instanceof Error ? removeError.message : String(removeError),
               });
             }
           } else {
             // Log detailed error information
             console.error('[PushNotificationService] ✗ Failed to send push notification:', {
-              endpoint: subscription.endpoint.substring(0, 50) + '...',
               errorName: error.name || 'Unknown',
               errorMessage: error.message || String(error),
               statusCode: error.statusCode,
@@ -276,20 +313,14 @@ export class PushNotificationService {
   }
 
   /**
-   * Deliver a push notification to the user's native (Expo/FCM) devices by
-   * delegating the actual send to the public gateway (the only online service
-   * that holds the FCM credential) — local-first push.
+   * Deliver a push notification to the user's native devices. Expo tokens go
+   * directly to the Expo Push API; remaining FCM tokens go through the relay.
    *
-   * The PC owns the subscriptions: this reads the user's stored `fcmToken`s and
-   * POSTs `{ pcId, tokens, payload }` to `<PORTABLE_RELAY_URL>/api/notify`. The
-   * gateway fans the message out via firebase-admin and returns a per-token
-   * result; tokens the gateway reports as unregistered are pruned locally
-   * (the same cleanup the local 410/404 web-push path performs).
+   * Both providers return per-token results. Tokens reported as unregistered
+   * are pruned locally, matching the local 410/404 web-push cleanup.
    *
-   * Best-effort by contract — NEVER throws. When `PORTABLE_RELAY_URL` /
-   * `PORTABLE_PC_ID` are unset (a non-launcher run, e.g. bare `bun run dev`),
-   * this no-ops gracefully. The local web-push/VAPID path is kept as a dormant
-   * fallback (see {@link sendNotification}).
+   * Best-effort by contract — NEVER throws. Missing relay configuration disables
+   * only legacy FCM delivery; Expo delivery remains available.
    */
   async notifyViaGateway(
     userId: string,
@@ -297,14 +328,6 @@ export class PushNotificationService {
     authToken?: string
   ): Promise<void> {
     try {
-      const relayBase = process.env.PORTABLE_RELAY_URL?.trim();
-      const pcId = process.env.PORTABLE_PC_ID?.trim();
-
-      // Non-launcher run: no gateway to delegate to → no-op (web-push fallback only).
-      if (!relayBase || !pcId) {
-        return;
-      }
-
       let subscriptions;
       try {
         subscriptions = await this.getUserSubscriptions(userId, authToken);
@@ -316,10 +339,25 @@ export class PushNotificationService {
         return;
       }
 
+      const expoSubscriptions = subscriptions.filter((subscription) =>
+        isTrustedPortableExpoSubscription(subscription)
+      );
+      await this.notifyViaExpo(userId, expoSubscriptions, payload, authToken);
+
+      const relayBase = process.env.PORTABLE_RELAY_URL?.trim();
+      const pcId = process.env.PORTABLE_PC_ID?.trim();
+      if (!relayBase || !pcId) {
+        return;
+      }
+
+      const hasExpoIos = expoSubscriptions.some((subscription) => subscription.platform === 'ios');
+
       // Collect distinct FCM tokens and remember which endpoint(s) each maps to,
       // so a token the gateway reports as dead can be pruned by endpoint.
       const endpointsByToken = new Map<string, string[]>();
       for (const sub of subscriptions) {
+        if (sub.pushProvider === 'expo') continue;
+        if (hasExpoIos && sub.platform === 'ios') continue;
         const token = sub.fcmToken?.trim();
         if (!token) continue;
         const endpoints = endpointsByToken.get(token) ?? [];
@@ -379,14 +417,11 @@ export class PushNotificationService {
         for (const endpoint of endpoints) {
           try {
             await this.removeSubscription(userId, endpoint, authToken);
-            console.log(
-              `[PushNotificationService] notifyViaGateway: pruned unregistered device (${endpoint.substring(0, 50)}...)`
-            );
+            console.log('[PushNotificationService] notifyViaGateway: pruned unregistered device');
           } catch (removeError) {
             console.error(
               '[PushNotificationService] notifyViaGateway: failed to prune dead subscription:',
               {
-                endpoint: endpoint.substring(0, 50) + '...',
                 error: removeError instanceof Error ? removeError.message : String(removeError),
               }
             );
@@ -400,6 +435,182 @@ export class PushNotificationService {
         error: error instanceof Error ? error.message : String(error),
       });
     }
+  }
+
+  private async notifyViaExpo(
+    userId: string,
+    subscriptions: PushSubscription[],
+    payload: NotifyPayload,
+    authToken?: string
+  ): Promise<void> {
+    const uniqueSubscriptions = [
+      ...new Map(
+        subscriptions.map((subscription) => [subscription.endpoint, subscription])
+      ).values(),
+    ];
+
+    for (let offset = 0; offset < uniqueSubscriptions.length; offset += 100) {
+      const batch = uniqueSubscriptions.slice(offset, offset + 100);
+      let response: Response | undefined;
+      try {
+        response = await this.fetchExpoWithRetry(EXPO_PUSH_API_URL, {
+          method: 'POST',
+          headers: {
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            'Accept-Encoding': 'gzip, deflate',
+          },
+          body: JSON.stringify(
+            batch.map((subscription) => ({
+              to: subscription.endpoint,
+              title: payload.title,
+              body: payload.body,
+              sound: 'default',
+              data: payload.chatId ? { chatId: payload.chatId } : {},
+            }))
+          ),
+        });
+      } catch (error) {
+        console.warn('[PushNotificationService] Expo Push API unreachable:', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
+
+      if (!response) continue;
+
+      if (!response.ok) {
+        console.warn(`[PushNotificationService] Expo Push API returned ${response.status}`);
+        continue;
+      }
+
+      let tickets: Array<{
+        status?: string;
+        id?: string;
+        details?: { error?: string };
+      }>;
+      try {
+        const result = (await response.json()) as {
+          data?:
+            | { status?: string; id?: string; details?: { error?: string } }
+            | Array<{ status?: string; id?: string; details?: { error?: string } }>;
+        };
+        tickets = result.data ? (Array.isArray(result.data) ? result.data : [result.data]) : [];
+      } catch (error) {
+        console.warn('[PushNotificationService] Expo Push API returned invalid JSON:', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
+
+      const receipts = new Map<string, string>();
+      for (const [index, ticket] of tickets.entries()) {
+        const subscription = batch[index];
+        if (!subscription) continue;
+        if (ticket.status === 'ok' && ticket.id) {
+          receipts.set(ticket.id, subscription.endpoint);
+          continue;
+        }
+        if (ticket.status !== 'error' || ticket.details?.error !== 'DeviceNotRegistered') {
+          continue;
+        }
+        try {
+          await this.removeSubscription(userId, subscription.endpoint, authToken);
+          console.log('[PushNotificationService] Pruned an unregistered Expo device');
+        } catch (error) {
+          console.error('[PushNotificationService] Failed to prune an Expo device:', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      if (receipts.size > 0) {
+        this.expoDelivery.schedule(
+          () => this.pollExpoReceipts(userId, receipts, authToken, 1),
+          this.expoDelivery.receiptDelayMs
+        );
+      }
+    }
+  }
+
+  private async fetchExpoWithRetry(
+    url: string,
+    init: Omit<RequestInit, 'signal'>
+  ): Promise<Response | undefined> {
+    for (let attempt = 1; attempt <= this.expoDelivery.sendAttempts; attempt += 1) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), this.expoDelivery.requestTimeoutMs);
+      if (typeof timeout.unref === 'function') timeout.unref();
+      try {
+        const response = await this.fetchImpl(url, { ...init, signal: controller.signal });
+        if (response.status !== 429 && response.status < 500) return response;
+        if (attempt === this.expoDelivery.sendAttempts) return response;
+      } catch (error) {
+        if (attempt === this.expoDelivery.sendAttempts) {
+          console.warn('[PushNotificationService] Expo request failed after retries:', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return undefined;
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+      await this.expoDelivery.sleep(this.expoDelivery.retryDelayMs * attempt);
+    }
+    return undefined;
+  }
+
+  private async pollExpoReceipts(
+    userId: string,
+    receipts: Map<string, string>,
+    authToken: string | undefined,
+    attempt: number
+  ): Promise<void> {
+    const pending = new Map(receipts);
+    let response: Response | undefined;
+    try {
+      response = await this.fetchExpoWithRetry(EXPO_PUSH_RECEIPTS_URL, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ ids: [...pending.keys()] }),
+      });
+    } catch {
+      response = undefined;
+    }
+
+    if (response?.ok) {
+      try {
+        const result = (await response.json()) as {
+          data?: Record<string, { status?: string; details?: { error?: string } }>;
+        };
+        for (const [ticketId, receipt] of Object.entries(result.data ?? {})) {
+          const endpoint = pending.get(ticketId);
+          if (!endpoint) continue;
+          pending.delete(ticketId);
+          if (receipt.status === 'error' && receipt.details?.error === 'DeviceNotRegistered') {
+            try {
+              await this.removeSubscription(userId, endpoint, authToken);
+              console.log('[PushNotificationService] Pruned an unregistered Expo device');
+            } catch (error) {
+              console.error('[PushNotificationService] Failed to prune an Expo device:', {
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+          }
+        }
+      } catch {
+        // Missing receipts are retried below; malformed responses are best-effort.
+      }
+    }
+
+    if (pending.size === 0 || attempt >= this.expoDelivery.receiptAttempts) return;
+    this.expoDelivery.schedule(
+      () => this.pollExpoReceipts(userId, pending, authToken, attempt + 1),
+      this.expoDelivery.receiptDelayMs
+    );
   }
 
   /**
@@ -495,8 +706,8 @@ export class PushNotificationService {
         icon: '/icons/icon-192.png',
       };
 
-      // Primary delivery: native Expo/FCM devices via the gateway relay.
-      // No-ops gracefully when not launcher-hosted (PORTABLE_RELAY_URL unset).
+      // Native delivery: iOS Expo tokens go directly to Expo; legacy FCM
+      // (including Android) uses the relay when it is configured.
       await this.notifyViaGateway(userId, notifyPayload, authToken);
 
       // Dormant fallback: local web-push/VAPID. Self-disables when VAPID keys are

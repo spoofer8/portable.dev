@@ -1,6 +1,6 @@
 /**
  * Notifications settings screen (`/settings/notifications`) — thin view over
- * {@link useNotificationsViewModel}, over the native APNs/FCM push path
+ * {@link useNotificationsViewModel}, over the native Expo/FCM push path
  * (`pushAdapter.ts` → `expo-notifications`).
  *
  * testIDs:
@@ -25,7 +25,7 @@
  *  - Denied path ADDS an "Open Settings" button (`Linking.openSettings` seam) —
  *    native can deep-link.
  *
- * Device-only acceptance (real APNs/FCM token round-trip) is deferred to the
+ * Device-only acceptance (real Expo/FCM token round-trip) is deferred to the
  * established device pass — see `pushAdapter.ts`.
  */
 

@@ -54,6 +54,25 @@ describe('API Routes - Push Notifications', () => {
 
       expect([400, 500]).toContain(response.status);
     });
+
+    it('rejects an Expo token claiming an untrusted app identity', async () => {
+      const response = await request(app)
+        .post('/api/push/subscribe')
+        .send({
+          subscription: {
+            endpoint: 'ExpoPushToken[wrong-app]',
+            platform: 'ios',
+            pushProvider: 'expo',
+            projectId: '114bef50-b96c-4db6-9c47-3c610bcdf321',
+            appId: 'dev.portable.app',
+          },
+        })
+        .set('Content-Type', 'application/json')
+        .set('Authorization', `Bearer ${authToken}`);
+
+      expect(response.status).toBe(400);
+      expect(response.body.error).toBe('Invalid Expo push subscription');
+    });
   });
 
   describe('POST /api/push/unsubscribe', () => {

@@ -394,6 +394,9 @@ export interface DbAdapter {
       };
       platform?: 'web' | 'ios' | 'android';
       fcmToken?: string;
+      pushProvider?: 'web' | 'fcm' | 'expo';
+      projectId?: string;
+      appId?: string;
       deviceInfo?: any;
     },
     authToken?: string
@@ -420,8 +423,12 @@ export interface DbAdapter {
         p256dh: string;
         auth: string;
       };
-      /** FCM device token (native Expo/FCM push); absent for legacy web-push subs. */
+      /** Legacy FCM token; absent for Expo and web-push subscriptions. */
       fcmToken?: string;
+      platform?: 'web' | 'ios' | 'android';
+      pushProvider?: 'web' | 'fcm' | 'expo';
+      projectId?: string;
+      appId?: string;
       deviceInfo?: any;
     }>
   >;

@@ -8,7 +8,7 @@
  *   1. status renders from the injected adapter + `GET /api/push/settings`
  *      (Checking... → Disabled / Enabled),
  *   2. Enable → permission request → `POST /api/push/subscribe` with the exact
- *      expected body (subscription.endpoint/platform/fcmToken +
+ *      expected body (subscription.endpoint/platform/provider/app identity +
  *      deviceInfo.platform/timestamp),
  *   3. Disable → `POST /api/push/unsubscribe { endpoint }`,
  *   4. notifyWhen toggle → `PUT /api/push/settings { notifyWhen: 'offline' }`
@@ -71,7 +71,9 @@ interface SecureStoreMock {
 const secureStore = jest.requireMock('expo-secure-store') as SecureStoreMock;
 
 const SANDBOX_BASE = 'https://sandbox.portable.test';
-const DEVICE_TOKEN = 'apns-token-123';
+const DEVICE_TOKEN = 'ExpoPushToken[fork-device]';
+const PROJECT_ID = '114bef50-b96c-4db6-9c47-3c610bcdf321';
+const APP_ID = 'cloud.umair.portable';
 const FIXED_NOW = '2026-06-11T12:00:00.000Z';
 
 const SAFE_AREA_METRICS = {
@@ -104,6 +106,7 @@ function createFakeAdapter(opts: FakeAdapterOpts = {}) {
       calls.getToken += 1;
       return opts.token ?? DEVICE_TOKEN;
     },
+    getRegistrationIdentity: () => ({ provider: 'expo', projectId: PROJECT_ID, appId: APP_ID }),
   };
   return { adapter, calls };
 }
@@ -126,7 +129,13 @@ describe('settings notifications — native push path', () => {
     secureStore.__store.clear();
     secureStore.__store.set(RELAY_URL_KEY, SANDBOX_BASE);
     secureStore.__store.set(AUTH_TOKEN_KEY, 'good-token');
-    usePushRegistrationStore.setState({ registeredEndpoint: null });
+    usePushRegistrationStore.setState({
+      registeredEndpoint: null,
+      registeredProvider: null,
+      registeredProjectId: null,
+      registeredAppId: null,
+      registrationSyncStatus: 'idle',
+    });
     gateway = createMockGateway();
     gateway.on('POST', `${SANDBOX_BASE}/api/push/subscribe`, () => ({ body: { success: true } }));
     gateway.on('POST', `${SANDBOX_BASE}/api/push/unsubscribe`, () => ({
@@ -192,7 +201,12 @@ describe('settings notifications — native push path', () => {
     registerSettings({ enabled: true, taskComplete: true, notifyWhen: 'offline' });
     // The per-device registration (persisted after a successful subscribe) is
     // the status source — seeded here as if this device had subscribed before.
-    usePushRegistrationStore.setState({ registeredEndpoint: DEVICE_TOKEN });
+    usePushRegistrationStore.setState({
+      registeredEndpoint: DEVICE_TOKEN,
+      registeredProvider: 'expo',
+      registeredProjectId: PROJECT_ID,
+      registeredAppId: APP_ID,
+    });
     renderScreen(createFakeAdapter({ permission: 'granted' }).adapter);
 
     await waitFor(() => {
@@ -205,6 +219,21 @@ describe('settings notifications — native push path', () => {
     expect(screen.getByTestId('settings-notifications-when-card')).toBeTruthy();
     expect(screen.getByTestId('settings-notifications-when-offline')).toBeSelected();
     expect(screen.getByTestId('settings-notifications-when-always')).not.toBeSelected();
+  });
+
+  it('does not show a legacy or different-project registration as enabled', async () => {
+    registerSettings({ enabled: true, taskComplete: true, notifyWhen: 'always' });
+    usePushRegistrationStore.setState({
+      registeredEndpoint: 'legacy-official-fcm-token',
+      registeredProvider: null,
+      registeredProjectId: null,
+      registeredAppId: null,
+    });
+    renderScreen(createFakeAdapter({ permission: 'granted' }).adapter);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('settings-notifications-status')).toHaveTextContent('Disabled');
+    });
   });
 
   it('does NOT trust the user-level server `enabled` flag: a fresh device shows Disabled', async () => {
@@ -249,7 +278,13 @@ describe('settings notifications — native push path', () => {
       (r) => r.method === 'POST' && r.url.endsWith('/api/push/subscribe')
     )!;
     expect(subscribe.body).toEqual({
-      subscription: { endpoint: DEVICE_TOKEN, platform: 'ios', fcmToken: DEVICE_TOKEN },
+      subscription: {
+        endpoint: DEVICE_TOKEN,
+        platform: 'ios',
+        pushProvider: 'expo',
+        projectId: PROJECT_ID,
+        appId: APP_ID,
+      },
       deviceInfo: { platform: 'ios', timestamp: FIXED_NOW },
     });
     expect(subscribe.headers.Authorization).toBe('Bearer good-token');
@@ -267,7 +302,12 @@ describe('settings notifications — native push path', () => {
 
   it('Disable → POSTs unsubscribe with the device token endpoint', async () => {
     registerSettings({ enabled: true, taskComplete: true, notifyWhen: 'always' });
-    usePushRegistrationStore.setState({ registeredEndpoint: DEVICE_TOKEN });
+    usePushRegistrationStore.setState({
+      registeredEndpoint: DEVICE_TOKEN,
+      registeredProvider: 'expo',
+      registeredProjectId: PROJECT_ID,
+      registeredAppId: APP_ID,
+    });
     renderScreen(createFakeAdapter({ permission: 'granted', token: DEVICE_TOKEN }).adapter);
 
     await waitFor(() => {
@@ -297,7 +337,12 @@ describe('settings notifications — native push path', () => {
 
   it('notifyWhen pick → PUT { notifyWhen: "offline" } and the selection is reflected', async () => {
     registerSettings({ enabled: true, taskComplete: true, notifyWhen: 'always' });
-    usePushRegistrationStore.setState({ registeredEndpoint: DEVICE_TOKEN });
+    usePushRegistrationStore.setState({
+      registeredEndpoint: DEVICE_TOKEN,
+      registeredProvider: 'expo',
+      registeredProjectId: PROJECT_ID,
+      registeredAppId: APP_ID,
+    });
     renderScreen(createFakeAdapter({ permission: 'granted' }).adapter);
 
     await waitFor(() => {

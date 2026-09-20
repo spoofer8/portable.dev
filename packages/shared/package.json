@@ -121,6 +121,10 @@
     "./cors": {
       "types": "./src/cors.ts",
       "default": "./src/cors.ts"
+    },
+    "./pushConfig": {
+      "types": "./src/pushConfig.ts",
+      "default": "./src/pushConfig.ts"
     }
   },
   "dependencies": {

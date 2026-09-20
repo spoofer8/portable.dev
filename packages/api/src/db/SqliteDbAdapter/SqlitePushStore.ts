@@ -25,6 +25,7 @@ import { promises as fs } from 'fs';
 import * as path from 'path';
 
 import { resolveDataDir } from '@vgit2/shared/secrets';
+import { isTrustedPortableExpoSubscription } from '@vgit2/shared/pushConfig';
 import { Database } from 'bun:sqlite';
 
 /** Filename of the SQLite database inside the data directory. */
@@ -38,6 +39,9 @@ interface DbPushRow {
   auth: string | null;
   platform: string;
   fcm_token: string | null;
+  push_provider: string | null;
+  project_id: string | null;
+  app_id: string | null;
   device_info: string;
   notification_settings: string;
 }
@@ -51,6 +55,9 @@ type PushSubscriptionInput = {
   };
   platform?: 'web' | 'ios' | 'android';
   fcmToken?: string;
+  pushProvider?: 'web' | 'fcm' | 'expo';
+  projectId?: string;
+  appId?: string;
   deviceInfo?: any;
 };
 
@@ -114,12 +121,29 @@ export class SqlitePushStore {
         auth TEXT,
         platform TEXT NOT NULL DEFAULT 'web',
         fcm_token TEXT,
+        push_provider TEXT,
+        project_id TEXT,
+        app_id TEXT,
         device_info TEXT NOT NULL DEFAULT '{}',
         notification_settings TEXT NOT NULL DEFAULT '{}',
         updated_at TEXT NOT NULL,
         PRIMARY KEY (user_id, endpoint)
       );
     `);
+
+    const columns = this.db
+      .prepare<{ name: string }>('PRAGMA table_info(push_subscriptions)')
+      .all()
+      .map((column) => column.name);
+    if (!columns.includes('push_provider')) {
+      this.db.exec('ALTER TABLE push_subscriptions ADD COLUMN push_provider TEXT');
+    }
+    if (!columns.includes('project_id')) {
+      this.db.exec('ALTER TABLE push_subscriptions ADD COLUMN project_id TEXT');
+    }
+    if (!columns.includes('app_id')) {
+      this.db.exec('ALTER TABLE push_subscriptions ADD COLUMN app_id TEXT');
+    }
   }
 
   close(): void {
@@ -137,29 +161,69 @@ export class SqlitePushStore {
     subscription: PushSubscriptionInput,
     _authToken?: string
   ): Promise<boolean> {
-    this.db
-      .prepare(
-        `INSERT INTO push_subscriptions
-           (user_id, endpoint, p256dh, auth, platform, fcm_token, device_info, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(user_id, endpoint) DO UPDATE SET
-           p256dh = excluded.p256dh,
-           auth = excluded.auth,
-           platform = excluded.platform,
-           fcm_token = excluded.fcm_token,
-           device_info = excluded.device_info,
-           updated_at = excluded.updated_at`
-      )
-      .run(
-        userId,
-        subscription.endpoint,
-        subscription.keys?.p256dh ?? null,
-        subscription.keys?.auth ?? null,
-        subscription.platform ?? 'web',
-        subscription.fcmToken ?? null,
-        JSON.stringify(subscription.deviceInfo ?? {}),
-        new Date().toISOString()
-      );
+    const platform = subscription.platform ?? 'web';
+    const pushProvider =
+      subscription.pushProvider ??
+      (subscription.fcmToken ? 'fcm' : platform === 'web' ? 'web' : null);
+    const existingSettings =
+      this.db
+        .prepare<{ notification_settings: string }>(
+          `SELECT notification_settings FROM push_subscriptions
+             WHERE user_id = ? ORDER BY updated_at ASC, endpoint ASC LIMIT 1`
+        )
+        .get(userId)?.notification_settings ?? '{}';
+    const save = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO push_subscriptions
+             (user_id, endpoint, p256dh, auth, platform, fcm_token, push_provider,
+              project_id, app_id, device_info, notification_settings, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(user_id, endpoint) DO UPDATE SET
+             p256dh = excluded.p256dh,
+             auth = excluded.auth,
+             platform = excluded.platform,
+             fcm_token = excluded.fcm_token,
+             push_provider = excluded.push_provider,
+             project_id = excluded.project_id,
+             app_id = excluded.app_id,
+             device_info = excluded.device_info,
+             updated_at = excluded.updated_at`
+        )
+        .run(
+          userId,
+          subscription.endpoint,
+          subscription.keys?.p256dh ?? null,
+          subscription.keys?.auth ?? null,
+          platform,
+          subscription.fcmToken ?? null,
+          pushProvider,
+          subscription.projectId ?? null,
+          subscription.appId ?? null,
+          JSON.stringify(subscription.deviceInfo ?? {}),
+          existingSettings,
+          new Date().toISOString()
+        );
+
+      if (
+        isTrustedPortableExpoSubscription({
+          endpoint: subscription.endpoint,
+          platform,
+          pushProvider: pushProvider ?? undefined,
+          projectId: subscription.projectId,
+          appId: subscription.appId,
+        })
+      ) {
+        this.db
+          .prepare(
+            `DELETE FROM push_subscriptions
+               WHERE user_id = ? AND platform = 'ios' AND endpoint != ?
+                 AND COALESCE(push_provider, 'fcm') != 'expo'`
+          )
+          .run(userId, subscription.endpoint);
+      }
+    });
+    save();
     console.log(`[SqlitePushStore] Saved push subscription for user ${userId}`);
     return true;
   }
@@ -194,12 +258,17 @@ export class SqlitePushStore {
         auth: string;
       };
       fcmToken?: string;
+      platform?: 'web' | 'ios' | 'android';
+      pushProvider?: 'web' | 'fcm' | 'expo';
+      projectId?: string;
+      appId?: string;
       deviceInfo?: any;
     }>
   > {
     const rows = this.db
       .prepare<DbPushRow>(
-        `SELECT user_id, endpoint, p256dh, auth, platform, fcm_token, device_info, notification_settings
+        `SELECT user_id, endpoint, p256dh, auth, platform, fcm_token, push_provider,
+                project_id, app_id, device_info, notification_settings
            FROM push_subscriptions WHERE user_id = ? ORDER BY updated_at ASC, endpoint ASC`
       )
       .all(userId);
@@ -210,8 +279,18 @@ export class SqlitePushStore {
         p256dh: row.p256dh ?? '',
         auth: row.auth ?? '',
       },
-      // Native Expo/FCM subscriptions carry an fcm_token (web-push subs do not).
+      // Only legacy Firebase-native subscriptions carry an fcm_token.
       fcmToken: row.fcm_token ?? undefined,
+      platform:
+        row.platform === 'ios' || row.platform === 'android' ? row.platform : ('web' as const),
+      pushProvider:
+        row.push_provider === 'expo' || row.push_provider === 'fcm'
+          ? row.push_provider
+          : row.fcm_token
+            ? 'fcm'
+            : 'web',
+      projectId: row.project_id ?? undefined,
+      appId: row.app_id ?? undefined,
       deviceInfo: this.parseJson(row.device_info, {}),
     }));
   }
