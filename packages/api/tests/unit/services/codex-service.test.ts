@@ -180,7 +180,126 @@ describe('CodexService thread lifecycle', () => {
     await unarchiving;
   });
 
-  test('keeps a closed thread resumable and restarts the supervised server cleanly', async () => {
+  test('unsubscribes one completed thread and removes its binding only after thread/closed', async () => {
+    const { service, transport } = await startService();
+    const starting = service.startCodexSession('chat-1', { cwd: '/repo' });
+    transport.reply(transport.take('thread/start'), { thread: { id: 'thread-1', cwd: '/repo' } });
+    await starting;
+    transport.receive({
+      method: 'turn/started',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1' } },
+    });
+    transport.receive({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [] } },
+    });
+
+    const releasing = service.releaseSession('chat-1', 'turn-1');
+    const unsubscribe = transport.take('thread/unsubscribe');
+    expect(unsubscribe.params).toEqual({ threadId: 'thread-1' });
+    transport.reply(unsubscribe, { status: 'unsubscribed' });
+    await Promise.resolve();
+    expect(service.getSession('chat-1')?.threadId).toBe('thread-1');
+
+    transport.receive({ method: 'thread/closed', params: { threadId: 'thread-1' } });
+    expect(await releasing).toBe(true);
+    expect(service.getSession('chat-1')).toBeUndefined();
+  });
+
+  test('releases only the requested thread while another session remains active', async () => {
+    const { service, transport } = await startService();
+    const first = service.startCodexSession('chat-1', { cwd: '/repo/one' });
+    transport.reply(transport.take('thread/start'), { thread: { id: 'thread-1' } });
+    await first;
+    const second = service.startCodexSession('chat-2', { cwd: '/repo/two' });
+    transport.reply(transport.take('thread/start'), { thread: { id: 'thread-2' } });
+    await second;
+    transport.receive({
+      method: 'turn/started',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1' } },
+    });
+    transport.receive({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [] } },
+    });
+
+    const releasing = service.releaseSession('chat-1', 'turn-1');
+    transport.reply(transport.take('thread/unsubscribe'), { status: 'unsubscribed' });
+    transport.receive({ method: 'thread/closed', params: { threadId: 'thread-1' } });
+
+    expect(await releasing).toBe(true);
+    expect(service.getSession('chat-1')).toBeUndefined();
+    expect(service.getSession('chat-2')?.threadId).toBe('thread-2');
+  });
+
+  test('accepts notLoaded as release confirmation and drops ambiguous timeout bindings', async () => {
+    const notLoadedHarness = await startService();
+    const starting = notLoadedHarness.service.startCodexSession('chat-1');
+    notLoadedHarness.transport.reply(notLoadedHarness.transport.take('thread/start'), {
+      thread: { id: 'thread-1' },
+    });
+    await starting;
+    notLoadedHarness.transport.receive({
+      method: 'turn/started',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1' } },
+    });
+    notLoadedHarness.transport.receive({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', items: [] } },
+    });
+    const notLoadedRelease = notLoadedHarness.service.releaseSession('chat-1', 'turn-1');
+    notLoadedHarness.transport.reply(notLoadedHarness.transport.take('thread/unsubscribe'), {
+      status: 'notLoaded',
+    });
+    expect(await notLoadedRelease).toBe(true);
+    expect(notLoadedHarness.service.getSession('chat-1')).toBeUndefined();
+
+    const timeoutHarness = await startService({ threadReleaseTimeoutMs: 1 });
+    const timeoutStart = timeoutHarness.service.startCodexSession('chat-2');
+    timeoutHarness.transport.reply(timeoutHarness.transport.take('thread/start'), {
+      thread: { id: 'thread-2' },
+    });
+    await timeoutStart;
+    timeoutHarness.transport.receive({
+      method: 'turn/started',
+      params: { threadId: 'thread-2', turn: { id: 'turn-2' } },
+    });
+    timeoutHarness.transport.receive({
+      method: 'turn/completed',
+      params: { threadId: 'thread-2', turn: { id: 'turn-2', status: 'completed', items: [] } },
+    });
+    const timedOutRelease = timeoutHarness.service.releaseSession('chat-2', 'turn-2');
+    timeoutHarness.transport.reply(timeoutHarness.transport.take('thread/unsubscribe'), {
+      status: 'notSubscribed',
+    });
+    expect(await timedOutRelease).toBe(false);
+    expect(timeoutHarness.service.getSession('chat-2')).toBeUndefined();
+  });
+
+  test('ignores a stale completion for an older turn without releasing the active turn', async () => {
+    const { service, transport } = await startService();
+    const starting = service.startCodexSession('chat-1');
+    transport.reply(transport.take('thread/start'), { thread: { id: 'thread-1' } });
+    await starting;
+    transport.receive({
+      method: 'turn/started',
+      params: { threadId: 'thread-1', turn: { id: 'turn-new' } },
+    });
+    transport.receive({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-old', status: 'completed', items: [] } },
+    });
+
+    expect(service.getSession('chat-1')).toMatchObject({
+      state: 'running',
+      activeTurnId: 'turn-new',
+    });
+    expect(await service.releaseSession('chat-1', 'turn-old')).toBe(false);
+    expect(transport.writes.some((message) => message.method === 'thread/unsubscribe')).toBe(false);
+    expect(service.getSession('chat-1')?.threadId).toBe('thread-1');
+  });
+
+  test('drops a closed thread binding and restarts the supervised server cleanly', async () => {
     const first = new FakeTransport();
     const second = new FakeTransport();
     const transports = [first, second];
@@ -195,14 +314,14 @@ describe('CodexService thread lifecycle', () => {
     first.reply(first.take('thread/start'), { thread: { id: 'thread-1', cwd: '/repo' } });
     await starting;
     first.receive({ method: 'thread/closed', params: { threadId: 'thread-1' } });
-    expect(service.getSession('chat-1')?.state).toBe('stopped');
-    expect(service.canResumeSession('chat-1')).toBe(true);
+    expect(service.getSession('chat-1')).toBeUndefined();
+    expect(service.canResumeSession('chat-1')).toBe(false);
 
     const restarting = service.restart();
     second.reply(await waitForRequest(second, 'initialize'), { userAgent: 'codex/0.154.0' });
     await restarting;
     expect(first.stops).toBe(1);
-    expect(service.canResumeSession('chat-1')).toBe(true);
+    expect(service.canResumeSession('chat-1')).toBe(false);
   });
 });
 
@@ -301,7 +420,18 @@ describe('CodexService turn lifecycle', () => {
       },
     });
     expect(service.getSession('chat-1')).toMatchObject({ state: 'idle', activeTurnId: undefined });
+    expect(statuses.at(-1)).toMatchObject({
+      chatId: 'chat-1',
+      state: 'idle',
+      completedTurnId: 'turn-1',
+    });
+
+    transport.receive({
+      method: 'thread/status/changed',
+      params: { threadId: 'thread-1', status: { type: 'idle' } },
+    });
     expect(statuses.at(-1)).toMatchObject({ chatId: 'chat-1', state: 'idle' });
+    expect(statuses.at(-1)).not.toHaveProperty('completedTurnId');
   });
 
   test('maps Portable question indexes back to Codex question ids', async () => {

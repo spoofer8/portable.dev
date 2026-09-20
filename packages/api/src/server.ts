@@ -613,7 +613,7 @@ class Server {
 
     this.codexService = new CodexService({
       command: process.env.CODEX_BIN || 'codex',
-      args: ['app-server', '--stdio'],
+      args: ['app-server', '--stdio', '-c', 'thread_unload_delay_secs=0'],
       onStream: (event) => {
         void this.chatExecutionService?.handleCodexStream(event).catch((error) => {
           console.error('[Server] Failed to handle Codex stream event:', error);

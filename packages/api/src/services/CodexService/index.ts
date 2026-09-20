@@ -24,6 +24,7 @@ import type {
   ThreadListParams,
   ThreadListResponse,
   ThreadOperationResponse,
+  ThreadUnsubscribeResponse,
   ThreadSourceKind,
   ThreadStartOptions,
   TurnStartOptions,
@@ -48,6 +49,7 @@ export type {
   ThreadListParams,
   ThreadListResponse,
   ThreadOperationResponse,
+  ThreadUnsubscribeResponse,
   ThreadSourceKind,
   ThreadStartOptions,
   TurnStartOptions,
@@ -77,6 +79,7 @@ export interface CodexServiceOptions extends Omit<
   onNotification?: (notification: JsonRpcNotification) => void;
   onExit?: (error: Error) => void;
   now?: () => number;
+  threadReleaseTimeoutMs?: number;
 }
 
 const approvalKind = (method: string): CodexApprovalRequest['kind'] => {
@@ -109,6 +112,7 @@ export class CodexService {
   private readonly chatByThreadId = new Map<string, string>();
   private readonly approvals = new Map<string, CodexApprovalRequest>();
   private readonly streamedTextItems = new Map<string, string>();
+  private readonly threadClosedWaiters = new Map<string, Set<() => void>>();
   private readonly now: () => number;
 
   constructor(private readonly options: CodexServiceOptions = {}) {
@@ -250,6 +254,7 @@ export class CodexService {
     const input = typeof content === 'string' ? [this.textInput(content)] : content;
     const response = await this.startTurn(session.threadId, input, options);
     session.activeTurnId = response.turn.id;
+    session.lastCompletedTurnId = undefined;
     session.state = 'running';
     session.lastError = undefined;
     session.updatedAt = this.now();
@@ -387,6 +392,69 @@ export class CodexService {
     await this.client.request('thread/unarchive', { threadId });
   }
 
+  async releaseSession(chatId: string, completedTurnId: string): Promise<boolean> {
+    const session = this.sessions.get(chatId);
+    if (
+      !session ||
+      session.lastCompletedTurnId !== completedTurnId ||
+      session.activeTurnId ||
+      session.state === 'running' ||
+      session.state === 'waiting'
+    ) {
+      return false;
+    }
+
+    const threadId = session.threadId;
+    let confirmClosed!: () => void;
+    const closed = new Promise<void>((resolve) => {
+      confirmClosed = resolve;
+    });
+    const waiters = this.threadClosedWaiters.get(threadId) ?? new Set<() => void>();
+    waiters.add(confirmClosed);
+    this.threadClosedWaiters.set(threadId, waiters);
+
+    const removeWaiter = () => {
+      const current = this.threadClosedWaiters.get(threadId);
+      current?.delete(confirmClosed);
+      if (current?.size === 0) this.threadClosedWaiters.delete(threadId);
+    };
+
+    try {
+      const response = await this.client.request<ThreadUnsubscribeResponse>('thread/unsubscribe', {
+        threadId,
+      });
+      if (response.status === 'notLoaded') {
+        this.removeThreadBindings(threadId);
+        return true;
+      }
+
+      const confirmed = await new Promise<boolean>((resolve) => {
+        const timer = setTimeout(
+          () => resolve(false),
+          this.options.threadReleaseTimeoutMs ?? 12_000
+        );
+        timer.unref?.();
+        void closed.then(() => {
+          clearTimeout(timer);
+          resolve(true);
+        });
+      });
+      if (!confirmed) {
+        const current = this.sessions.get(chatId);
+        if (
+          current === session &&
+          current.lastCompletedTurnId === completedTurnId &&
+          !current.activeTurnId
+        ) {
+          this.removeThreadBindings(threadId);
+        }
+      }
+      return confirmed;
+    } finally {
+      removeWaiter();
+    }
+  }
+
   async restart(): Promise<unknown> {
     for (const session of this.sessions.values()) {
       session.state = 'stopped';
@@ -472,8 +540,11 @@ export class CodexService {
       case 'turn/completed': {
         if (!session) return;
         const turn = asRecord(params.turn);
+        const completedTurnId = typeof turn.id === 'string' ? turn.id : undefined;
+        if (!completedTurnId || session.activeTurnId !== completedTurnId) return;
         const status = turn.status;
         session.activeTurnId = undefined;
+        session.lastCompletedTurnId = completedTurnId;
         if (Array.isArray(turn.items)) {
           for (const item of turn.items) {
             const itemRecord = asRecord(item);
@@ -484,10 +555,14 @@ export class CodexService {
           const error = asRecord(turn.error);
           session.lastError =
             typeof error.message === 'string' ? error.message : 'Codex turn failed';
-          this.setSessionState(session, 'error');
+          this.setSessionState(session, 'error', {
+            completedTurnId,
+          });
         } else {
           session.lastError = undefined;
-          this.setSessionState(session, 'idle');
+          this.setSessionState(session, 'idle', {
+            completedTurnId,
+          });
         }
         return;
       }
@@ -502,8 +577,15 @@ export class CodexService {
       case 'thread/closed': {
         if (session) {
           session.activeTurnId = undefined;
-          this.setSessionState(session, 'stopped');
+          session.state = 'stopped';
+          session.updatedAt = this.now();
         }
+        if (threadId) {
+          this.removeThreadBindings(threadId);
+          for (const confirm of this.threadClosedWaiters.get(threadId) ?? []) confirm();
+          this.threadClosedWaiters.delete(threadId);
+        }
+        if (session) this.emitStatus(session, { ownershipReleased: true });
         return;
       }
       case 'serverRequest/resolved': {
@@ -710,21 +792,29 @@ export class CodexService {
     });
   }
 
-  private emitStatus(session: CodexSession): void {
+  private emitStatus(
+    session: CodexSession,
+    metadata: Pick<CodexStatusEvent, 'completedTurnId' | 'ownershipReleased'> = {}
+  ): void {
     this.options.onStatus?.({
       chatId: session.chatId,
       userId: session.userId,
       threadId: session.threadId,
       state: session.state,
       turnId: session.activeTurnId,
+      ...metadata,
       error: session.lastError,
     });
   }
 
-  private setSessionState(session: CodexSession, state: CodexSessionState): void {
+  private setSessionState(
+    session: CodexSession,
+    state: CodexSessionState,
+    metadata: Pick<CodexStatusEvent, 'completedTurnId' | 'ownershipReleased'> = {}
+  ): void {
     session.state = state;
     session.updatedAt = this.now();
-    this.emitStatus(session);
+    this.emitStatus(session, metadata);
   }
 
   private stateFromThreadStatus(status: unknown): CodexSessionState {

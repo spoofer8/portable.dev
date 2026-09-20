@@ -8,7 +8,8 @@ const ORIGINAL_PRESETS = process.env.CODEX_PRESETS_JSON;
 function makeHarness(
   chatOverrides: Record<string, unknown> = {},
   codexCwdValidator: (cwd: string, userId: string) => Promise<string> = async (cwd) => cwd,
-  stopOnPc = mock(async () => ({ stopped: true, reason: 'stopped' }))
+  stopOnPc = mock(async () => ({ stopped: true, reason: 'stopped' })),
+  pushNotificationService?: { sendIfOffline: (...args: any[]) => Promise<void> }
 ) {
   const bufferMessage = mock(async () => {});
   const chat = {
@@ -47,6 +48,7 @@ function makeHarness(
   const forkCodexSession = mock(startCodexSession);
   const addMessageToSession = mock(async () => ({ id: 'turn-1', status: 'inProgress' }));
   const stopSession = mock(async () => true);
+  const releaseSession = mock(async () => true);
   const resolvePermissionRequest = mock(() => true);
   const resolveUserInputRequest = mock(() => true);
   const getSession = mock(() => undefined);
@@ -59,6 +61,7 @@ function makeHarness(
     forkCodexSession,
     addMessageToSession,
     stopSession,
+    releaseSession,
     resolvePermissionRequest,
     resolveUserInputRequest,
   } as any;
@@ -82,7 +85,7 @@ function makeHarness(
     undefined,
     undefined,
     dbAdapter,
-    undefined,
+    pushNotificationService,
     undefined,
     undefined,
     undefined,
@@ -106,6 +109,7 @@ function makeHarness(
     forkCodexSession,
     addMessageToSession,
     stopSession,
+    releaseSession,
     resolvePermissionRequest,
     resolveUserInputRequest,
     getSession,
@@ -148,9 +152,252 @@ describe('ChatExecutionService Codex routing', () => {
       userId: 'alice@example.com',
       threadId: 'thread-1',
       state: 'idle',
+      completedTurnId: 'turn-1',
     });
 
     expect(harness.releasePower).toHaveBeenCalledTimes(2);
+  });
+
+  it('releases app-server ownership only after a real turn completion is persisted and pushed', async () => {
+    const order: string[] = [];
+    const pushNotificationService = {
+      sendIfOffline: mock(async () => {
+        order.push('push');
+      }),
+    };
+    const harness = makeHarness({}, async (cwd) => cwd, undefined, pushNotificationService);
+    harness.bufferMessage.mockImplementation(async (_userId, _chatId, role) => {
+      if (role === 'assistant') order.push('persist');
+    });
+    harness.releaseSession.mockImplementation(async () => {
+      order.push('release');
+      return true;
+    });
+    await harness.service.executeMessage(harness.context, { content: 'Run' }, {});
+    await harness.service.handleCodexStream({
+      chatId: 'chat-1',
+      userId: 'alice@example.com',
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      operation: 'append',
+      block: { type: 'text', blockId: 'reply', content: 'Done', timestamp: 1 },
+    });
+
+    await harness.service.handleCodexStatus({
+      chatId: 'chat-1',
+      userId: 'alice@example.com',
+      threadId: 'thread-1',
+      state: 'idle',
+      completedTurnId: 'turn-1',
+    });
+
+    expect(order).toEqual(['persist', 'push', 'release']);
+    expect(harness.releaseSession).toHaveBeenCalledWith('chat-1', 'turn-1');
+  });
+
+  it('does not unsubscribe for a transient idle status without turn completion', async () => {
+    const harness = makeHarness();
+    await harness.service.executeMessage(harness.context, { content: 'Run' }, {});
+
+    await harness.service.handleCodexStatus({
+      chatId: 'chat-1',
+      userId: 'alice@example.com',
+      threadId: 'thread-1',
+      state: 'idle',
+    });
+
+    expect(harness.releaseSession).not.toHaveBeenCalled();
+  });
+
+  it('does not emit, persist, or push a second completion when thread/closed confirms release', async () => {
+    const pushNotificationService = { sendIfOffline: mock(async () => {}) };
+    const harness = makeHarness({}, async (cwd) => cwd, undefined, pushNotificationService);
+    await harness.service.executeMessage(harness.context, { content: 'Run' }, {});
+    harness.bufferMessage.mockClear();
+
+    await harness.service.handleCodexStatus({
+      chatId: 'chat-1',
+      userId: 'alice@example.com',
+      threadId: 'thread-1',
+      state: 'stopped',
+      ownershipReleased: true,
+    });
+
+    expect(harness.bufferMessage).not.toHaveBeenCalled();
+    expect(harness.emitted).toEqual([]);
+    expect(harness.context.emitter.broadcastRuntimeStateToUser).toHaveBeenCalledWith(
+      'alice@example.com'
+    );
+    expect(pushNotificationService.sendIfOffline).not.toHaveBeenCalled();
+    expect(harness.releaseSession).not.toHaveBeenCalled();
+  });
+
+  it('serializes a completed-turn release against the next mobile send', async () => {
+    let confirmRelease!: () => void;
+    const releasePending = new Promise<void>((resolve) => {
+      confirmRelease = resolve;
+    });
+    const harness = makeHarness({ session_id: 'thread-existing' });
+    harness.releaseSession.mockImplementation(async () => {
+      await releasePending;
+      return true;
+    });
+    await harness.service.executeMessage(harness.context, { content: 'First' }, {});
+
+    const completing = harness.service.handleCodexStatus({
+      chatId: 'chat-1',
+      userId: 'alice@example.com',
+      threadId: 'thread-existing',
+      state: 'idle',
+      completedTurnId: 'turn-1',
+    });
+    for (
+      let attempt = 0;
+      attempt < 20 && harness.releaseSession.mock.calls.length === 0;
+      attempt++
+    ) {
+      await Promise.resolve();
+    }
+    expect(harness.releaseSession).toHaveBeenCalledTimes(1);
+    const nextSend = harness.service.executeMessage(harness.context, { content: 'Second' }, {});
+    await Promise.resolve();
+
+    expect(harness.resumeCodexSession).toHaveBeenCalledTimes(1);
+    confirmRelease();
+    await completing;
+    await nextSend;
+    expect(harness.resumeCodexSession).toHaveBeenCalledTimes(2);
+    expect(harness.addMessageToSession).toHaveBeenCalledTimes(2);
+  });
+
+  it('resumes the persisted thread on the next mobile message after release', async () => {
+    const harness = makeHarness({ session_id: 'thread-existing' });
+    let owned = true;
+    harness.getSession.mockImplementation(() =>
+      owned
+        ? {
+            chatId: 'chat-1',
+            userId: 'alice@example.com',
+            threadId: 'thread-existing',
+            state: 'idle',
+            updatedAt: 1,
+          }
+        : undefined
+    );
+    harness.releaseSession.mockImplementation(async () => {
+      owned = false;
+      return true;
+    });
+
+    await harness.service.executeMessage(harness.context, { content: 'First' }, {});
+    expect(harness.resumeCodexSession).not.toHaveBeenCalled();
+    await harness.service.handleCodexStatus({
+      chatId: 'chat-1',
+      userId: 'alice@example.com',
+      threadId: 'thread-existing',
+      state: 'idle',
+      completedTurnId: 'turn-1',
+    });
+    await harness.service.executeMessage(harness.context, { content: 'Second' }, {});
+
+    expect(harness.resumeCodexSession).toHaveBeenCalledWith(
+      'chat-1',
+      'thread-existing',
+      expect.any(Object),
+      'alice@example.com'
+    );
+    expect(harness.addMessageToSession).toHaveBeenCalledTimes(2);
+  });
+
+  it('resumes through the safe DB path after an unconfirmed release timeout', async () => {
+    const harness = makeHarness({ session_id: 'thread-existing' });
+    let owned = true;
+    harness.getSession.mockImplementation(() =>
+      owned
+        ? {
+            chatId: 'chat-1',
+            userId: 'alice@example.com',
+            threadId: 'thread-existing',
+            state: 'idle',
+            updatedAt: 1,
+          }
+        : undefined
+    );
+    harness.releaseSession.mockImplementation(async () => {
+      owned = false;
+      return false;
+    });
+
+    await harness.service.executeMessage(harness.context, { content: 'First' }, {});
+    await harness.service.handleCodexStatus({
+      chatId: 'chat-1',
+      userId: 'alice@example.com',
+      threadId: 'thread-existing',
+      state: 'idle',
+      completedTurnId: 'turn-1',
+    });
+    await harness.service.executeMessage(harness.context, { content: 'Second' }, {});
+
+    expect(harness.resumeCodexSession).toHaveBeenCalledWith(
+      'chat-1',
+      'thread-existing',
+      expect.any(Object),
+      'alice@example.com'
+    );
+  });
+
+  it('suppresses a delayed thread/closed after a queued next send', async () => {
+    const order: string[] = [];
+    let confirmRelease!: () => void;
+    const releasePending = new Promise<void>((resolve) => {
+      confirmRelease = resolve;
+    });
+    const harness = makeHarness({ session_id: 'thread-existing' });
+    harness.bufferMessage.mockImplementation(async (_userId, _chatId, role, payload) => {
+      if (role === 'chat_status_update') order.push(`status:${payload.status}`);
+    });
+    harness.releaseSession.mockImplementation(async () => {
+      order.push('release:start');
+      await releasePending;
+      order.push('release:end');
+      return true;
+    });
+    harness.resumeCodexSession.mockImplementation(async () => {
+      order.push('resume');
+      return {
+        chatId: 'chat-1',
+        userId: 'alice@example.com',
+        threadId: 'thread-existing',
+        cwd: '/repo',
+        state: 'idle',
+        updatedAt: Date.now(),
+      };
+    });
+    await harness.service.executeMessage(harness.context, { content: 'Initial' }, {});
+    order.length = 0;
+
+    const completion = harness.service.handleCodexStatus({
+      chatId: 'chat-1',
+      userId: 'alice@example.com',
+      threadId: 'thread-existing',
+      state: 'idle',
+      completedTurnId: 'turn-1',
+    });
+    for (let attempt = 0; attempt < 20 && !order.includes('release:start'); attempt++) {
+      await Promise.resolve();
+    }
+    const nextSend = harness.service.executeMessage(harness.context, { content: 'Next' }, {});
+    const closed = harness.service.handleCodexStatus({
+      chatId: 'chat-1',
+      userId: 'alice@example.com',
+      threadId: 'thread-existing',
+      state: 'stopped',
+      ownershipReleased: true,
+    });
+
+    confirmRelease();
+    await Promise.all([completion, closed, nextSend]);
+    expect(order).toEqual(['status:idle', 'release:start', 'release:end', 'resume']);
   });
 
   it('releases direct-call power when execution fails', async () => {
@@ -414,6 +661,7 @@ describe('ChatExecutionService Codex routing', () => {
       userId: 'alice@example.com',
       threadId: 'thread-1',
       state: 'idle',
+      completedTurnId: 'turn-1',
     });
 
     expect(harness.emitted).toContainEqual({

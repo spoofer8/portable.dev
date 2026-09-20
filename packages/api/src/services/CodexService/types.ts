@@ -105,6 +105,7 @@ export interface CodexSession {
   cwd?: string;
   state: CodexSessionState;
   activeTurnId?: string;
+  lastCompletedTurnId?: string;
   lastError?: string;
   updatedAt: number;
 }
@@ -137,7 +138,17 @@ export interface CodexStatusEvent {
   threadId: string;
   state: CodexSessionState;
   turnId?: string;
+  /** Present only for the authoritative turn/completed notification. */
+  completedTurnId?: string;
+  /** The app-server confirmed that this process no longer owns the thread. */
+  ownershipReleased?: boolean;
   error?: string;
+}
+
+export type ThreadUnsubscribeStatus = 'notLoaded' | 'notSubscribed' | 'unsubscribed';
+
+export interface ThreadUnsubscribeResponse {
+  status: ThreadUnsubscribeStatus;
 }
 
 export interface ThreadListParams {

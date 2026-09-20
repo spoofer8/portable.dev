@@ -58,7 +58,7 @@ export class StdioCodexTransport implements CodexProcessTransport {
 
     const child = this.spawnProcess(
       this.options.command ?? 'codex',
-      this.options.args ?? ['app-server'],
+      this.options.args ?? ['app-server', '--stdio', '-c', 'thread_unload_delay_secs=0'],
       {
         cwd: this.options.cwd,
         env: buildCodexProcessEnv(this.options.env ?? process.env, this.options.extraEnvAllowlist),

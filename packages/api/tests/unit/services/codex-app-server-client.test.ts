@@ -247,6 +247,36 @@ describe('CodexAppServerClient', () => {
     expect(errors.map((error) => error.message)).toEqual(['write EPIPE']);
   });
 
+  test('starts the app-server with immediate thread unloading by default', () => {
+    const child = Object.assign(new EventEmitter(), {
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+      exitCode: null,
+      signalCode: null,
+      kill: () => true,
+    });
+    const spawns: Array<{ command: string; args: string[] }> = [];
+    const transport = new StdioCodexTransport({}, (command, args) => {
+      spawns.push({ command, args });
+      return child as any;
+    });
+
+    transport.start({
+      onLine: () => undefined,
+      onStderr: () => undefined,
+      onExit: () => undefined,
+      onError: () => undefined,
+    });
+
+    expect(spawns).toEqual([
+      {
+        command: 'codex',
+        args: ['app-server', '--stdio', '-c', 'thread_unload_delay_secs=0'],
+      },
+    ]);
+  });
+
   test('reports a stdin failure and following process exit only once', async () => {
     const transport = new FakeTransport();
     const failures: Error[] = [];

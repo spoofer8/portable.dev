@@ -132,6 +132,10 @@ export class ChatExecutionService {
   // Serializes external Codex handoff with any execution targeting that chat.
   private codexHandoffLocks = new Map<string, Promise<void>>();
 
+  // Prevents a completed turn from releasing its app-server subscription while
+  // a following mobile turn is resuming or starting on the same thread.
+  private codexSessionLocks = new Map<string, Promise<void>>();
+
   private codexExecutionContexts = new Map<string, ExecutionContext>();
   private codexPowerReleases = new Map<string, () => void>();
 
@@ -1679,6 +1683,23 @@ export class ChatExecutionService {
     }
   }
 
+  private async acquireCodexSessionLock(chatId: string): Promise<() => void> {
+    const previous = this.codexSessionLocks.get(chatId) ?? Promise.resolve();
+    let releaseCurrent!: () => void;
+    const current = new Promise<void>((resolve) => {
+      releaseCurrent = resolve;
+    });
+    const tail = previous.then(() => current);
+    this.codexSessionLocks.set(chatId, tail);
+    await previous;
+    return () => {
+      releaseCurrent();
+      if (this.codexSessionLocks.get(chatId) === tail) {
+        this.codexSessionLocks.delete(chatId);
+      }
+    };
+  }
+
   private async executeCodexMessage(
     context: ExecutionContext,
     message: { content: string; uploadedFiles?: any[]; context?: PageContext },
@@ -1689,14 +1710,15 @@ export class ChatExecutionService {
     if (message.uploadedFiles?.length) {
       throw new Error('Codex file attachments are not supported yet');
     }
-    if (this.executingChats.has(chatId)) {
-      throw new Error('This Codex chat is already starting a turn');
-    }
+    const releaseSessionLock = await this.acquireCodexSessionLock(chatId);
 
-    this.executingChats.add(chatId);
-    this.codexExecutionContexts.set(chatId, context);
     let turnStarted = false;
     try {
+      if (this.executingChats.has(chatId)) {
+        throw new Error('This Codex chat is already starting a turn');
+      }
+      this.executingChats.add(chatId);
+      this.codexExecutionContexts.set(chatId, context);
       const chat = await this.chatService.getChat(chatId, userId, authToken);
       if (!chat) throw new Error(`Chat ${chatId} not found in database`);
 
@@ -1801,6 +1823,7 @@ export class ChatExecutionService {
     } finally {
       if (!turnStarted) this.releaseCodexPowerLease(chatId);
       this.executingChats.delete(chatId);
+      releaseSessionLock();
     }
   }
 
@@ -1828,25 +1851,35 @@ export class ChatExecutionService {
   }
 
   async handleCodexStatus(event: CodexStatusEvent): Promise<void> {
-    const context = this.codexExecutionContexts.get(event.chatId);
-    if (!context) return;
-    const status =
-      event.state === 'stopped' ? 'completed' : event.state === 'error' ? 'error' : event.state;
-    await context.emitter.emit('claude:status', {
-      chatId: event.chatId,
-      provider: 'codex',
-      status,
-    });
-    await this.chatService.bufferMessage(
-      context.userId,
-      event.chatId,
-      'chat_status_update',
-      { status },
-      context.authToken
-    );
-    context.emitter.broadcastRuntimeStateToUser?.(context.userId);
+    const releaseSessionLock = await this.acquireCodexSessionLock(event.chatId);
+    try {
+      const context = this.codexExecutionContexts.get(event.chatId);
+      if (!context) return;
+      if (event.ownershipReleased) {
+        this.releaseCodexPowerLease(event.chatId);
+        context.emitter.broadcastRuntimeStateToUser?.(context.userId);
+        return;
+      }
+      const status =
+        event.state === 'stopped' ? 'completed' : event.state === 'error' ? 'error' : event.state;
+      await context.emitter.emit('claude:status', {
+        chatId: event.chatId,
+        provider: 'codex',
+        status,
+      });
+      await this.chatService.bufferMessage(
+        context.userId,
+        event.chatId,
+        'chat_status_update',
+        { status },
+        context.authToken
+      );
+      context.emitter.broadcastRuntimeStateToUser?.(context.userId);
 
-    if (event.state === 'idle' || event.state === 'stopped' || event.state === 'error') {
+      const shouldFinalizeTurn =
+        !!event.completedTurnId || event.state === 'stopped' || event.state === 'error';
+      if (!shouldFinalizeTurn) return;
+
       this.releaseCodexPowerLease(event.chatId);
       const preview = this.extractNotificationPreview(event.chatId);
       await this.saveAccumulatedMessage(event.chatId, context.userId, context.authToken);
@@ -1865,6 +1898,27 @@ export class ChatExecutionService {
           preview
         );
       }
+
+      if (event.completedTurnId && this.codexService) {
+        try {
+          const released = await this.codexService.releaseSession(
+            event.chatId,
+            event.completedTurnId
+          );
+          if (!released) {
+            console.warn(
+              `[ChatExecutionService] Codex thread ownership release was not confirmed for ${event.chatId}`
+            );
+          }
+        } catch (error) {
+          console.error(
+            `[ChatExecutionService] Failed to release Codex thread ownership for ${event.chatId}:`,
+            error
+          );
+        }
+      }
+    } finally {
+      releaseSessionLock();
     }
   }
 
