@@ -13,9 +13,11 @@
  * reconstructs the exact same effective configuration.
  *
  * The manifest holds ONLY routing/config — NEVER a secret. The JWT secret, the
- * pairing JWT, the E2E PSK, and the Claude/GitHub tokens stay exclusively in the
- * {@link LocalSecretStore} indexed by {@link ServiceInstallManifest.dataDir}
- * (PRD §5). It is written atomically with restrictive permissions (mirrors the
+ * pairing JWT, the E2E PSK, the Claude/GitHub tokens, and the service's allowlisted
+ * Codex provider environment stay exclusively in encrypted {@link LocalSecretStore}
+ * instances under {@link ServiceInstallManifest.dataDir} (the Codex snapshot uses
+ * its own child store to avoid concurrent writes). The manifest is written atomically
+ * with restrictive permissions (mirrors the
  * {@link PairingStateStore}/{@link DevicePresenceStore} write pattern).
  */
 import fs from 'fs';

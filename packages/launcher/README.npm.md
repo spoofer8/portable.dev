@@ -69,9 +69,11 @@ the local Claude or Codex CLI configuration on your computer.
 On macOS, Portable detects `codex` without invoking interactive shell aliases. The
 `supersol` and `superastra` app choices map to native Codex app-server settings. If Codex is
 not installed, Portable continues in Claude-only mode and prints the official npm install
-command. `CODEX_HOME` and provider environment variables are forwarded unchanged and never
-persisted by the launcher. When `WORKSPACE_DIR` is unset and `~/projects` exists, that folder
-becomes the default session discovery root.
+command. `CODEX_HOME` and allowlisted provider environment variables are forwarded unchanged.
+For the background service, they are captured at install/start/restart in Portable's encrypted
+local secret store and restored only when the headless service boots; exported and `.env` values
+still win. When `WORKSPACE_DIR` is unset and `~/projects` exists, that folder becomes the default
+session discovery root.
 
 To keep everything on infrastructure you control, you can self-host the relay and point the
 CLI at it with `PORTABLE_RELAY_URL`. Prefer a different tunnel? `portable --ngrok` fronts your

@@ -92,10 +92,13 @@ provider, ultra effort, context-window, and compaction settings. Portable starts
 Codex with workspace isolation and approval prompts; choosing bypass permissions is
 the explicit path to full filesystem access. Set `CODEX_PRESETS_JSON` to replace the mapping.
 
-`CODEX_HOME` and provider environment variables pass straight through to the local
-api child. Portable does not read or persist their values. Keep credentials out of
-`CODEX_PRESETS_JSON`; provider authentication belongs in the Codex CLI configuration
-or provider environment.
+`CODEX_HOME` and provider environment variables pass through to the local api child.
+When you install or manually start/restart the background service, Portable stores
+only the Codex allowlisted environment in its encrypted local secret store. The
+headless service restores missing values from that snapshot; exported variables and
+`.env` still win. Re-run `portable service restart` after rotating a provider key.
+Keep credentials out of `CODEX_PRESETS_JSON`; provider authentication belongs in the
+Codex CLI configuration or provider environment.
 
 ## Prerequisites
 
@@ -120,20 +123,21 @@ install dirs (`%ProgramFiles(x86)%\cloudflared`, the winget Links dir, scoop shi
 
 ## Environment knobs
 
-| Var                        | Purpose                                                                                        |
-| -------------------------- | ---------------------------------------------------------------------------------------------- |
-| `VGIT_PORT`                | The loopback api port (default `4200`).                                                        |
-| `PORTABLE_RELAY_URL`       | The hosted relay to register with (default `https://app.portable-dev.com`; self-host with D7). |
-| `PORTABLE_PC_ID`           | Override the stable pcId (else persisted in the local store).                                  |
-| `PORTABLE_PC_LABEL`        | Human label for this PC (default: hostname).                                                   |
-| `PORTABLE_CLOUDFLARED_BIN` | Full path to a `cloudflared` binary to use instead of the auto-provisioned one.                |
-| `PORTABLE_TUNNEL_PROVIDER` | `ngrok` to use ngrok instead of cloudflared (same as the `--ngrok` flag). Default cloudflared. |
-| `PORTABLE_NGROK_BIN`       | Full path to an `ngrok` binary (else resolved on PATH / win32 probe). `--ngrok` only.          |
-| `NGROK_AUTHTOKEN`          | ngrok authtoken; satisfies the `--ngrok` auth preflight (else a configured ngrok authtoken).   |
-| `WORKSPACE_DIR`            | The repo root Portable scans. On macOS it defaults to `~/projects` when that directory exists. |
-| `CODEX_BIN`                | Optional Codex executable override. A detected native executable is otherwise forwarded.       |
-| `CODEX_HOME`               | Optional Codex home/config location, forwarded unchanged and never persisted by Portable.      |
-| `CODEX_PRESETS_JSON`       | Optional JSON replacement for the built-in `supersol` and `superastra` preset mapping.         |
+| Var                            | Purpose                                                                                                                                                                         |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `VGIT_PORT`                    | The loopback api port (default `4200`).                                                                                                                                         |
+| `PORTABLE_RELAY_URL`           | The hosted relay to register with (default `https://app.portable-dev.com`; self-host with D7).                                                                                  |
+| `PORTABLE_PC_ID`               | Override the stable pcId (else persisted in the local store).                                                                                                                   |
+| `PORTABLE_PC_LABEL`            | Human label for this PC (default: hostname).                                                                                                                                    |
+| `PORTABLE_CLOUDFLARED_BIN`     | Full path to a `cloudflared` binary to use instead of the auto-provisioned one.                                                                                                 |
+| `PORTABLE_TUNNEL_PROVIDER`     | `ngrok` to use ngrok instead of cloudflared (same as the `--ngrok` flag). Default cloudflared.                                                                                  |
+| `PORTABLE_NGROK_BIN`           | Full path to an `ngrok` binary (else resolved on PATH / win32 probe). `--ngrok` only.                                                                                           |
+| `NGROK_AUTHTOKEN`              | ngrok authtoken; satisfies the `--ngrok` auth preflight (else a configured ngrok authtoken).                                                                                    |
+| `WORKSPACE_DIR`                | The repo root Portable scans. On macOS it defaults to `~/projects` when that directory exists.                                                                                  |
+| `CODEX_BIN`                    | Optional Codex executable override. A detected native executable is otherwise forwarded.                                                                                        |
+| `CODEX_HOME`                   | Optional Codex home/config location. The service snapshots it in encrypted local storage.                                                                                       |
+| `CODEX_PRESETS_JSON`           | Optional JSON replacement for the built-in `supersol` and `superastra` preset mapping.                                                                                          |
+| `PORTABLE_CODEX_ENV_ALLOWLIST` | Comma-separated extra provider variables allowed into Codex and the encrypted service snapshot. Denied Portable, Claude, GitHub, and Anthropic credential classes stay blocked. |
 
 ## Modules
 

@@ -73,6 +73,8 @@ function baseDeps(over: Partial<ServiceControllerDeps> = {}): ServiceControllerD
     isProcessAlive: () => true,
     persistManifest: () => {},
     clearInstallArtifacts: () => {},
+    captureCodexEnvironment: () => {},
+    clearCodexEnvironment: () => {},
     ...over,
   };
 }
@@ -197,10 +199,19 @@ describe('lifecycle actions await the real transition (§12.1)', () => {
 
   it('restart runs stop then start (no singleton contention)', async () => {
     const { manager, calls } = fakeManager();
-    const res = await new LauncherServiceController(baseDeps({ manager })).restart();
+    const res = await new LauncherServiceController(
+      baseDeps({
+        manager,
+        captureCodexEnvironment: () => calls.push('captureCodexEnvironment'),
+      })
+    ).restart();
     expect(res.ok).toBe(true);
     // stop before start; the trailing 'status' is getSnapshot building the result.
-    expect(calls.filter((c) => c === 'stop' || c === 'start')).toEqual(['stop', 'start']);
+    expect(calls.filter((c) => c !== 'status')).toEqual([
+      'captureCodexEnvironment',
+      'stop',
+      'start',
+    ]);
   });
 
   it('install(start:false) registers WITHOUT starting (the handoff) and persists the manifest', async () => {
@@ -240,13 +251,14 @@ describe('lifecycle actions await the real transition (§12.1)', () => {
       baseDeps({
         manager,
         waitForHealthy: async () => true,
+        captureCodexEnvironment: () => void order.push('captureCodexEnvironment'),
         handoff: async () => void order.push('handoff'),
       })
     ).install();
     expect(res.ok).toBe(true);
     // The port is freed (handoff) AFTER the definition is registered but BEFORE the
     // daemon starts — and the fused `install()` is never used.
-    expect(order).toEqual(['installDefinition', 'handoff', 'start']);
+    expect(order).toEqual(['captureCodexEnvironment', 'installDefinition', 'handoff', 'start']);
     expect(order).not.toContain('install');
   });
 
@@ -269,19 +281,42 @@ describe('lifecycle actions await the real transition (§12.1)', () => {
       baseDeps({
         manager,
         waitForHealthy: async () => true,
+        captureCodexEnvironment: () => void order.push('captureCodexEnvironment'),
         handoff: async () => void order.push('handoff'),
       })
     ).start();
-    expect(order).toEqual(['handoff', 'start']);
+    expect(order).toEqual(['captureCodexEnvironment', 'handoff', 'start']);
   });
 
   it('uninstall clears the install artifacts', async () => {
     let cleared = 0;
+    let codexCleared = 0;
     const res = await new LauncherServiceController(
-      baseDeps({ clearInstallArtifacts: () => cleared++ })
+      baseDeps({
+        clearInstallArtifacts: () => cleared++,
+        clearCodexEnvironment: () => codexCleared++,
+      })
     ).uninstall();
     expect(res.ok).toBe(true);
     expect(cleared).toBe(1);
+    expect(codexCleared).toBe(1);
+  });
+
+  it('reports a partial uninstall failure when the encrypted Codex snapshot cannot be deleted', async () => {
+    let artifactsCleared = 0;
+    const res = await new LauncherServiceController(
+      baseDeps({
+        clearCodexEnvironment: () => {
+          throw new Error('secret store unavailable');
+        },
+        clearInstallArtifacts: () => artifactsCleared++,
+      })
+    ).uninstall();
+
+    expect(res.ok).toBe(false);
+    expect(res.message).toContain('service was removed');
+    expect(res.message).toContain('Codex environment snapshot');
+    expect(artifactsCleared).toBe(1);
   });
 
   it('surfaces a manager failure as a structured result (ok:false + error)', async () => {

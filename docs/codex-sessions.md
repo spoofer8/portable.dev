@@ -37,6 +37,14 @@ The Codex child receives a strict environment allowlist rather than Portable's c
 environment. Extra provider-specific keys can be named with `PORTABLE_CODEX_ENV_ALLOWLIST`;
 Portable authentication, relay, GitHub, and Anthropic secrets remain blocked.
 
+macOS launchd does not inherit the interactive shell environment. `portable service install`,
+`start`, and `restart` therefore replace an encrypted snapshot containing only this allowlisted
+Codex environment. `connect --service` restores missing values before the api starts, while
+explicit process and `.env` values retain precedence. Uninstall removes this snapshot without
+deleting other Portable secrets. The snapshot has its own `<DATA_DIR>/service-codex-env` store,
+so replacing it cannot race writes to Portable's JWT, E2E, Claude, or GitHub credentials. Re-run
+`portable service restart` after rotating a provider key.
+
 ## Discovery
 
 Claude and Codex discovery are independent provider adapters behind one coordinator.

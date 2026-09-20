@@ -7,6 +7,7 @@ import { describe, expect, it } from 'bun:test';
 import os from 'os';
 import path from 'path';
 
+import { renderLaunchdPlist } from '../src/LaunchdService.js';
 import { resolveServiceExec } from '../src/ServiceManager.js';
 
 describe('resolveServiceExec', () => {
@@ -107,5 +108,31 @@ describe('resolveServiceExec', () => {
       env: {},
     });
     expect(fromDefault.env?.PORTABLE_DATA_DIR).toBe(path.join(os.homedir(), '.portable'));
+  });
+
+  it('never puts Codex provider keys in service env, argv, or a LaunchAgent plist', () => {
+    const spec = resolveServiceExec({
+      execPath: '/usr/local/bin/bun',
+      argv: ['/usr/local/bin/bun', '/g/cli.js', 'service', 'install'],
+      cwd: '/Users/u',
+      env: {
+        PATH: '/usr/bin:/bin',
+        AZURE_API_KEY: 'azure-must-stay-encrypted',
+        CLIPROXY_API_KEY: 'cliproxy-must-stay-encrypted',
+        PORTABLE_CODEX_ENV_ALLOWLIST: 'CUSTOM_PROVIDER_KEY',
+        CUSTOM_PROVIDER_KEY: 'custom-must-stay-encrypted',
+      },
+    });
+    const serialized = `${JSON.stringify(spec)}\n${renderLaunchdPlist(spec, '/tmp/log')}`;
+    for (const forbidden of [
+      'AZURE_API_KEY',
+      'CLIPROXY_API_KEY',
+      'CUSTOM_PROVIDER_KEY',
+      'azure-must-stay-encrypted',
+      'cliproxy-must-stay-encrypted',
+      'custom-must-stay-encrypted',
+    ]) {
+      expect(serialized).not.toContain(forbidden);
+    }
   });
 });

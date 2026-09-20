@@ -105,7 +105,10 @@ export interface ResolveServiceExecOptions {
   env?: NodeJS.ProcessEnv;
 }
 
-/** Env vars captured into the service definition when the operator has them set. */
+/**
+ * Non-secret env vars safe to embed in a world-readable service definition.
+ * Codex provider values use the encrypted ServiceCodexEnvironment snapshot instead.
+ */
 const CAPTURED_ENV_VARS = ['PATH', 'PORTABLE_NGROK_BIN', 'PORTABLE_CLOUDFLARED_BIN'] as const;
 
 /**

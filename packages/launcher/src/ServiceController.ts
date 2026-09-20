@@ -38,6 +38,10 @@ import {
   removeServiceInstallManifest,
   type ServiceInstallManifest,
 } from './ServiceInstallManifest.js';
+import {
+  captureServiceCodexEnvironment,
+  deleteServiceCodexEnvironment,
+} from './ServiceCodexEnvironment.js';
 
 import type { ServiceManager } from './ServiceManager.js';
 
@@ -137,6 +141,10 @@ export interface ServiceControllerDeps {
   persistManifest?: () => void;
   /** Remove the manifest + runtime-state on uninstall (defaults to the real remover). */
   clearInstallArtifacts?: () => void;
+  /** Replace the encrypted service Codex env snapshot before install can start it. */
+  captureCodexEnvironment?: () => void;
+  /** Remove only the encrypted service Codex env snapshot on uninstall. */
+  clearCodexEnvironment?: () => void;
   /**
    * The interactive runtime→daemon HANDOFF (PRD §10). Provided ONLY when the
    * dashboard runs inside a LIVE manual `portable` runtime (the connected menu):
@@ -207,6 +215,8 @@ export class LauncherServiceController implements ServiceController {
   private readonly isProcessAlive: (pid: number) => boolean;
   private readonly persistManifest: () => void;
   private readonly clearInstallArtifacts: () => void;
+  private readonly captureCodexEnvironment: () => void;
+  private readonly clearCodexEnvironment: () => void;
   private readonly handoff?: () => Promise<void>;
   private readonly log: (line: string) => void;
 
@@ -245,6 +255,12 @@ export class LauncherServiceController implements ServiceController {
         removeServiceInstallManifest(this.dataDir);
         new DaemonRuntimeStateStore({ dataDir: this.dataDir }).clear();
       });
+    this.captureCodexEnvironment =
+      deps.captureCodexEnvironment ??
+      (() => captureServiceCodexEnvironment({ env: this.env, dataDir: this.dataDir }));
+    this.clearCodexEnvironment =
+      deps.clearCodexEnvironment ??
+      (() => void deleteServiceCodexEnvironment({ env: this.env, dataDir: this.dataDir }));
     this.handoff = deps.handoff;
     this.log = deps.log ?? (() => {});
   }
@@ -331,6 +347,7 @@ export class LauncherServiceController implements ServiceController {
   async install(options: { start?: boolean } = {}): Promise<ServiceActionResult> {
     const start = options.start ?? true;
     try {
+      this.captureCodexEnvironment();
       if (!start) {
         await this.installDefinitionOnly();
         this.tryPersistManifest();
@@ -364,10 +381,29 @@ export class LauncherServiceController implements ServiceController {
   async uninstall(): Promise<ServiceActionResult> {
     try {
       await this.manager.uninstall();
+      let codexCleanupFailed = false;
+      let artifactCleanupFailed = false;
+      try {
+        this.clearCodexEnvironment();
+      } catch {
+        codexCleanupFailed = true;
+        this.log('[service] encrypted Codex environment snapshot cleanup failed.');
+      }
       try {
         this.clearInstallArtifacts();
-      } catch (err) {
-        this.log(`[service] artifact cleanup failed: ${errMsg(err)}`);
+      } catch {
+        artifactCleanupFailed = true;
+        this.log('[service] install artifact cleanup failed.');
+      }
+      if (codexCleanupFailed || artifactCleanupFailed) {
+        const detail = [
+          codexCleanupFailed ? 'encrypted Codex environment snapshot' : '',
+          artifactCleanupFailed ? 'install artifacts' : '',
+        ]
+          .filter(Boolean)
+          .join(' and ');
+        const message = `The service was removed, but cleanup failed for ${detail}.`;
+        return this.result(false, message, new Error(message));
       }
       return this.result(true, 'Service uninstalled.');
     } catch (err) {
@@ -377,6 +413,7 @@ export class LauncherServiceController implements ServiceController {
 
   async start(): Promise<ServiceActionResult> {
     try {
+      this.captureCodexEnvironment();
       // §10: if a live manual runtime owns the port, free it first (no-op/idempotent
       // when there is none) so the daemon can bind it.
       if (this.handoff) await this.handoff();
@@ -406,6 +443,7 @@ export class LauncherServiceController implements ServiceController {
 
   async restart(): Promise<ServiceActionResult> {
     try {
+      this.captureCodexEnvironment();
       const baseUrl = this.resolveBaseUrl(this.readManifest());
       await this.manager.stop();
       await this.waitForStoppedImpl(baseUrl);

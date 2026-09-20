@@ -114,6 +114,10 @@
       "types": "./src/sentry.ts",
       "default": "./src/sentry.ts"
     },
+    "./codexEnv": {
+      "types": "./src/codexEnv.ts",
+      "default": "./src/codexEnv.ts"
+    },
     "./cors": {
       "types": "./src/cors.ts",
       "default": "./src/cors.ts"

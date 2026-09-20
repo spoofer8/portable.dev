@@ -17,6 +17,10 @@ import { resolveDataDir } from '@vgit2/shared/secrets';
 import { DaemonRuntimeStateStore } from './DaemonRuntimeStateStore.js';
 import { LaunchdServiceManager } from './LaunchdService.js';
 import {
+  captureServiceCodexEnvironment,
+  deleteServiceCodexEnvironment,
+} from './ServiceCodexEnvironment.js';
+import {
   persistServiceInstallManifest,
   removeServiceInstallManifest,
 } from './ServiceInstallManifest.js';
@@ -78,6 +82,10 @@ export interface ServiceCommandsDeps {
   persistManifest?: () => void;
   /** `service uninstall`: remove the manifest + runtime-state (defaults to the real remover). */
   clearInstallArtifacts?: () => void;
+  /** Capture the invoking shell's allowlisted Codex env before the service starts. */
+  captureCodexEnvironment?: () => void;
+  /** Remove only the encrypted Codex env snapshot on uninstall. */
+  clearCodexEnvironment?: () => void;
 }
 
 /** The real per-platform manager, built from THIS invocation's exec spec. */
@@ -274,9 +282,16 @@ export async function runServiceCommand(
         // Best-effort cleanup.
       }
     });
+  const captureCodexEnvironment =
+    deps.captureCodexEnvironment ?? (() => captureServiceCodexEnvironment());
+  const clearCodexEnvironment =
+    deps.clearCodexEnvironment ?? (() => void deleteServiceCodexEnvironment());
   try {
     switch (action as ServiceAction) {
       case 'install':
+        // Must happen before install(): every platform's fused install starts the
+        // service immediately, and the daemon needs this snapshot at its boot.
+        captureCodexEnvironment();
         await manager.install();
         persistManifest();
         out('portable service: installed and running.');
@@ -284,10 +299,30 @@ export async function runServiceCommand(
         return 0;
       case 'uninstall':
         await manager.uninstall();
-        clearInstallArtifacts();
+        {
+          let cleanupFailed = false;
+          try {
+            clearCodexEnvironment();
+          } catch {
+            cleanupFailed = true;
+          }
+          try {
+            clearInstallArtifacts();
+          } catch {
+            cleanupFailed = true;
+          }
+          if (cleanupFailed) {
+            out(
+              'portable service: service was removed, but local cleanup failed; ' +
+                'the encrypted Codex environment snapshot may remain.'
+            );
+            return 1;
+          }
+        }
         out('portable service: uninstalled.');
         return 0;
       case 'start':
+        captureCodexEnvironment();
         await manager.start();
         out('portable service: started.');
         return 0;
@@ -297,6 +332,7 @@ export async function runServiceCommand(
         return 0;
       case 'restart':
         // Stop then start — the managers serialize this; no singleton contention.
+        captureCodexEnvironment();
         await manager.stop();
         await manager.start();
         out('portable service: restarted.');

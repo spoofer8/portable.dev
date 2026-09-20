@@ -41,6 +41,8 @@ const BASE_ENV: NodeJS.ProcessEnv = {
   // Secrets that must NEVER end up in the manifest (§5/§12.2).
   JWT_SECRET: 'super-secret-jwt-value-do-not-leak',
   PORTABLE_E2E_PSK: 'e2e-psk-base64-do-not-leak',
+  AZURE_API_KEY: 'azure-value-do-not-leak',
+  CLIPROXY_API_KEY: 'cliproxy-value-do-not-leak',
 };
 
 describe('buildServiceInstallManifest', () => {
@@ -99,6 +101,10 @@ describe('buildServiceInstallManifest', () => {
     expect(serialized).not.toContain('e2e-psk-base64-do-not-leak');
     expect(serialized).not.toContain('stored-secret');
     expect(serialized).not.toContain('stored-psk');
+    expect(serialized).not.toContain('AZURE_API_KEY');
+    expect(serialized).not.toContain('azure-value-do-not-leak');
+    expect(serialized).not.toContain('CLIPROXY_API_KEY');
+    expect(serialized).not.toContain('cliproxy-value-do-not-leak');
   });
 });
 

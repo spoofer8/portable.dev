@@ -28,6 +28,7 @@ import { resolveDataDir } from '@vgit2/shared/secrets';
 import { DEV_RELAY_BASE_URL, loadOperatorEnv, resolveCliVersion } from './config.js';
 import { createLauncher } from './Launcher.js';
 import { autoLinkIfEligible, runLinkCommand, runUnlinkCommand } from './ProjectCommands.js';
+import { restoreServiceCodexEnvironment } from './ServiceCodexEnvironment.js';
 import { acquireSingleton } from './SingletonGuard.js';
 
 const HELP = `portable — local-first launcher / tunnel-router
@@ -99,6 +100,9 @@ Credentials (auto-discovered, else login):
   is never blocked). If GitHub is missing it OFFERS the OAuth device flow
   (needs GITHUB_OAUTH_CLIENT_ID); GitHub is optional — you can connect it later
   from the Portable app.
+  Codex provider variables allowed by Portable are captured into encrypted local
+  storage on \`service install/start/restart\` and restored only in service mode.
+  Exported and .env values win; use PORTABLE_CODEX_ENV_ALLOWLIST for extra provider vars.
 
 Prerequisites:
   - Bun (https://bun.sh)
@@ -253,6 +257,16 @@ async function main(): Promise<void> {
     process.stderr.write(`portable: unknown command '${command}'\n\n${HELP}`);
     process.exitCode = 1;
     return;
+  }
+
+  // launchd/systemd invoke exactly `connect --service` with a minimal
+  // environment. Restore only that internal entrypoint, after `.env` loading so
+  // explicit process and file values retain precedence, and before api spawn.
+  if (serviceMode && command === 'connect') {
+    restoreServiceCodexEnvironment({
+      env: process.env,
+      log: (line) => process.stderr.write(`${line}${os.EOL}`),
+    });
   }
 
   // portable.dev#12 follow-up (PRD §11): a manual `portable` in front of an

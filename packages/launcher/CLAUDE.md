@@ -307,6 +307,13 @@ portable.service`, `Restart=always`) + `loginctl enable-linger` for boot start/l
     boot-token QR page (§8.4 — the token expires on a long-running daemon; the dashboard
     mints a fresh one on demand). Docs:
     [`docs/portable-daemon.md`](../../docs/portable-daemon.md).
+  - **`ServiceCodexEnvironment.ts`** — launchd/systemd do not inherit the install
+    shell's provider keys. `install`/`start`/`restart` replace an encrypted, versioned
+    `LocalSecretStore` snapshot selected by the shared Codex allowlist. It uses a dedicated
+    `<DATA_DIR>/service-codex-env` store so snapshot replacement cannot race writes to the main
+    JWT/E2E/OAuth store. `connect --service` restores only missing values after `.env` loading
+    and before api spawn. Denied credential classes cannot be re-enabled by
+    `PORTABLE_CODEX_ENV_ALLOWLIST`; uninstall removes only this snapshot.
 
 - **Interactive CLI control plane (portable.dev#12 follow-up)** — the daemon stays
   headless; the CLI is its control plane. A manual `portable` in front of an installed

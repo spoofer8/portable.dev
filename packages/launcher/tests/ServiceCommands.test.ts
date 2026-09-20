@@ -54,6 +54,8 @@ function harness(opts: { platform?: NodeJS.Platform; status?: ServiceStatus } = 
     // No-op the manifest/artifact side effects so tests never touch the real DATA_DIR.
     persistManifest: () => {},
     clearInstallArtifacts: () => {},
+    captureCodexEnvironment: () => {},
+    clearCodexEnvironment: () => {},
   };
   return { deps, calls, out };
 }
@@ -85,9 +87,10 @@ describe('runServiceCommand', () => {
 
   it('routes restart to the manager as stop then start (exit 0)', async () => {
     const h = harness();
+    h.deps.captureCodexEnvironment = () => h.calls.push('captureCodexEnvironment');
     const code = await runServiceCommand(['service', 'restart'], h.deps);
     expect(code).toBe(0);
-    expect(h.calls).toEqual(['stop', 'start']);
+    expect(h.calls).toEqual(['captureCodexEnvironment', 'stop', 'start']);
     expect(h.out.join('\n')).toContain('restarted');
   });
 
@@ -100,9 +103,33 @@ describe('runServiceCommand', () => {
 
     const removed = harness();
     let cleared = 0;
+    let codexCleared = 0;
     removed.deps.clearInstallArtifacts = () => cleared++;
+    removed.deps.clearCodexEnvironment = () => codexCleared++;
     await runServiceCommand(['service', 'uninstall'], removed.deps);
     expect(cleared).toBe(1);
+    expect(codexCleared).toBe(1);
+  });
+
+  it('refreshes the encrypted Codex env before starting an installed service', async () => {
+    const h = harness();
+    h.deps.captureCodexEnvironment = () => h.calls.push('captureCodexEnvironment');
+    await runServiceCommand(['service', 'start'], h.deps);
+    expect(h.calls).toEqual(['captureCodexEnvironment', 'start']);
+  });
+
+  it('reports uninstall cleanup failure after still clearing other artifacts', async () => {
+    const h = harness();
+    let artifactsCleared = 0;
+    h.deps.clearCodexEnvironment = () => {
+      throw new Error('must-not-be-printed');
+    };
+    h.deps.clearInstallArtifacts = () => artifactsCleared++;
+
+    expect(await runServiceCommand(['service', 'uninstall'], h.deps)).toBe(1);
+    expect(artifactsCleared).toBe(1);
+    expect(h.out.join('\n')).toContain('Codex environment snapshot');
+    expect(h.out.join('\n')).not.toContain('must-not-be-printed');
   });
 
   it('rejects an unknown/missing action with usage (exit 1)', async () => {
